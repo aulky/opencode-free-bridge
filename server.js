@@ -1572,27 +1572,31 @@ function handleRequest(req, res) {
             // The retry already used the freshest derived identity (endpoint,
             // session id, full tool set) — so a repeated FreeTierError is not a
             // shape problem this bridge can learn its way out of. Measured
-            // Two different failures return this same body, and telling them
-            // apart matters because the fix is completely different:
+            // 403 FreeTierError has more than one cause, and the message alone
+            // cannot distinguish them:
             //
-            //   1. per-IP allowance — identical requests alternate 200/403.
-            //   2. transport fingerprint — measured: with byte-identical
-            //      headers and body, Node and curl are refused 100% while Bun
-            //      succeeds 100% from the same IP in the same minute. The CLI
-            //      ships as a Bun binary, so its TLS ClientHello is Bun's.
+            //   1. transport fingerprint — measured: Node and curl are refused
+            //      100% while Bun succeeds 100% from the same IP in the same
+            //      minute. The CLI ships as a Bun binary, so only Bun matches.
+            //   2. per-IP allowance — also returned as 403. Measured: after a
+            //      few dozen probes the real CLI v2.0.32 gets the identical 403
+            //      from the same IP that answered 200 an hour earlier, and so
+            //      does the bridge. The transport had not changed.
             //
-            // The runtime is the discriminator we can check locally, so say
-            // that instead of guessing at an allowance the user cannot verify.
-            const budgetSuspected =
-              (gateStatus === 403 || gateStatus === 401) &&
-              /freetiererror|free tier|only available in opencode/i.test(rawMsg);
+            // A 429 FreeUsageLimitError is unambiguous: transport passed and
+            // the quota is spent. Observed on a fresh IP while 403 was being
+            // returned elsewhere, which is how the two were told apart.
+            //
+            // Only the runtime can be checked locally, so report that and name
+            // both possibilities instead of asserting the wrong one.
+            const freeTierMsg = /freetiererror|free tier|only available in opencode/i.test(rawMsg);
             const onNode = typeof Bun === "undefined";
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${gateStatus}): ${rawMsg} — ${
-                budgetSuspected
+                freeTierMsg
                   ? onNode
-                    ? "request shape already matches upstream, and this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before assuming an allowance limit"
-                    : "request shape and transport both match upstream; if this persists it is the per-IP free-tier allowance (identical requests alternate 200/403)"
+                    ? "request shape already matches upstream, but this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before suspecting an allowance limit"
+                    : "transport and request shape both match upstream. Either the per-IP free-tier allowance is spent, or upstream is refusing this network; the real CLI returns the same 403 from the same IP when it is (verified). A 429 would mean transport passed and only quota is left"
                   : `no further identity change to apply; ${UPDATE_HINT}`
               }`
             );
@@ -1614,7 +1618,7 @@ function handleRequest(req, res) {
                   // Point at an update only when the shape is plausibly stale.
                   // A budget rejection already carries the newest identity, so
                   // an "update the bridge" hint would send the user the wrong way.
-                  message: budgetSuspected ? retryMsg : `${retryMsg} (${UPDATE_HINT})`,
+                  message: freeTierMsg ? retryMsg : `${retryMsg} (${UPDATE_HINT})`,
                   type: retryType,
                   code: upstreamRes.status,
                 },
