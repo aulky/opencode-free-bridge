@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * identity.js — adaptive OpenCode CLI identity & security-layer sync.
  *
@@ -93,13 +93,17 @@ const CATALOG_URL = process.env.OPENCODE_CATALOG_URL || "https://models.opencode
 // the last real catalog this process saw — not with a table of names written by
 // hand, which is what it replaces.
 function getCatalogCacheDir() {
-  return (
-    process.env.OPENCODE_CACHE_DIR ||
-    require("path").join(require("os").homedir(), ".opencode-free-bridge", "cache")
-  );
+  const raw = process.env.OPENCODE_CACHE_DIR;
+  if (raw !== undefined) {
+    const trimmed = String(raw).trim();
+    if (!trimmed || /^(off|0|false|none)$/i.test(trimmed)) return null;
+    return trimmed;
+  }
+  return require("path").join(require("os").homedir(), ".opencode-free-bridge", "cache");
 }
 function getCatalogCacheFile() {
-  return require("path").join(getCatalogCacheDir(), "catalog.json");
+  const dir = getCatalogCacheDir();
+  return dir ? require("path").join(dir, "catalog.json") : null;
 }
 const CATALOG_CACHE_DIR = getCatalogCacheDir();
 const CATALOG_CACHE_FILE = getCatalogCacheFile();
@@ -1015,8 +1019,10 @@ function extractToolFromSource(source, fallbackName) {
  */
 function readCachedCatalog() {
   try {
+    const file = getCatalogCacheFile();
+    if (!file) return null;
     const fs = require("fs");
-    const raw = fs.readFileSync(getCatalogCacheFile(), "utf8");
+    const raw = fs.readFileSync(file, "utf8");
     const parsed = JSON.parse(raw);
     // A cached catalog is only useful if it is structurally a catalog.
     if (parsed && typeof parsed === "object" && parsed.opencode) return parsed;
@@ -1026,9 +1032,10 @@ function readCachedCatalog() {
 
 function writeCachedCatalog(json) {
   try {
-    const fs = require("fs");
     const dir = getCatalogCacheDir();
     const file = getCatalogCacheFile();
+    if (!dir || !file) return;
+    const fs = require("fs");
     fs.mkdirSync(dir, { recursive: true });
     const tmp = `${file}.tmp.${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify(json));

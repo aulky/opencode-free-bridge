@@ -92,10 +92,10 @@ async function checkAndApplyUpdate() {
   }
   updateInFlight = (async () => {
     lastUpdateCheck = Date.now();
-    const { spawnSync } = require("child_process");
     const tmpFiles = [];
+    const cb = Date.now();
     try {
-      const pkgRes = await fetch(`${UPDATE_BASE_URL}/package.json`, {
+      const pkgRes = await fetch(`${UPDATE_BASE_URL}/package.json?cb=${cb}`, {
         headers: { "Cache-Control": "no-cache" },
         signal: AbortSignal.timeout(8000),
       });
@@ -108,22 +108,30 @@ async function checkAndApplyUpdate() {
       }
 
       for (const file of UPDATE_FILES) {
-        const res = await fetch(`${UPDATE_BASE_URL}/${file}`, {
+        const res = await fetch(`${UPDATE_BASE_URL}/${file}?cb=${cb}`, {
           headers: { "Cache-Control": "no-cache" },
           signal: AbortSignal.timeout(15000),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${file}`);
         const text = await res.text();
         if (!text || text.length < 20) throw new Error(`empty response for ${file}`);
+        if (file.endsWith(".js")) {
+          try {
+            new Function(text.replace(/^#!.*\n/, ""));
+          } catch (err) {
+            throw new Error(`syntax check failed for ${file}: ${err.message}`);
+          }
+        } else if (file.endsWith(".json")) {
+          try {
+            JSON.parse(text);
+          } catch (err) {
+            throw new Error(`invalid JSON in ${file}: ${err.message}`);
+          }
+        }
         const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
         fs.writeFileSync(tmpPath, text, "utf8");
-        if (file.endsWith(".js")) {
-          const chk = spawnSync(process.execPath, ["--check", tmpPath], { encoding: "utf8" });
-          if (chk.status !== 0) throw new Error(`syntax check failed for ${file}`);
-        }
         tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
       }
-
       for (const { tmpPath, targetPath } of tmpFiles) fs.renameSync(tmpPath, targetPath);
       console.log(
         `[opencode-free-bridge] Self-updated ${VERSION} → ${remoteVersion}; exiting for service restart.`
@@ -213,7 +221,6 @@ function createId(descending, timestamp = Date.now()) {
 // served a stale lie.
 let activeModels = [];
 let cachedModelsPayload = '{"object":"list","data":[]}';
-let cachedHealthPayload = "";
 let lastDiscoveryTime = 0;
 const DISCOVERY_TTL_MS = 60 * 60 * 1000; // Auto-refresh every 1 hour
 // Single-flight: concurrent /v1/models hits after TTL expiry share one upstream
@@ -226,12 +233,6 @@ const CLI_VERSION_TTL_MS = 6 * 60 * 60 * 1000;
 
 function rebuildDiscoveryPayloads() {
   cachedModelsPayload = JSON.stringify({ object: "list", data: activeModels });
-  cachedHealthPayload = JSON.stringify({
-    status: "ok",
-    provider: "opencode-free-bridge",
-    version: VERSION,
-    discoveredModels: activeModels.length,
-  });
 }
 rebuildDiscoveryPayloads();
 
@@ -1189,6 +1190,7 @@ function handleRequest(req, res) {
         status: "ok",
         provider: "opencode-free-bridge",
         version: VERSION,
+        runtime: typeof Bun !== "undefined" ? `bun/${Bun.version}` : `node/${process.versions.node}`,
         discoveredModels: activeModels.length,
         identity: {
           userAgent: idState.userAgent,
@@ -2223,4 +2225,5 @@ module.exports = {
   __getDiscoveryState: () => ({ inFlight: !!discoveryInFlight, lastDiscoveryTime, activeModels }),
   __setLastCliVersionCheckTime: (v) => { lastCliVersionCheckTime = v; },
   __getCliVersionState: () => ({ lastCliVersionCheckTime }),
+  __setLastUpdateCheck: (v) => { lastUpdateCheck = v; },
 };

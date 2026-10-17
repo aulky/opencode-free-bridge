@@ -4,13 +4,13 @@ OpenAI-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier
 
 It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
 
-## What's New in v2.3 (v2.3.10)
+## What's New in v2.3 (v2.3.11)
 
-- **Bun transport parity (`v2.3.6+`):** The OpenCode CLI ships as a compiled Bun binary, and upstream's free-tier gate inspects the TLS `ClientHello` fingerprint (17 cipher suites, 12 TLS extensions in a fixed order). The bridge now runs on Bun (`bun server.js`), refuses accidental Node.js startups unless `ALLOW_NODE=1` is set for offline tests, and ships `transport-fingerprint.js` to verify TLS parity against `transport-baseline.json`.
-- **Automatic installer migration (`v2.3.6` to `v2.3.10`):** `install.sh` installs Bun automatically if missing and rewrites existing `systemd` or `launchd` service units from `node` to `bun` during upgrades.
-- **Full source and catalog derivation (`v2.2` to `v2.3.10`):** All hardcoded model tables (`MODEL_MAP`) and model-name substring heuristics have been removed. The bridge derives its client version, commit SHA, session ID format (`ses_` + 12 hex + 14 base62), 7 gate headers, 13 tool plugins (parsed from upstream's Effect Schema AST in GitHub source), inference endpoints (`chatUrl` and `responsesUrl`), active free models, shorthand family aliases, and reasoning token limits directly from OpenCode's update API, GitHub repository, and `models.opencode.ai/api.json`.
-- **On-disk catalog cache for instant cold starts (`v2.3.8` to `v2.3.10`):** After fetching `models.opencode.ai/api.json`, the bridge caches the catalog at `~/.opencode-free-bridge/cache/catalog.json` and loads it at module boot. Model aliases (`mimo`, `longcat`, `beam`), deprecated/paid model checks, and reasoning token budgets work on the very first request after startup and when offline.
-- **Multi-layer reactive self-healing (`v2.3.7` to `v2.3.10`):** When upstream rejects a request with `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a moved endpoint path, the bridge refreshes its recipe and catalog from upstream, evicts stale session IDs from cache, mints a new session ID, escalates to the full 12-tool profile, and retries once transparently before returning to the client.
+- **Bun transport parity (`v2.3.6+`):** The OpenCode CLI ships as a compiled Bun binary, and upstream's free-tier gate inspects the TLS `ClientHello` fingerprint (17 cipher suites, 12 TLS extensions in a fixed order). The bridge runs on Bun (`bun server.js`), refuses accidental Node.js startups unless `ALLOW_NODE=1` is set for offline tests, and ships `transport-fingerprint.js` to verify TLS parity against `transport-baseline.json`.
+- **Zero-dead-end installer (`v2.3.6` to `v2.3.11`):** `install.sh` finds or installs Bun (and `unzip` when missing on minimal Linux), stages and syntax-checks every file before touching a running bridge, retires legacy `opencode-bridge.service` units, rewrites `node` units to `bun`, configures `systemd` (Linux) or `launchd` with log redirection (macOS), verifies `/health` and the TLS fingerprint baseline, and exits non-zero if the service never answers.
+- **Full source and catalog derivation (`v2.2` to `v2.3.11`):** All hardcoded model tables (`MODEL_MAP`) and model-name substring heuristics have been removed. The bridge derives its client version, commit SHA, session ID format (`ses_` + 12 hex + 14 base62), 7 gate headers, 13 tool plugins (parsed from upstream's Effect Schema AST in GitHub source), inference endpoints (`chatUrl` and `responsesUrl`), active free models, shorthand family aliases, and reasoning token limits directly from OpenCode's update API, GitHub repository, and `models.opencode.ai/api.json`.
+- **On-disk catalog cache for instant cold starts (`v2.3.8` to `v2.3.11`):** After fetching `models.opencode.ai/api.json`, the bridge caches the catalog at `~/.opencode-free-bridge/cache/catalog.json` and loads it at module boot (`OPENCODE_CACHE_DIR=off` disables disk caching). Model aliases (`mimo`, `longcat`, `beam`), deprecated/paid model checks, and reasoning token budgets work on the very first request after startup and when offline.
+- **Multi-layer reactive self-healing (`v2.3.7` to `v2.3.11`):** When upstream rejects a request with `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a moved endpoint path, the bridge refreshes its recipe and catalog from upstream, evicts stale session IDs from cache, mints a new session ID, escalates to the full 12-tool profile, and retries once transparently before returning to the client.
 
 ## Features
 
@@ -61,14 +61,14 @@ curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main
 ```
 
 What `install.sh` does:
-1. Finds `bun`, or installs it via `https://bun.sh/install` when it is missing.
-2. Downloads every file into a staging directory and validates it (syntax and JSON) before touching anything that is already running.
-3. Retires a pre-2.3 `opencode-bridge.service` that would otherwise hold port 20129, and stops this installer's own running bridge if you are re-running it.
-4. Backs up the previous install under `~/.opencode-free-bridge/.backup-*`, then copies the new files in.
-5. Registers and starts the background service (`systemd` on Linux, `launchd` on macOS) on `127.0.0.1:20129`.
-6. Waits for `/health`, runs the quick self-check, and checks the Bun TLS fingerprint against the recorded CLI baseline.
+1. Finds `bun` across `PATH`, `$BUN_INSTALL/bin`, `~/.bun/bin`, `~/.local/bin`, `/usr/local/bin`, and `/opt/bun/bin`, or installs it via `https://bun.sh/install` (installing `unzip` first on minimal Linux images when needed).
+2. Downloads every file into a staging directory and validates it (in-process JS syntax compilation and JSON parsing) before touching anything that is already running.
+3. Checks port availability (`ss` or `lsof`), retires a pre-2.3 `opencode-bridge.service` that would hold port 20129, and stops its own running bridge when upgrading in place.
+4. Backs up the previous install under `~/.opencode-free-bridge/.backup-*`, then moves the staged files into place.
+5. Registers and starts the background service (`systemd` system or `--user` unit on Linux, `launchd` agent with `~/Library/Logs/opencode-free-bridge.log` on macOS).
+6. Waits up to 20 seconds for `/health`, runs the quick self-check, and checks the Bun TLS fingerprint against `transport-baseline.json`.
 
-If the bridge does not answer after 20 seconds the installer exits non-zero and tells you where the log is. It only prints `Done` for a bridge that responded.
+If the bridge does not answer after 20 seconds, the installer exits with code `1` and prints the exact log inspection command. It only prints `Done.` when the bridge is answering.
 
 Installer options:
 
@@ -240,7 +240,8 @@ curl -s http://127.0.0.1:20129/health
 {
   "status": "ok",
   "provider": "opencode-free-bridge",
-  "version": "2.3.10",
+  "version": "2.3.11",
+  "runtime": "bun/1.4.2",
   "discoveredModels": 10,
   "identity": {
     "userAgent": "opencode/latest/2.0.32/cli",
@@ -250,6 +251,16 @@ curl -s http://127.0.0.1:20129/health
     "lastCheckAgeMs": 1240,
     "ttlMs": 900000,
     "lastError": null,
+    "release": {
+      "version": "2.0.32",
+      "sha": "d4a6223d017e17f1beaa91d3e6ecc6511c5132ad",
+      "minimum": false,
+      "active": true,
+      "channel": "latest",
+      "source": "update-api",
+      "resolvedAt": 1760740000000,
+      "stale": false
+    },
     "available": null,
     "headers": [
       "x-opencode-session-id",
@@ -261,12 +272,16 @@ curl -s http://127.0.0.1:20129/health
       "x-opencode-client"
     ],
     "unsentHeaders": [],
-    "release": {
-      "version": "2.0.32",
-      "sha": "d4a6223d017e17f1beaa91d3e6ecc6511c5132ad",
-      "minimum": false,
-      "source": "update-api"
+    "endpoints": {
+      "chatUrl": "https://opencode.ai/inference/openai/v1/chat/completions",
+      "responsesUrl": "https://opencode.ai/inference/openai/v1/responses",
+      "modelsUrl": "https://opencode.ai/inference/v1/models",
+      "catalogBase": "https://opencode.ai/inference/openai/v1"
     },
+    "toolNames": [
+      "read", "shell", "edit", "write", "glob", "grep", "patch",
+      "question", "skill", "subagent", "webfetch", "websearch", "execute"
+    ],
     "tools": {
       "source": "source",
       "version": "2.0.32",
@@ -282,18 +297,14 @@ curl -s http://127.0.0.1:20129/health
 ## Testing, Verification & Gate Drills
 
 ```bash
-bun test                        # 107 offline unit, contract, and regression tests
+bun test                        # 118 offline unit, contract, and regression tests
 bun run verify                  # live check: probes every discovered free model
 bun run verify:quick            # live check: stops at the first model that answers
 bun run drill                   # runs live + offline self-healing gate drills
 bun run fingerprint:check       # checks Bun TLS ClientHello against transport-baseline.json
 ```
 
-`verify.js` exits `0` when a model answers, `2` when the bridge is healthy but
-upstream refuses this IP's free-tier allowance, and `1` for a real failure. The
-`2` case is what a throttled network looks like: the official OpenCode CLI gets
-the same `403 FreeTierError` from the same IP at the same moment, so it is not a
-reason to reinstall or edit headers.
+`verify.js` exits `0` when a model answers, `2` when the bridge is healthy and its TLS fingerprint matches the baseline but upstream refuses this IP's free-tier allowance, and `1` for a real failure (bridge unreachable, running on Node.js, or TLS fingerprint drift). The `2` case is what a throttled network looks like: the official OpenCode CLI gets the same `403 FreeTierError` from the same IP at the same moment, so it is not a reason to reinstall or edit headers.
 
 `gate-drill.js` deliberately corrupts the bridge's state and verifies that a single client request triggers self-healing and still returns `HTTP 200`:
 

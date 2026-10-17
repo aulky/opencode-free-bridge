@@ -213,3 +213,49 @@ test("server refuses to start on Node without ALLOW_NODE", () => {
   assert.match(stderr, /requires Bun/);
   assert.match(stderr, /0\/6[\s\S]*6\/6/, "the message must cite the measurement");
 });
+
+test("self-updater in server.js parses JS and JSON in-process instead of spawning bun --check", async () => {
+  const serverPath = path.join(__dirname, "..", "server.js");
+  const src = fs.readFileSync(serverPath, "utf8");
+  assert.doesNotMatch(src, /\["--check"/, "server.js must not invoke --check on Bun");
+  assert.match(src, /new Function\(text\.replace\(\/\^#!\.\*\\n\/, ""\)\)/);
+
+  const srv = require("../server");
+  const origFetch = global.fetch;
+  const prevAuto = process.env.AUTO_UPDATE;
+  process.env.AUTO_UPDATE = "force";
+  srv.__setLastUpdateCheck(0);
+  try {
+    global.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("package.json")) {
+        return {
+          ok: true,
+          json: async () => ({ version: "99.0.0" }),
+          text: async () => JSON.stringify({ name: "opencode-free-bridge", version: "99.0.0" }),
+        };
+      }
+      if (u.includes("identity.js")) {
+        return {
+          ok: true,
+          text: async () => "const broken = {{{ syntax error;",
+        };
+      }
+      return { ok: true, text: async () => "// valid placeholder script content\nmodule.exports = {};" };
+    };
+    const res = await srv.checkAndApplyUpdate();
+    assert.equal(res.updated, false);
+    assert.match(res.error, /syntax check failed for identity\.js/);
+  } finally {
+    global.fetch = origFetch;
+    if (prevAuto === undefined) delete process.env.AUTO_UPDATE;
+    else process.env.AUTO_UPDATE = prevAuto;
+    srv.__setLastUpdateCheck(Date.now());
+  }
+});
+
+test("verify.js checks runtime and TLS baseline before blaming the IP for a closed gate", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "verify.js"), "utf8");
+  assert.match(src, /health\.runtime\.startsWith\("node\/"\)/);
+  assert.match(src, /TLS fingerprint drift detected/);
+});

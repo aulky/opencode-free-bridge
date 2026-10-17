@@ -19,7 +19,8 @@
 const http = require("http");
 
 const PORT = parseInt(process.env.PORT || "20129", 10);
-const HOST = process.env.HOST || "127.0.0.1";
+const RAW_HOST = process.env.HOST || "127.0.0.1";
+const HOST = RAW_HOST === "0.0.0.0" || RAW_HOST === "::" ? "127.0.0.1" : RAW_HOST;
 const BASE = `http://${HOST}:${PORT}`;
 const QUICK = process.argv.includes("--quick");
 
@@ -73,6 +74,7 @@ async function checkHealth() {
   return {
     ok: true,
     version: res.body.version,
+    runtime: res.body.runtime || null,
     models: res.body.discoveredModels,
   };
 }
@@ -190,6 +192,36 @@ async function probe(model) {
   }
 
   if (blocked > 0 && broken === 0) {
+    if (counts["gate-closed"] > 0) {
+      if (typeof health.runtime === "string" && health.runtime.startsWith("node/")) {
+        console.log(`\n  ${bad("Server is running on Node.js, not Bun.")}`);
+        console.log(`  ${C.dim}The bridge reported runtime ${health.runtime}. Upstream rejects Node's TLS ClientHello with 403 FreeTierError.${C.reset}`);
+        console.log(`  ${C.dim}Restart the bridge with Bun: ${C.reset}${C.cyan}bun server.js${C.reset}\n`);
+        process.exit(1);
+      }
+      if (process.versions.bun) {
+        let tlsDrift = null;
+        try {
+          const fs = require("fs");
+          const path = require("path");
+          const basePath = path.join(__dirname, "transport-baseline.json");
+          if (fs.existsSync(basePath)) {
+            const { capture, describe } = require("./transport-fingerprint");
+            const base = JSON.parse(fs.readFileSync(basePath, "utf8"));
+            const now = describe(await capture());
+            const sameCiphers = JSON.stringify(base.ciphers) === JSON.stringify(now.ciphers);
+            const sameExts = JSON.stringify(base.extensions) === JSON.stringify(now.extensions);
+            if (!sameCiphers || !sameExts) tlsDrift = { now, base };
+          }
+        } catch {}
+        if (tlsDrift) {
+          console.log(`\n  ${bad("TLS fingerprint drift detected.")}`);
+          console.log(`  ${C.dim}This Bun runtime (${tlsDrift.now.runtime}) does not match the recorded OpenCode CLI baseline (${tlsDrift.base.runtime}).${C.reset}`);
+          console.log(`  ${C.dim}Inspect: ${C.reset}${C.cyan}bun transport-fingerprint.js --check${C.reset}\n`);
+          process.exit(1);
+        }
+      }
+    }
     // Exit 2 is deliberately distinct from 1: the install is correct, the IP
     // is not currently allowed. The installer and CI can tell these apart.
     console.log(`\n  ${warn("Bridge is healthy, but upstream refused this IP.")}`);

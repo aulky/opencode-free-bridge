@@ -61,7 +61,7 @@ find_bun() {
     return 0
   fi
   local candidate
-  for candidate in "${BUN_INSTALL:-}/bin/bun" "$HOME/.bun/bin/bun" /usr/local/bin/bun /opt/bun/bin/bun; do
+  for candidate in "${BUN_INSTALL:-}/bin/bun" "$HOME/.bun/bin/bun" "$HOME/.local/bin/bun" /usr/local/bin/bun /opt/bun/bin/bun; do
     if [ -n "$candidate" ] && [ -x "$candidate" ]; then
       printf '%s\n' "$candidate"
       return 0
@@ -85,6 +85,24 @@ else
   # The one-line installer exists so a new user does not have to read a manual.
   # Telling them "install Bun first" and exiting defeats that, so install it.
   say "Bun is not installed; installing it now (required for the transport fingerprint)"
+  if ! command -v unzip >/dev/null 2>&1 && ! command -v 7z >/dev/null 2>&1; then
+    if [ "$(id -u)" = "0" ] || (command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1); then
+      SUDO_CMD=""
+      [ "$(id -u)" != "0" ] && SUDO_CMD="sudo -n"
+      say "Installing unzip (required by the Bun installer)..."
+      if command -v apt-get >/dev/null 2>&1; then
+        $SUDO_CMD apt-get update -qq >/dev/null 2>&1 && $SUDO_CMD apt-get install -y -qq unzip >/dev/null 2>&1 || true
+      elif command -v dnf >/dev/null 2>&1; then
+        $SUDO_CMD dnf install -y -q unzip >/dev/null 2>&1 || true
+      elif command -v yum >/dev/null 2>&1; then
+        $SUDO_CMD yum install -y -q unzip >/dev/null 2>&1 || true
+      elif command -v apk >/dev/null 2>&1; then
+        $SUDO_CMD apk add --no-cache -q unzip >/dev/null 2>&1 || true
+      elif command -v pacman >/dev/null 2>&1; then
+        $SUDO_CMD pacman -Sy --noconfirm unzip >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
   if command -v curl >/dev/null 2>&1; then
     if ! curl -fsSL https://bun.sh/install | bash >/tmp/ofb-bun-install.log 2>&1; then
       warn "Bun installation failed. Log:"
@@ -179,8 +197,15 @@ migrate_service_runtime
 # forever. A user who finds this repo and re-runs the installer on a machine
 # that still has the old bridge should get an upgrade, not a port fight.
 port_holder() {
-  command -v ss >/dev/null 2>&1 || return 0
-  ss -tlnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print; exit}'
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlnp 2>/dev/null | awk -v p=":$PORT$" '$4 ~ p {print; exit}'
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print; exit}'
+    return 0
+  fi
+  return 0
 }
 
 legacy_unit_active() {
@@ -197,7 +222,15 @@ legacy_unit_active() {
 # pipeline whose `grep` finds nothing exits 1, which would abort the whole
 # install with no message. Every probe here must be allowed to come up empty.
 pid_on_port() {
-  port_holder | grep -oP 'pid=\K[0-9]+' | head -1 || true
+  local pid
+  pid="$(port_holder | grep -oP 'pid=\K[0-9]+' | head -1 || true)"
+  if [ -z "$pid" ]; then
+    pid="$(port_holder | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1 || true)"
+  fi
+  if [ -z "$pid" ] && command -v lsof >/dev/null 2>&1; then
+    pid="$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+  fi
+  printf '%s\n' "$pid"
 }
 
 port_held_by_own_bridge() {
@@ -210,10 +243,12 @@ port_held_by_own_bridge() {
   # " (deleted)" once the install directory has been replaced, which must not
   # defeat the match.
   cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null | sed 's/ (deleted)$//' || true)"
-  target="$(readlink -f "$BINDIR" 2>/dev/null || true)"
+  target="$(readlink -f "$BINDIR" 2>/dev/null || printf '%s' "$BINDIR")"
   [ -n "$cwd" ] && [ -n "$target" ] && [ "$cwd" = "$target" ] && return 0
 
   tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$BINDIR/server.js" && return 0
+  ps -p "$pid" -o command= 2>/dev/null | grep -qF "$BINDIR/server.js" && return 0
+  command -v lsof >/dev/null 2>&1 && lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | grep -qF "n$target" && return 0
   return 1
 }
 
@@ -342,8 +377,10 @@ syntax_check() {
 for js in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js; do
   syntax_check "$STAGE/$js" >/dev/null 2>&1 || die "$js failed a syntax check; the running bridge was left untouched"
 done
-"$RUNTIME" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$STAGE/package.json" \
-  || die "package.json is not valid JSON; the running bridge was left untouched"
+for json in package.json transport-baseline.json; do
+  "$RUNTIME" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$STAGE/$json" \
+    || die "$json is not valid JSON; the running bridge was left untouched"
+done
 
 # Staged and validated. Only now is it safe to stop the old bridge.
 retire_legacy_service
@@ -364,10 +401,11 @@ fi
 for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json; do
   mv -f "$STAGE/$file" "$BINDIR/$file"
 done
-chmod +x "$BINDIR/server.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" 2>/dev/null || true
+chmod +x "$BINDIR/server.js" "$BINDIR/identity.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" "$BINDIR/transport-fingerprint.js" 2>/dev/null || true
 say "Files installed (v$("$RUNTIME" -e 'try{process.stdout.write(require(process.argv[1]).version||"latest")}catch{process.stdout.write("latest")}' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
 
 # ---------------------------------------------------------------- service ---
+SERVICE_SCOPE="none"
 install_service() {
   local os
   os="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -402,6 +440,7 @@ UNIT
         warn "systemd refused to start opencode-free-bridge — inspect: systemctl status opencode-free-bridge"
         return 1
       fi
+      SERVICE_SCOPE="system"
       say "systemd service installed and restarted"
       return 0
     elif systemctl --user status >/dev/null 2>&1; then
@@ -431,6 +470,8 @@ UNIT
         warn "systemd --user refused to start opencode-free-bridge — inspect: systemctl --user status opencode-free-bridge"
         return 1
       fi
+      SERVICE_SCOPE="user"
+      command -v loginctl >/dev/null 2>&1 && loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
       say "systemd --user service installed and restarted"
       return 0
     else
@@ -463,6 +504,7 @@ PLIST
     mkdir -p "$HOME/Library/Logs"
     launchctl unload "$plist" >/dev/null 2>&1 || true
     launchctl load "$plist"
+    SERVICE_SCOPE="launchd"
     say "launchd agent installed and restarted"
     return 0
   fi
@@ -502,25 +544,42 @@ if [ "$SERVICE_OK" != "1" ]; then
   popd >/dev/null
 fi
 
+PROBE_HOST="$HOST"
+if [ "$PROBE_HOST" = "0.0.0.0" ] || [ "$PROBE_HOST" = "::" ]; then
+  PROBE_HOST="127.0.0.1"
+fi
+
+probe_health() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 2 "http://$PROBE_HOST:$PORT/health" >/dev/null 2>&1
+  else
+    "$RUNTIME" -e 'fetch(process.argv[1],{signal:AbortSignal.timeout(2000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' "http://$PROBE_HOST:$PORT/health" >/dev/null 2>&1
+  fi
+}
+
 say "Waiting for the bridge to come up..."
 BRIDGE_UP=0
 for _ in $(seq 1 20); do
   # -m matters: a HOST that is not routable makes curl hang for minutes, and
   # the installer used to sit there until the user killed it.
-  if curl -fsS -m 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then BRIDGE_UP=1; break; fi
+  if probe_health; then BRIDGE_UP=1; break; fi
   sleep 1
 done
 
 if [ "$BRIDGE_UP" != "1" ]; then
-  warn "the bridge did not answer on http://$HOST:$PORT/health after 20s"
+  warn "the bridge did not answer on http://$PROBE_HOST:$PORT/health after 20s"
   if [ "$SERVICE_OK" = "1" ]; then
-    warn "inspect: systemctl status opencode-free-bridge ; journalctl -u opencode-free-bridge -n 30"
+    if [ "$SERVICE_SCOPE" = "user" ]; then
+      warn "inspect: systemctl --user status opencode-free-bridge ; journalctl --user -u opencode-free-bridge -n 30"
+    else
+      warn "inspect: systemctl status opencode-free-bridge ; journalctl -u opencode-free-bridge -n 30"
+    fi
   else
     warn "inspect: $BINDIR/bridge.log"
   fi
   die "install finished but the service is not running"
 fi
-say "Bridge is answering on http://$HOST:$PORT"
+say "Bridge is answering on http://$PROBE_HOST:$PORT"
 
 echo
 say "Running self-check (quick — full check: $RUNTIME $BINDIR/verify.js)"
@@ -566,9 +625,9 @@ echo
 say "Done."
 cat <<NEXT
 
-  Endpoint : http://$HOST:$PORT/v1
+  Endpoint : http://$PROBE_HOST:$PORT/v1
   API key  : public  (any value is accepted)
-  Models   : curl http://$HOST:$PORT/v1/models
+  Models   : curl http://$PROBE_HOST:$PORT/v1/models
 
   Add it to 9Router, Cursor, Continue, or any OpenAI-compatible client as a
   custom provider. Re-run the self-check any time with:
@@ -578,7 +637,9 @@ cat <<NEXT
 NEXT
 
 if [ "$SERVICE_OK" = "1" ]; then
-  if command -v systemctl >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
+  if [ "$SERVICE_SCOPE" = "user" ]; then
+    echo "  Logs     : journalctl --user -u opencode-free-bridge -f"
+  elif [ "$SERVICE_SCOPE" = "system" ]; then
     echo "  Logs     : journalctl -u opencode-free-bridge -f"
   else
     echo "  Logs     : tail -f ~/Library/Logs/opencode-free-bridge.log"

@@ -22,7 +22,7 @@ This file gives AI coding agents (OpenCode, Claude Code, Cursor, Codex, Cline, A
 
 ### Option A: Standard system install (recommended for persistent background service)
 
-Run the installer script. It installs `bun` if missing, places files in `~/.opencode-free-bridge`, migrates any legacy `node` service units to `bun`, and starts the `opencode-free-bridge` service (`systemd` on Linux, `launchd` on macOS):
+Run the installer script. It finds or installs `bun` (installing `unzip` first on minimal Linux if needed), stages and validates files before touching a running service, retires legacy `opencode-bridge.service` units, places files in `~/.opencode-free-bridge`, migrates any `node` service units to `bun`, starts the `opencode-free-bridge` service (`systemd` on Linux, `launchd` on macOS), and verifies `/health` and the TLS baseline:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main/install.sh | bash
@@ -60,7 +60,10 @@ curl -s http://127.0.0.1:20129/v1/models
 # 3. Verify Bun TLS ClientHello matches the OpenCode CLI baseline
 bun transport-fingerprint.js --check
 
-# 4. Send a test chat completion request
+# 4. Run the quick readiness check (exits 0 if a model answers, 2 if IP quota is throttled, 1 if broken)
+bun verify.js --quick
+
+# 5. Send a test chat completion request
 curl -s http://127.0.0.1:20129/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"mimo-v2.6-flash-free","messages":[{"role":"user","content":"Reply with OK"}]}'
@@ -79,7 +82,7 @@ Use these connection details in any OpenAI-compatible tool:
 
 ### Current active free models (also supports family shorthands)
 
-Always verify via `GET /v1/models`. As of catalog sync `v2.3.10`:
+Always verify via `GET /v1/models`. As of catalog sync `v2.3.11`:
 - `mimo-v2.6-flash-free` (shorthand: `mimo`)
 - `big-pickle` (shorthand: `big-pickle`)
 - `beam-free` (shorthand: `beam`)
@@ -108,12 +111,13 @@ When a user reports an error, diagnose it using this decision table before chang
 | Symptom | Root Cause | Action to Take |
 |---|---|---|
 | `node server.js` exits with `opencode-free-bridge requires Bun` | Server was launched with Node.js instead of Bun | Launch with `bun server.js` (or run `bash install.sh` to rewrite the systemd/launchd service unit to use `bun`). |
-| `HTTP 403 FreeTierError` returned to client **after** logs show `refreshing identity and retrying once with full tool set` | Upstream per-IP free-tier quota is temporarily exhausted on this network | **Do not modify headers or code.** Confirm by running `bun gate-drill.js`: if `upstream control` says `HTTP 403 -> gate CLOSED`, the IP itself is throttled by `opencode.ai` (the official `opencode` CLI binary fails with the exact same 403 on this IP). Wait for cooldown or use another IP/VPS tunnel. |
-| `bun: command not found` in a fresh SSH session, but the service is healthy | `bun.sh/install` only edits an interactive shell's PATH | Use the absolute path the installer printed (`~/.bun/bin/bun`) or export `PATH="$HOME/.bun/bin:$PATH"`. Do not reinstall. |
+| `HTTP 403 FreeTierError` returned to client **after** logs show `refreshing identity and retrying once with full tool set` (and `verify.js` exits `2` with `GATE`) | Upstream per-IP free-tier quota is temporarily exhausted on this network | **Do not modify headers or code.** Confirm by running `bun gate-drill.js`: if `upstream control` says `HTTP 403 -> gate CLOSED`, the IP itself is throttled by `opencode.ai` (the official `opencode` CLI binary fails with the exact same 403 on this IP). Wait for cooldown or use another IP/VPS tunnel. |
+| `verify.js` exits `1` with `TLS fingerprint drift detected` or `Server is running on Node.js` | The runtime's TLS `ClientHello` does not match `transport-baseline.json` | Run `bun transport-fingerprint.js --check` to inspect cipher/extension differences, and ensure the service runs under a current Bun 1.4+ binary. |
+| `bun: command not found` in a fresh SSH session, but the service is healthy | `bun.sh/install` only edits an interactive shell's PATH | Use the absolute path (`~/.bun/bin/bun`) or export `PATH="$HOME/.bun/bin:$PATH"`. Do not reinstall. |
 | `HTTP 429` or `BUSY` in `verify.js` | Upstream model capacity limit | Switch to another model ID from `GET /v1/models`. |
 | `HTTP 404 Model '<id>' has been retired upstream` | Client requested a deprecated model (e.g. `cat-jam-free`, `muse-spark-*`, `step-5-preview-free`) | Fetch `GET /v1/models` and update the client configuration to use an active model ID. |
-| `HTTP 404 Model '<id>' is not on OpenCode's free tier` | Client requested a paid model (e.g. `gpt-5.4`, `claude-sonnet-4-5`) | The bridge only serves zero-cost models (`cost.input === 0`). Pick a model from `GET /v1/models`. |
-| Old `opencode-bridge.service` conflict on port `20129` | A legacy pre-v2 service unit is still running Node.js on port `20129` | Stop and remove the legacy unit (`systemctl --user disable --now opencode-bridge.service`), then run `bash install.sh`. |
+| `HTTP 404 Model '<id>' is not on the free tier` | Client requested a paid model (e.g. `gpt-5.4`, `claude-sonnet-4-5`) | The bridge only serves zero-cost models (`cost.input === 0`). Pick a model from `GET /v1/models`. |
+| Port conflict (`port 20129 is occupied by another process`) during `install.sh` | Another non-bridge process is listening on port 20129 | Stop the conflicting process or install on another port (`PORT=20130 bash install.sh`). Legacy `opencode-bridge.service` and the bridge's own process are retired/replaced automatically. |
 
 ---
 

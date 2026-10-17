@@ -114,13 +114,23 @@ test("refresh populates catalog when freeModels is empty even if CLI version is 
       return { ok: false, status: 404 };
     };
     const prevCacheDir = process.env.OPENCODE_CACHE_DIR;
-    process.env.OPENCODE_CACHE_DIR = path.join(require("os").tmpdir(), `ofb-test-${process.pid}`);
+    const tmpCacheDir = path.join(require("os").tmpdir(), `ofb-test-${process.pid}-${Date.now()}`);
+    process.env.OPENCODE_CACHE_DIR = tmpCacheDir;
     try {
       const res = await identity.refresh({ recheck: true });
       assert.equal(res.reason, "up-to-date");
       assert.deepEqual(identity.getFreeModels(), ["mimo-v2.6-flash-free"]);
       assert.equal(identity.resolveModelAlias("mimo"), "mimo-v2.6-flash-free");
+      assert.equal(fs.existsSync(path.join(tmpCacheDir, "catalog.json")), true);
+
+      // OPENCODE_CACHE_DIR=off disables disk writes without creating "./off"
+      process.env.OPENCODE_CACHE_DIR = "off";
+      await identity.extractCatalog();
+      assert.equal(fs.existsSync(path.join(process.cwd(), "off")), false);
     } finally {
+      try {
+        fs.rmSync(tmpCacheDir, { recursive: true, force: true });
+      } catch {}
       if (prevCacheDir === undefined) delete process.env.OPENCODE_CACHE_DIR;
       else process.env.OPENCODE_CACHE_DIR = prevCacheDir;
     }

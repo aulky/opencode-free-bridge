@@ -1,3 +1,41 @@
+## 2.3.11 — full repository, self-updater, and universal installer audit
+
+- **Self-updater on Bun (`server.js`):** `checkAndApplyUpdate()` previously ran
+  `spawnSync(process.execPath, ["--check", tmpPath])` on downloaded `.js` files.
+  Because Bun has no `--check` flag, it executed each staged script (`verify.js`,
+  `gate-drill.js`, `server.js`) as an entrypoint and aborted every self-update on
+  `server.js` (`EADDRINUSE`). It now validates `.js` files in-process via
+  `new Function`, validates `.json` files via `JSON.parse`, and appends `?cb=` to
+  bypass GitHub raw CDN caching.
+- **Installer universal onboarding (`install.sh`):**
+  - Automatically installs `bun` via `https://bun.sh/install` when missing (and
+    auto-installs `unzip` first on minimal Debian/Ubuntu/RHEL/Alpine/Arch images
+    when running as root or with passwordless `sudo`).
+  - Bounds `/health` readiness checks (`-m 2`, 20 attempts), normalizes wildcard
+    bind addresses (`0.0.0.0` / `::` -> `127.0.0.1`), falls back to `$RUNTIME`
+    `fetch` if `curl` is absent, and exits `1` instead of printing `Done.` if the
+    service never comes up.
+  - Runs `transport-fingerprint.js --check` during install and configures
+    `StandardOutPath` / `StandardErrorPath` in the macOS `launchd` plist so
+    `~/Library/Logs/opencode-free-bridge.log` is created as documented.
+  - Adds `lsof`, `ps`, and POSIX `sed` fallbacks to `port_holder`, `pid_on_port`,
+    and `port_held_by_own_bridge` so port conflict detection and in-place upgrades
+    work on macOS, BusyBox/Alpine, and minimal Linux containers without `ss` or
+    GNU `grep -P`.
+  - Tracks `SERVICE_SCOPE` (`system`, `user`, `launchd`) to enable `loginctl
+    enable-linger` for user units and print the exact `journalctl --user` vs
+    `journalctl` log command.
+- **TLS drift vs IP quota in `verify.js` & `/health`:** `/health` now reports
+  `runtime` (`bun/<ver>` or `node/<ver>`). When all probes return `gate-closed`
+  (`403 FreeTierError`), `verify.js` checks both `health.runtime` and the local
+  TLS `ClientHello` against `transport-baseline.json` so a Node.js deployment or
+  drifted Bun binary exits `1` with a clear error instead of exiting `2` (`GATE`
+  / IP quota).
+- **Catalog cache disable switch (`identity.js`):** Setting
+  `OPENCODE_CACHE_DIR=off` (or `0`/`false`/`none`) now disables disk caching as
+  documented rather than creating a literal `./off` directory.
+
+
 ## 2.3.10 — onboarding hardened by deploying to three real hosts
 
 This release came out of installing v2.3.9 the way a stranger would: a clean
