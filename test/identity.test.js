@@ -250,6 +250,20 @@ describe("identity: recipe & tool extraction", () => {
     assert.deepEqual(r, {});
   });
 
+  // The fallback header list is what the bridge sends when the source read
+  // fails, and it is also the baseline the extractor is tested against. Adding
+  // a header here that upstream does not emit makes the bridge claim a wire
+  // shape the real CLI never sends, and the next successful refresh silently
+  // removes it again (measured: a host showed 8 headers, then 7 after refresh).
+  it("ships only header names that upstream's request builder actually sets", () => {
+    const upstream = identity.extractRecipe(SOURCE).headers;
+    assert.deepEqual(
+      [...identity.DEFAULT_RECIPE.headers].sort(),
+      [...upstream].sort(),
+      "DEFAULT_RECIPE.headers must match the names parsed from model-request.ts"
+    );
+  });
+
   it("ignores an implausible session length", () => {
     const r = identity.extractRecipe({ identifier: 'const length = 3\nconst chars = "ab"' });
     assert.equal(r.sessionLength, undefined);
