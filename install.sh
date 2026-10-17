@@ -6,7 +6,9 @@
 # What it does:
 #   1. requires Bun. The CLI ships as a Bun binary and the free-tier gate checks
 #      the transport fingerprint: measured 200 on Bun, 403 on Node and curl.
-#   2. copies server.js, token-budget.js and verify.js into an install dir
+#   2. copies the bridge and its tools into an install dir (server.js,
+#      identity.js, token-budget.js, verify.js, gate-drill.js and the
+#      transport-fingerprint files), backing up any existing install first
 #   3. registers a service so the bridge starts on boot and restarts on crash
 #      (systemd on Linux, launchd on macOS, a logon task on Windows Git Bash)
 #   4. starts it and runs the self-check

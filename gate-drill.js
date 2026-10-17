@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * gate-drill.js — prove the reactive self-heal against the *real* upstream gate.
  *

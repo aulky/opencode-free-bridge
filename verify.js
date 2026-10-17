@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * verify.js — self-check for opencode-free-bridge.
  *

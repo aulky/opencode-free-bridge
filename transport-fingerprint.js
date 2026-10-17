@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * transport-fingerprint.js — record and compare the outbound TLS ClientHello.
  *

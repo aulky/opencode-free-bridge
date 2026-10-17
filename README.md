@@ -107,7 +107,7 @@ NO_SERVICE=1 bash install.sh                                 # skip the boot ser
 ```bash
 git clone https://github.com/azrinaldi/opencode-free-bridge
 cd opencode-free-bridge
-node server.js
+bun server.js
 ```
 
 The bridge listens on `http://127.0.0.1:20129` by default.
@@ -116,9 +116,10 @@ The bridge listens on `http://127.0.0.1:20129` by default.
 
 ```bash
 npm test                # offline unit & HTTP contract tests (no network)
-node verify.js          # live check: every model, real prompt
-node verify.js --quick  # live check: one short probe per model
+npm run verify          # live check: every model, real prompt
+npm run verify:quick    # live check: stops at the first model that answers
 npm run drill           # gate drill: prove the self-heal actually heals
+npm run fingerprint:check   # assert this runtime's TLS fingerprint matches the CLI
 ```
 
 `npm run drill` deliberately starts the bridge in a state upstream rejects, sends
