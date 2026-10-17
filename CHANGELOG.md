@@ -1,3 +1,57 @@
+## 2.3.7 — every layer broken at once, and a measurement that corrects the record
+
+The existing drills each break one layer. A real upstream change does not: it
+moves the version floor, changes the session shape and replaces the tool set in
+the same release. New drill `full-corrupt` stages exactly that.
+
+It corrupts, in one step:
+
+| layer | corrupted to |
+|---|---|
+| version | 0.9.9 |
+| session prefix | `old_` |
+| session length | 20 (valid range, wrong value) |
+| session charset | hex only |
+| tool set | the shipped default instead of the derived profile |
+
+Then it sends **one** client request to a local gate that rejects on all of
+them, and asserts against the values derived from source rather than hardcoded
+expectations, so it keeps working when upstream changes.
+
+Result — one request, one retry:
+
+```
+attempt 1  sid=old_eb6092e5  ua=0.9.9   tools=2   rejected: session,tools
+attempt 2  sid=ses_eb6092bf  ua=2.0.32  tools=12  accepted
+client saw HTTP 200 "HEALED"
+```
+
+Every layer verified healed: version 2.0.32, prefix `ses_`, length 26, charset
+62 chars, 13 tools, UA `opencode/latest/2.0.32/cli`.
+
+### After healing, does the wire match the CLI?
+
+Measured against the real CLI capture, after corrupting and healing:
+
+| | |
+|---|---|
+| headers | 5/5 identical |
+| body key order | identical |
+| tools | 11/12 byte-identical |
+| session id shape | same |
+| version + UA | 2.0.32, identical |
+
+The twelfth tool is `subagent`, whose description the CLI extends with a runtime
+agent list this bridge does not have.
+
+### Correction: "retry once" is accurate, "endpoint heals inside the retry" is not
+
+While writing this drill I assumed a 403 retry would also pick up a changed
+endpoint. It does not: `identity.refresh()` legitimately owns the endpoint, so
+the retry targets whatever the refreshed recipe says. Endpoint migration is
+handled by the separate 404 path (`endpoint-move`), which is measured and
+passes. The two paths are distinct and are now documented as such.
+
 ## 2.3.6 — the installer returns, and the bridge survives it
 
 2.3.5 cut the self-check from eighteen minutes to seconds. The installer still

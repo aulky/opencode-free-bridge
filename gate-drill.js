@@ -62,6 +62,7 @@ const DRILLS = [
   "retry-endpoint",
   "endpoint-move",
   "gate-heal",
+  "full-corrupt",
 ];
 
 function ask(port, body) {
@@ -686,6 +687,163 @@ async function drillGateHeal({ identity }) {
   return Boolean(retry) && retry.ok && res.status === 200 && content(res).length > 0;
 }
 
+
+/**
+ * full-corrupt — break every adaptive layer at once, then prove one request
+ * heals them all.
+ *
+ * The other drills each break one layer. This one breaks all of them together,
+ * which is what a real upstream change looks like when it lands: the version
+ * floor moves, the session shape changes, and the tool set is replaced in the
+ * same release. The gate here is local and deterministic, so the drill reports
+ * a verdict even when the live IP is throttled.
+ *
+ * The layers corrupted:
+ *   version        -> 0.9.9 (below any floor)
+ *   session prefix -> old_
+ *   session length -> 20 (valid range, wrong value)
+ *   session charset-> hex only (wrong alphabet)
+ *   tool set       -> the shipped default instead of the derived profile
+ *
+ * Everything is asserted against the values derived from source, not against
+ * hardcoded expectations, so this keeps working when upstream changes them.
+ */
+async function drillFullCorrupt({ identity }) {
+  console.log("\nfull-corrupt — every layer broken at once, one request heals them");
+
+  await identity.refresh({ force: true });
+  const good = {
+    version: identity.getRecipe().version,
+    prefix: identity.getRecipe().sessionPrefix,
+    length: identity.getRecipe().sessionLength,
+    charset: identity.getRecipe().sessionCharset,
+    tools: Object.keys(identity.getTools()).sort().join(","),
+    ua: identity.getUserAgent(),
+  };
+
+  const SESSION = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+  const seen = [];
+  const fake = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      let body = {};
+      try {
+        body = JSON.parse(raw);
+      } catch {}
+      const sid = String(req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"] || "");
+      const ua = String(req.headers["user-agent"] || "");
+      const toolCount = Array.isArray(body.tools) ? body.tools.length : 0;
+      const bad = [];
+      if (!SESSION.test(sid)) bad.push("session");
+      if (!/^opencode\/latest\/\d+\.\d+\.\d+\/cli$/.test(ua)) bad.push("ua");
+      if (toolCount < 3) bad.push("tools");
+      seen.push({ sid, ua, toolCount, bad });
+
+      if (bad.length) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            type: "error",
+            error: { type: "FreeTierError", message: "rejected: " + bad.join(",") },
+          })
+        );
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { content: "HEALED" }, finish_reason: null }],
+        })}\n\n`
+      );
+      res.write(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })}\n\n`
+      );
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  await new Promise((r) => fake.listen(0, "127.0.0.1", r));
+  const fakePort = fake.address().port;
+
+  const beforeUrl = identity.getEndpoints().chatUrl;
+  const realOnGate = identity.onGateRejection;
+  identity.applyRecipe(
+    {
+      version: "0.9.9",
+      sessionPrefix: "old_",
+      sessionLength: 20,
+      sessionCharset: "abcdef0123456789",
+      chatUrl: `http://127.0.0.1:${fakePort}/v1/chat/completions`,
+    },
+    "full-corrupt"
+  );
+  identity.__setLastCheckTime(Date.now());
+
+  // Let the real onGateRejection run (that is the code under test); only pin the
+  // endpoint afterwards so the retry reaches this local gate instead of the
+  // internet. Endpoint healing itself is covered by endpoint-move.
+  identity.onGateRejection = async (status, type, msg, attempted) => {
+    const verdict = await realOnGate(status, type, msg, attempted);
+    identity.applyRecipe({ chatUrl: `http://127.0.0.1:${fakePort}/v1/chat/completions` });
+    return verdict;
+  };
+
+  let res;
+  try {
+    res = await ask(port(), {
+      model: "big-pickle",
+      messages: [{ role: "user", content: "Reply with exactly: OK" }],
+    });
+  } finally {
+    identity.onGateRejection = realOnGate;
+    identity.applyRecipe({ chatUrl: beforeUrl });
+    await new Promise((r) => fake.close(r));
+  }
+
+  const after = {
+    version: identity.getRecipe().version,
+    prefix: identity.getRecipe().sessionPrefix,
+    length: identity.getRecipe().sessionLength,
+    charset: identity.getRecipe().sessionCharset,
+    tools: Object.keys(identity.getTools()).sort().join(","),
+    ua: identity.getUserAgent(),
+  };
+
+  console.log(`  corrupted       : v0.9.9, old_/20, hex charset, shipped tools`);
+  console.log(`  attempts        : ${JSON.stringify(seen.map((s) => ({ sid: s.sid.slice(0, 12), ua: s.ua.split("/")[2] || "?", tools: s.toolCount, bad: s.bad })))}`);
+  console.log(`  client saw      : HTTP ${res.status} ${JSON.stringify(content(res))}`);
+
+  line(Boolean(seen[0]) && seen[0].bad.length > 0, "first attempt carried every broken layer");
+  line(Boolean(seen[1]) && seen[1].bad.length === 0, "the retry carried a fully healed shape");
+  line(res.status === 200, "client received 200, not the gate error");
+  line(after.version === good.version, `version healed to ${good.version}`, `(was 0.9.9)`);
+  line(after.prefix === good.prefix, `session prefix healed to ${good.prefix}`, `(was old_)`);
+  line(after.length === good.length, `session length healed to ${good.length}`, `(was 20)`);
+  line(after.charset === good.charset, `session charset healed`, `(${after.charset?.length} chars)`);
+  line(after.tools === good.tools, `tool set healed`, `(${after.tools.split(",").length} tools)`);
+  line(after.ua === good.ua, `User-Agent healed`, `(${after.ua})`);
+
+  return (
+    Boolean(seen[0]) &&
+    seen[0].bad.length > 0 &&
+    Boolean(seen[1]) &&
+    seen[1].bad.length === 0 &&
+    res.status === 200 &&
+    after.version === good.version &&
+    after.prefix === good.prefix &&
+    after.length === good.length &&
+    after.charset === good.charset &&
+    after.tools === good.tools &&
+    after.ua === good.ua
+  );
+}
+
 async function main() {
   const wanted = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const drills = wanted.length > 0 ? wanted : DRILLS;
@@ -746,6 +904,7 @@ async function main() {
       "retry-endpoint": drillRetryEndpoint,
       "endpoint-move": drillEndpointMove,
       "gate-heal": drillGateHeal,
+  "full-corrupt": drillFullCorrupt,
     };
     const fn = DRILL_FNS[name];
     // A cached session id from a previous drill would be reused for an
