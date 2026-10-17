@@ -57,6 +57,27 @@ test("installer rewrites a service unit that points at node", () => {
   assert.match(src, /\.bak/);
 });
 
+test("installer finds bun installed outside PATH", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // `curl https://bun.sh/install | bash` only edits an interactive shell's
+  // PATH. A non-interactive SSH session sees no bun even though it is present,
+  // which is exactly how a VPS install fails after a successful bun install.
+  assert.match(src, /find_bun/, "installer must probe standard bun locations");
+  assert.match(src, /\.bun\/bin\/bun/, "installer must look in ~/.bun/bin");
+});
+
+test("installer retires the pre-2.3 unit that owns the same port", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // Old releases shipped opencode-bridge.service. Leaving it enabled makes the
+  // new service restart-loop on EADDRINUSE, so an upgrade must stop and
+  // disable it instead of assuming a clean machine.
+  assert.match(src, /retire_legacy_service/);
+  assert.match(src, /opencode-bridge\.service/);
+  assert.match(src, /still in use/, "installer must report a port still held by another process");
+});
+
 test("server refuses to start on Node without ALLOW_NODE", () => {
   // This is a Node-specific behaviour, so it needs a real `node` binary — under
   // Bun, process.execPath is Bun and the server would (correctly) start.

@@ -42,9 +42,34 @@ esac
 # identical headers and body: the real CLI and the bridge on Bun both get 200,
 # while Node and curl get 403. The CLI ships as a Bun binary, and the free-tier
 # gate inspects the transport fingerprint, so only Bun reproduces it.
-if command -v bun >/dev/null 2>&1; then
-  RUNTIME="$(command -v bun)"
+#
+# `curl https://bun.sh/install | bash` puts bun in `$HOME/.bun/bin` and adds it
+# to an *interactive* shell's PATH only. A non-interactive SSH session, a cron
+# job, or this installer running under `sh -c` therefore sees no `bun` even
+# though the binary is present. Look in the standard locations before
+# concluding it is missing.
+find_bun() {
+  if command -v bun >/dev/null 2>&1; then
+    command -v bun
+    return 0
+  fi
+  local candidate
+  for candidate in "${BUN_INSTALL:-}/bin/bun" "$HOME/.bun/bin/bun" /usr/local/bin/bun /opt/bun/bin/bun; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if BUN_BIN="$(find_bun)"; then
+  RUNTIME="$BUN_BIN"
   say "runtime: bun ($("$RUNTIME" --version)) — matches the CLI's transport"
+  case ":$PATH:" in
+    *":$(dirname "$RUNTIME"):"*) ;;
+    *) warn "bun is not on PATH; using $RUNTIME. Add $(dirname "$RUNTIME") to PATH for manual runs." ;;
+  esac
 elif [ -n "${ALLOW_NODE:-}" ] && command -v node >/dev/null 2>&1; then
   RUNTIME="$(command -v node)"
   warn "runtime: node — NOT supported for live use. The free-tier gate refuses Node's"
@@ -118,6 +143,55 @@ migrate_service_runtime() {
   fi
 }
 migrate_service_runtime
+
+# ------------------------------------------------------- legacy retirement ---
+# Releases before v2.3 registered `opencode-bridge.service`, not
+# `opencode-free-bridge.service`. Both bind the same port, so leaving the old
+# unit enabled makes the new service fail with EADDRINUSE and restart-loop
+# forever. A user who finds this repo and re-runs the installer on a machine
+# that still has the old bridge should get an upgrade, not a port fight.
+retire_legacy_service() {
+  local name="opencode-bridge.service"
+  local stamp retired=0
+  stamp="$(date +%Y%m%d%H%M%S)"
+
+  if [ -f "/etc/systemd/system/$name" ] || systemctl cat "$name" >/dev/null 2>&1; then
+    if systemctl is-active --quiet "$name" 2>/dev/null; then
+      systemctl stop "$name" 2>/dev/null && retired=1
+    fi
+    systemctl disable "$name" >/dev/null 2>&1 || true
+    if [ -f "/etc/systemd/system/$name" ]; then
+      mv -f "/etc/systemd/system/$name" "/etc/systemd/system/$name.retired-$stamp" 2>/dev/null || true
+    fi
+    rm -f "/etc/systemd/system/multi-user.target.wants/$name" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    say "Retired legacy unit $name (it held the old bridge on port $PORT)"
+  fi
+
+  if [ -f "$HOME/.config/systemd/user/$name" ]; then
+    systemctl --user stop "$name" 2>/dev/null || true
+    systemctl --user disable "$name" >/dev/null 2>&1 || true
+    mv -f "$HOME/.config/systemd/user/$name" "$HOME/.config/systemd/user/$name.retired-$stamp" 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/default.target.wants/$name" 2>/dev/null || true
+    systemctl --user daemon-reload 2>/dev/null || true
+    say "Retired legacy user unit $name"
+  fi
+
+  # Let the old process release the listening socket before the new service
+  # tries to bind it.
+  if [ "$retired" = "1" ]; then sleep 1; fi
+}
+retire_legacy_service
+
+# If something else still owns the port, say so now. Otherwise the new service
+# restart-loops on a bind error and the cause is invisible in the installer.
+if command -v ss >/dev/null 2>&1; then
+  PORT_HOLDER="$(ss -tlnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print; exit}')"
+  if [ -n "$PORT_HOLDER" ]; then
+    warn "port $PORT is still in use: $PORT_HOLDER"
+    warn "stop that process, or install with PORT=<free port>, before the service can bind."
+  fi
+fi
 
 # ------------------------------------------------------------------ fetch ---
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
