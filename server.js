@@ -285,6 +285,12 @@ async function discoverModels() {
     };
 
     for (const id of identity.getFreeModels()) keep(id);
+    // With the catalog loaded this loop adds nothing today: every id /models
+    // offers is either described by the catalog (already ruled on) or is an
+    // evaluator entry. It exists for the window before the first catalog read,
+    // when the name is the only signal available — a bridge that answers
+    // /v1/models with an empty list for the first seconds after boot is worse
+    // than one that guesses and corrects itself on the next refresh.
     for (const item of items) {
       const id = String(item.id || "");
       const lower = id.toLowerCase();
