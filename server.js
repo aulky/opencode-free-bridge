@@ -28,7 +28,11 @@ const UPDATE_HINT =
   "Update opencode-free-bridge: curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main/install.sh | bash";
 
 function isFreeTierCliGateError(status, errType, errMsg) {
-  if (errType === "FreeTierError") return true;
+  if (errType === "FreeTierError" || errType === "UpgradeRequired") return true;
+  // 426 is the version-floor handshake: upstream names the minimum client
+  // version it will accept. Treat it as a gate signal so the identity layer can
+  // adopt that floor and retry.
+  if (status === 426) return true;
   if (status !== 403 && status !== 401) return false;
   const m = String(errMsg || "").toLowerCase();
   return (
@@ -36,12 +40,30 @@ function isFreeTierCliGateError(status, errType, errMsg) {
     m.includes("free tier") ||
     m.includes("free models") ||
     m.includes("opencode cli") ||
-    m.includes("only available in opencode")
+    m.includes("only available in opencode") ||
+    m.includes("upgrade required") ||
+    m.includes("or newer is required")
   );
 }
-const DEFAULT_CLI_VERSION = "2.0.29";
-let currentUserAgent =
-  process.env.OPENCODE_USER_AGENT || `opencode/latest/${DEFAULT_CLI_VERSION}/cli`;
+const identity = require("./identity");
+// The adaptive stack: handshake resolves which release is authoritative,
+// artifact reads its tool definitions, capture records a real CLI's request,
+// probe diagnoses a gate move we do not recognise.
+const handshake = require("./handshake");
+const artifact = require("./artifact");
+const capture = require("./capture");
+const probe = require("./probe");
+
+// The identity (user-agent, session-id format, header set) is owned by
+// identity.js, which derives it from opencode's public source and refreshes it
+// lazily — on request, never on a timer. `currentUserAgent` mirrors it for the
+// few call sites that need a plain string.
+let currentUserAgent = process.env.OPENCODE_USER_AGENT || identity.getUserAgent();
+
+function syncUserAgent() {
+  if (!process.env.OPENCODE_USER_AGENT) currentUserAgent = identity.getUserAgent();
+  return currentUserAgent;
+}
 
 function isValidV2UserAgent(ua) {
   const match = String(ua || "")
@@ -51,43 +73,11 @@ function isValidV2UserAgent(ua) {
 }
 
 // --- ID Generator (matches OpenCode v2 CLI format) ---
-// Session prefix = 12 hex chars of ~(timeMs * 0x1000 + counter) masked to 48 bits.
-// Upstream decodes the 48-bit prefix and requires a small 12-bit counter (1..16);
-// wrapping after 16 into the next millisecond prevents both counter overflow into
-// timestamp bits and upstream 403 FreeTierError rejections under burst load.
-const CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
-const MAX_COUNTER_PER_MS = 16;
-let lastTimestamp = 0;
-let counter = 0;
-const RAND_POOL_SIZE = 14 * 256;
-const randPool = Buffer.allocUnsafe(RAND_POOL_SIZE);
-let randPoolOffset = RAND_POOL_SIZE;
-
-function nextRandomBase62_14() {
-  if (randPoolOffset + 14 > RAND_POOL_SIZE) {
-    crypto.randomFillSync(randPool);
-    randPoolOffset = 0;
-  }
-  let out = "";
-  for (let i = 0; i < 14; i++) {
-    out += CHARS[randPool[randPoolOffset + i] % 62];
-  }
-  randPoolOffset += 14;
-  return out;
-}
-
+// The shape (charset, total length, multiplier, prefix) comes from identity.js,
+// which derives it from opencode's own `packages/schema/src/identifier.ts`.
+// Kept as a thin wrapper here so existing call sites and tests keep working.
 function createId(descending, timestamp = Date.now()) {
-  if (timestamp !== lastTimestamp) {
-    lastTimestamp = timestamp;
-    counter = 0;
-  }
-  counter++;
-  const extraMs = Math.floor((counter - 1) / MAX_COUNTER_PER_MS);
-  const effectiveCounter = ((counter - 1) % MAX_COUNTER_PER_MS) + 1;
-  const current = BigInt(timestamp + extraMs) * 0x1000n + BigInt(effectiveCounter);
-  const value = (descending ? ~current : current) & SESSION_PREFIX_MASK;
-  return value.toString(16).padStart(12, "0") + nextRandomBase62_14();
+  return identity.createId(descending, timestamp);
 }
 
 // Live model list, discovered from upstream at boot and refreshed hourly.
@@ -123,24 +113,24 @@ function isLocalOrigin(origin) {
   return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin.trim());
 }
 
+/**
+ * Kept for callers and tests that expect the old name. Delegates to the
+ * identity layer, which fetches the release feed AND derives the rest of the
+ * recipe from opencode's source. Unlike the old implementation this also
+ * updates the session-id format, so a changed id shape heals too.
+ *
+ * The `lastCliVersionCheckTime` guard is preserved so the feed is still read at
+ * most once per CLI_VERSION_TTL_MS even when called repeatedly.
+ */
 async function refreshCliVersion() {
-  if (process.env.OPENCODE_USER_AGENT) return;
   const now = Date.now();
-  if (now - lastCliVersionCheckTime < CLI_VERSION_TTL_MS) return;
-  try {
-    const res = await fetch(OPENCODE_RELEASES_ATOM_URL, {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return;
-    lastCliVersionCheckTime = now;
-    const text = await res.text();
-    const match = text.match(/<title>v?(\d+\.\d+\.\d+)<\/title>/i);
-    if (match && parseInt(match[1].split(".")[0], 10) >= 2) {
-      currentUserAgent = `opencode/latest/${match[1]}/cli`;
-    }
-  } catch {
-    // Keep existing currentUserAgent on network error; retry on next discovery
+  if (now - lastCliVersionCheckTime < CLI_VERSION_TTL_MS) {
+    return { updated: false, reason: "fresh" };
   }
+  const result = await identity.refresh({ force: true });
+  syncUserAgent();
+  lastCliVersionCheckTime = now;
+  return result;
 }
 
 // Auto-discovery from OpenCode upstream gateway.
@@ -258,73 +248,40 @@ function markProtocolSupport(modelId, useResponses) {
   }
 }
 
-// --- OpenCode v2 Tool Fingerprint Layering ---
-// Upstream /inference/v1 validates that `tools` contains OpenCode's exact `read`
-// and `shell` tool definitions (verbatim description and parameter schema).
-// Stub descriptions or `tool_choice: "none"` trigger 403 FreeTierError.
-const FINGERPRINT_TOOL_NAMES = ["read", "shell"];
-
-const FINGERPRINT_TOOL_DEFINITIONS = {
-  read: {
-    description:
-      "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "File or directory to read" },
-        offset: {
-          type: "integer",
-          minimum: 0,
-          description: "The line or directory entry to start reading from (1-based)",
-        },
-        limit: {
-          type: "integer",
-          minimum: 0,
-          description:
-            "The maximum number of lines or directory entries to read (defaults to and capped at 2000)",
-        },
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  },
-  shell: {
-    description:
-      "Execute a shell command and return its output. Commands run on Linux using bash. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
-    parameters: {
-      type: "object",
-      properties: {
-        command: { type: "string", description: "Shell command string to execute" },
-        workdir: {
-          type: "string",
-          description:
-            "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead.",
-        },
-        timeout: {
-          type: "integer",
-          minimum: 0,
-          description:
-            "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default.",
-        },
-        background: {
-          type: "boolean",
-          description:
-            "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion.",
-        },
-      },
-      required: ["command"],
-      additionalProperties: false,
-    },
-  },
-};
-
-function getToolName(tool) {
-  if (!tool || typeof tool !== "object") return "";
-  if (typeof tool.name === "string") return tool.name.trim();
-  if (tool.function && typeof tool.function.name === "string") return tool.function.name.trim();
-  return "";
+// --- Tool fingerprint (dynamic) -------------------------------------------
+//
+// Upstream /inference/v1 validates the `tools` array in the request body, and
+// this is the layer that has moved most often: first the array had to exist,
+// then it had to contain specific tool names, then (per 9router#4837) the exact
+// schemas. Hardcoding those definitions here meant a code change every time.
+//
+// The definitions now come from identity.js, which resolves them in this order:
+//   1. capture.json  — recorded from a real CLI (exact bytes)
+//   2. artifact      — extracted from the published @opencode/core bundle
+//   3. DEFAULT_TOOLS — shipped fallback, used only until 1 or 2 succeeds
+//
+// The names below are kept for the call sites and tests that predate the
+// change; they are read from the live profile, not frozen at load time.
+function getFingerprintNames() {
+  // Only the names actually sent upstream. A capture carries ~10 tools but
+  // `TOOL_PROFILE_SCOPE=core` sends a subset; treating the unsent ones as
+  // fingerprints would alias an unrelated client tool (`glob` → `glob_client`)
+  // for no reason.
+  return identity.getToolList(false).map((t) => t.function.name);
 }
 
+function getFingerprintDefinitions() {
+  return identity.getTools();
+}
+
+function getCanonicalTools(flat) {
+  return identity.getToolList(flat);
+}
+
+/**
+ * Stable JSON for schema comparison. Key order must not affect equality: two
+ * definitions that differ only in property order are the same schema.
+ */
 function stableStringify(val) {
   if (!val || typeof val !== "object") return JSON.stringify(val);
   if (Array.isArray(val)) return "[" + val.map(stableStringify).join(",") + "]";
@@ -332,45 +289,19 @@ function stableStringify(val) {
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(val[k])).join(",") + "}";
 }
 
-const FINGERPRINT_PARAM_STRINGS = {
-  read: stableStringify(FINGERPRINT_TOOL_DEFINITIONS.read.parameters),
-  shell: stableStringify(FINGERPRINT_TOOL_DEFINITIONS.shell.parameters),
-};
-
-const CANONICAL_TOOLS_CHAT = Object.freeze(
-  FINGERPRINT_TOOL_NAMES.map((name) =>
-    Object.freeze({
-      type: "function",
-      function: Object.freeze({
-        name,
-        description: FINGERPRINT_TOOL_DEFINITIONS[name].description,
-        parameters: FINGERPRINT_TOOL_DEFINITIONS[name].parameters,
-      }),
-    })
-  )
-);
-
-const CANONICAL_TOOLS_RESPONSES = Object.freeze(
-  FINGERPRINT_TOOL_NAMES.map((name) =>
-    Object.freeze({
-      type: "function",
-      name,
-      description: FINGERPRINT_TOOL_DEFINITIONS[name].description,
-      parameters: FINGERPRINT_TOOL_DEFINITIONS[name].parameters,
-      strict: false,
-    })
-  )
-);
-
 const EMPTY_MAP = Object.freeze(new Map());
 
+/**
+ * Is this client-supplied tool already byte-identical to the fingerprint we
+ * would inject? If so it can be passed through untouched.
+ */
 function isExactFingerprintDef(tool, key) {
-  const want = FINGERPRINT_TOOL_DEFINITIONS[key];
+  const want = identity.getTools()[key];
   if (!want || !tool || typeof tool !== "object") return false;
   const def = tool.function && typeof tool.function === "object" ? tool.function : tool;
   return (
     def.description === want.description &&
-    stableStringify(def.parameters) === FINGERPRINT_PARAM_STRINGS[key]
+    stableStringify(def.parameters) === stableStringify(want.parameters)
   );
 }
 
@@ -382,18 +313,42 @@ function buildPlaceholderNote(appendedNames) {
     : `Do not call the ${list} tool; it is a placeholder that does nothing. Use the other tools you have been given instead.`;
 }
 
-const DEFAULT_PLACEHOLDER_NOTE = buildPlaceholderNote(FINGERPRINT_TOOL_NAMES);
+function getToolName(tool) {
+  if (!tool || typeof tool !== "object") return "";
+  if (typeof tool.name === "string") return tool.name.trim();
+  if (tool.function && typeof tool.function.name === "string") return tool.function.name.trim();
+  return "";
+}
 
+/**
+ * Merge the client's tools with the fingerprint tools the gate requires.
+ *
+ * Three cases per required tool:
+ *   - client already sends it verbatim  → keep the client's copy
+ *   - client sends the same name with a different schema → rename the client's
+ *     copy (`read_client`) so both survive, and map responses back
+ *   - client does not send it at all   → append the fingerprint definition
+ *
+ * The definitions are resolved per call from identity.js, so a profile update
+ * takes effect on the next request without a restart.
+ */
 function prepareToolsWithFingerprint(clientTools = [], flat = false) {
+  const fingerprintNames = getFingerprintNames();
+  const canonical = getCanonicalTools(flat);
+  const canonicalByName = new Map(
+    canonical.map((t) => [flat ? t.name : t.function.name, t])
+  );
+
   if (!Array.isArray(clientTools) || clientTools.length === 0) {
     return {
-      tools: flat ? CANONICAL_TOOLS_RESPONSES : CANONICAL_TOOLS_CHAT,
-      appended: FINGERPRINT_TOOL_NAMES,
-      placeholderNote: DEFAULT_PLACEHOLDER_NOTE,
+      tools: canonical,
+      appended: fingerprintNames,
+      placeholderNote: buildPlaceholderNote(fingerprintNames),
       aliasToOriginal: EMPTY_MAP,
       originalToAlias: EMPTY_MAP,
     };
   }
+
   const aliasToOriginal = new Map();
   const originalToAlias = new Map();
   const normalized = [];
@@ -407,7 +362,7 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false) {
     const description = def.description || "";
     const parameters = def.parameters || { type: "object", properties: {} };
 
-    if (FINGERPRINT_TOOL_NAMES.includes(name)) {
+    if (fingerprintNames.includes(name)) {
       if (presentExactFingerprints.has(name)) continue;
       if (isExactFingerprintDef(t, name)) {
         presentExactFingerprints.add(name);
@@ -418,8 +373,8 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false) {
         );
         continue;
       }
-      // Client defined its own `read` or `shell` tool with a custom schema:
-      // alias it so we can still inject OpenCode's exact fingerprint tool.
+      // Client defined its own tool under a name the gate fingerprints: alias
+      // it so the exact fingerprint can still be injected alongside.
       if (originalToAlias.has(name)) continue;
       let alias = `${name}_client`;
       for (let i = 2; takenNames.has(alias); i++) {
@@ -444,10 +399,11 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false) {
   }
 
   const appended = [];
-  for (let i = 0; i < FINGERPRINT_TOOL_NAMES.length; i++) {
-    const name = FINGERPRINT_TOOL_NAMES[i];
+  for (const name of fingerprintNames) {
     if (presentExactFingerprints.has(name)) continue;
-    normalized.push(flat ? CANONICAL_TOOLS_RESPONSES[i] : CANONICAL_TOOLS_CHAT[i]);
+    const def = canonicalByName.get(name);
+    if (!def) continue;
+    normalized.push(def);
     appended.push(name);
   }
 
@@ -455,8 +411,8 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false) {
     tools: normalized,
     appended,
     placeholderNote:
-      appended.length === FINGERPRINT_TOOL_NAMES.length
-        ? DEFAULT_PLACEHOLDER_NOTE
+      appended.length === fingerprintNames.length
+        ? buildPlaceholderNote(fingerprintNames)
         : buildPlaceholderNote(appended),
     aliasToOriginal,
     originalToAlias,
@@ -933,7 +889,92 @@ function handleRequest(req, res) {
   // Health check
   if (pathname === "" || pathname === "/" || pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(cachedHealthPayload);
+    // `identity` is computed per request (not cached) so it reflects the mask
+    // currently in use — the first thing to check when upstream starts
+    // rejecting requests.
+    const idState = identity.getState();
+    return res.end(
+      JSON.stringify({
+        status: "ok",
+        provider: "opencode-free-bridge",
+        version: VERSION,
+        discoveredModels: activeModels.length,
+        identity: {
+          userAgent: idState.userAgent,
+          sourceTag: idState.lastSourceTag,
+          versionFloor: idState.versionFloor,
+          lastCheckAgeMs: idState.lastCheckTime ? Date.now() - idState.lastCheckTime : null,
+          ttlMs: idState.ttlMs,
+          lastError: idState.lastRefreshError,
+          // Non-empty means the last source read could not derive these fields:
+          // the recipe is still working, but a regex stopped matching upstream.
+          missingFields: idState.missingFields,
+          drift: idState.lastDrift,
+        },
+        // Which release the bridge is following, and how it found out.
+        update: {
+          mode: idState.updateMode,
+          release: handshake.getState().lastResult,
+          error: handshake.getState().lastError,
+        },
+        // The tool definitions actually on the wire, and where they came from.
+        // `source` is the single most useful field when a gate moves:
+        //   capture  = recorded from a real CLI (best)
+        //   artifact = extracted from the published package
+        //   default  = shipped fallback, meaning both sources failed
+        tools: idState.toolProfile,
+        // Diagnostic probing is off by default; this says whether it is on and
+        // whether it is currently backing off.
+        probe: probe.getState(),
+        capture: capture.getState(),
+      })
+    );
+  }
+
+  // Explicit profile inspection: the tool definitions currently in use, in the
+  // exact shape they are sent upstream.
+  if (req.method === "GET" && pathname === "/profile") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(
+      JSON.stringify({
+        tools: identity.getToolList(false),
+        state: identity.getState().toolProfile,
+        release: handshake.getState().lastResult,
+      })
+    );
+  }
+
+  // Manual capture: run the real CLI once and record what it sends. This is the
+  // recovery path when a gate moves and the derived profile is not enough —
+  // it replaces inference with the actual bytes.
+  if (req.method === "POST" && pathname === "/capture") {
+    capture
+      .captureAndSave()
+      .then((result) => {
+        if (result.error) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ ok: false, error: result.error }));
+        }
+        // Adopt the fresh capture immediately so the next request uses it.
+        identity
+          .loadToolProfile(identity.getRecipe().version, { force: true })
+          .catch(() => {});
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            path: result.path,
+            toolNames: result.profile.toolNames,
+            endpoint: result.profile.endpoint,
+            headerNames: result.profile.headerNames,
+          })
+        );
+      })
+      .catch((err) => {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      });
+    return;
   }
 
   // Model list (triggers async re-discovery when the hourly TTL expired)
@@ -1037,6 +1078,13 @@ function handleRequest(req, res) {
       }
 
       const clientStream = Boolean(body.stream);
+
+      // Lazy identity check: no timer runs in the background. The first request
+      // after the TTL kicks off a refresh in the background and proceeds with
+      // the current mask; the next request uses the refreshed one.
+      identity.ensureFresh();
+      syncUserAgent();
+
       let useResponses = isResponsesModel(targetModel);
       const sessionId = getPersistentSessionId(req, body);
       const upstreamHeaders = buildUpstreamHeaders(req, sessionId);
@@ -1107,6 +1155,105 @@ function handleRequest(req, res) {
                 },
               })
             );
+          }
+        }
+
+        // Self-healing identity: if upstream rejects the mask (403 FreeTierError
+        // or 426 UpgradeRequired), refresh the identity immediately and replay
+        // the request once. The client never sees the intermediate rejection.
+        let gateRetried = false;
+        if (!upstreamRes.ok && isFreeTierCliGateError(upstreamRes.status, "", "")) {
+          const gateStatus = upstreamRes.status;
+          let gateBody = "";
+          try {
+            gateBody = await upstreamRes.text();
+          } catch {
+            gateBody = "";
+          }
+          let probeType = "";
+          let probeMsg = gateBody;
+          try {
+            const j = JSON.parse(gateBody);
+            probeType = j.error?.type || "";
+            probeMsg = j.error?.message || gateBody;
+          } catch {
+            // non-JSON body: keep raw text as the message
+          }
+
+          const verdict = await identity
+            .onGateRejection(gateStatus, probeType, probeMsg, false)
+            .catch(() => ({ retry: false }));
+
+          if (verdict.retry) {
+            syncUserAgent();
+            const retryHeaders = buildUpstreamHeaders(req, sessionId);
+            console.warn(
+              `[opencode-free-bridge] Identity refreshed (${verdict.reason}) after upstream ${gateStatus}; retrying once`
+            );
+            gateRetried = true;
+            // Rebuild the body too: the tool profile may have changed, and the
+            // tools are part of what the gate inspects.
+            ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
+              body,
+              targetModel,
+              useResponses
+            ));
+            upstreamRes = await fetch(upstreamUrl, {
+              method: "POST",
+              headers: retryHeaders,
+              body: JSON.stringify(upstreamBody),
+              signal: abortController.signal,
+            });
+          }
+
+          // Still rejected after healing? The gate moved in a way the derived
+          // profile does not explain. Differential probing is the last resort:
+          // it is off by default and rate-limited, because a burst of failures
+          // triggers an upstream cooldown that hides the real error.
+          if (!upstreamRes.ok && gateRetried && probe.isEnabled()) {
+            const report = await probe
+              .run(
+                {
+                  url: upstreamUrl,
+                  headers: buildUpstreamHeaders(req, sessionId),
+                  body: upstreamBody,
+                },
+                {
+                  tools: identity.getToolList(useResponses),
+                  sessionId,
+                }
+              )
+              .catch(() => null);
+
+            if (report && report.ran) {
+              console.warn(
+                `[opencode-free-bridge] Probe ${report.reason}: ` +
+                  report.attempts
+                    .map((a) => `${a.label}=${a.ok ? "PASS" : a.status || a.skipped || a.note}`)
+                    .join(" ")
+              );
+              if (report.learned && report.learnedAttempt) {
+                // A single dimension fixed it. Adopt that attempt verbatim for
+                // this retry so the client gets a real answer, and leave the
+                // diagnosis in /health for the operator.
+                console.warn(
+                  `[opencode-free-bridge] Probe learned: ${report.learned}. Replaying with it.`
+                );
+                upstreamRes = await fetch(report.learnedAttempt.url, {
+                  method: "POST",
+                  headers: report.learnedAttempt.headers,
+                  body: JSON.stringify(report.learnedAttempt.body),
+                  signal: abortController.signal,
+                });
+                if (upstreamRes.ok) {
+                  // The learned shape works; make it the new baseline.
+                  ({ upstreamBody, aliasToOriginal } = {
+                    upstreamBody: report.learnedAttempt.body,
+                    aliasToOriginal,
+                  });
+                }
+              }
+            }
           }
         }
 
@@ -1572,16 +1719,42 @@ if (require.main === module) {
   // Discovery runs in background: /v1/models is live as soon as upstream
   // answers. Boot never blocks on network.
   discoverModels().catch(() => {});
+  // Resolve the tool profile in the background so the first request already
+  // sends the current definitions instead of the shipped fallback. Failure is
+  // harmless: DEFAULT_TOOLS keeps the bridge working.
+  identity
+    .loadToolProfile(identity.getRecipe().version)
+    .then((r) => {
+      if (r && r.updated) {
+        console.log(
+          `[opencode-free-bridge] Tool profile ${identity.getRecipe().version} loaded from ${r.source}: ${r.tools.join(", ")}`
+        );
+      }
+    })
+    .catch(() => {});
+  // Model list rotates on upstream's schedule, so it keeps a timer. The
+  // IDENTITY does not: it is refreshed lazily from the request path (see
+  // identity.ensureFresh), so an idle bridge makes no network calls at all.
   setInterval(discoverModels, DISCOVERY_TTL_MS).unref();
 }
 
 module.exports = {
   VERSION,
   MODEL_MAP,
-  FINGERPRINT_TOOL_NAMES,
-  FINGERPRINT_TOOL_DEFINITIONS,
-  CANONICAL_TOOLS_CHAT,
-  CANONICAL_TOOLS_RESPONSES,
+  // Kept for callers and tests written against the old frozen constants. These
+  // are live views of the resolved profile, not snapshots.
+  get FINGERPRINT_TOOL_NAMES() {
+    return getFingerprintNames();
+  },
+  get FINGERPRINT_TOOL_DEFINITIONS() {
+    return getFingerprintDefinitions();
+  },
+  get CANONICAL_TOOLS_CHAT() {
+    return getCanonicalTools(false);
+  },
+  get CANONICAL_TOOLS_RESPONSES() {
+    return getCanonicalTools(true);
+  },
   MAX_SESSIONS,
   SESSION_TTL_MS,
   sessionCache,
@@ -1613,7 +1786,13 @@ module.exports = {
   consumeSseLines,
   readRequestBody,
   refreshCliVersion,
+  identity,
+  handshake,
+  artifact,
+  capture,
+  probe,
   __getUserAgent: () => currentUserAgent,
+  __syncUserAgent: syncUserAgent,
   DISCOVERY_TTL_MS,
   CLI_VERSION_TTL_MS,
   __setLastDiscoveryTime: (v) => { lastDiscoveryTime = v; },

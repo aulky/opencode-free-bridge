@@ -54,6 +54,13 @@ fetch() {
 
 fetch package.json
 fetch server.js
+# The adaptive stack. identity.js requires all four, so a partial install
+# would fail to start rather than degrade — fetch them together.
+fetch identity.js
+fetch handshake.js
+fetch artifact.js
+fetch capture.js
+fetch probe.js
 fetch token-budget.js
 fetch verify.js
 chmod +x "$BINDIR/server.js" "$BINDIR/verify.js" 2>/dev/null || true

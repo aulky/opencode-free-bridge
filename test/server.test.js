@@ -18,6 +18,7 @@ const {
   getPersistentSessionId,
   readRequestBody,
   server,
+  identity,
 } = require("../server");
 function sseStreamFromLines(lines) {
   const encoder = new TextEncoder();
@@ -240,15 +241,25 @@ describe("server unit & integration tests", () => {
     assert.equal(fakeReq.listenerCount("error"), 0);
   });
 
-  it("returns precomputed frozen canonical tool arrays on zero-tool requests without allocating", () => {
-    const a = prepareToolsWithFingerprint([], false);
-    const b = prepareToolsWithFingerprint(undefined, false);
-    assert.equal(a.tools, CANONICAL_TOOLS_CHAT);
-    assert.equal(b.tools, CANONICAL_TOOLS_CHAT);
-    assert.equal(a.aliasToOriginal.size, 0);
+  it("returns the fingerprint tools on zero-tool requests, shaped per protocol lane", () => {
+    const chat = prepareToolsWithFingerprint([], false);
+    const responses = prepareToolsWithFingerprint([], true);
 
-    const r = prepareToolsWithFingerprint([], true);
-    assert.equal(r.tools, CANONICAL_TOOLS_RESPONSES);
+    // The definitions are resolved from the live profile, so compare against
+    // what identity reports rather than a frozen module constant.
+    const names = identity.getToolList(false).map((t) => t.function.name);
+    assert.deepEqual(
+      chat.tools.map((t) => t.function.name),
+      names
+    );
+    assert.deepEqual(
+      responses.tools.map((t) => t.name),
+      names
+    );
+    assert.equal(chat.aliasToOriginal.size, 0);
+    // Chat nests the definition under `function`; Responses puts it flat.
+    assert.ok(chat.tools.every((t) => t.function && t.type === "function"));
+    assert.ok(responses.tools.every((t) => !t.function && t.type === "function"));
   });
 
   it("generates 10,000 session IDs using pooled random bytes in <25ms", () => {
@@ -273,6 +284,15 @@ describe("server unit & integration tests", () => {
           resolve();
         });
       });
+    });
+
+    // The identity layer refreshes lazily from the request path. These tests
+    // assert on the exact upstream calls the bridge makes, so the identity is
+    // marked fresh before each case: a background refresh would otherwise show
+    // up as an extra fetch and make call-count assertions ambiguous.
+    beforeEach(() => {
+      identity.__reset();
+      identity.__setLastCheckTime(Date.now());
     });
 
     after(async () => {

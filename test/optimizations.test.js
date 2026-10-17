@@ -72,15 +72,20 @@ describe("v1.5.2 optimizations", () => {
   });
 
   it("caches the CLI version feed for 6h (2nd call = no fetch)", async () => {
+    // The refresh now reads the release feed AND (only when the version moves)
+    // the three recipe source files. Counting only the feed keeps the assertion
+    // about caching, not about how many files the recipe needs.
     let feedHits = 0;
-    global.fetch = async () => {
-      feedHits++;
+    global.fetch = async (url) => {
+      if (String(url).includes("releases.atom")) feedHits++;
       return { ok: true, text: async () => "<title>v2.0.29</title>" };
     };
     __setLastCliVersionCheckTime(0);
     await refreshCliVersion();
+    const afterFirst = feedHits;
     await refreshCliVersion();
-    assert.equal(feedHits, 1, `expected 1 feed fetch, got ${feedHits}`);
+    assert.equal(feedHits, afterFirst, `expected no extra feed fetch, got ${feedHits - afterFirst}`);
+    assert.ok(afterFirst >= 1, "first call must read the feed");
     assert.ok(Date.now() - __getCliVersionState().lastCliVersionCheckTime < 60_000);
   });
 

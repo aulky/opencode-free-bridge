@@ -1,7 +1,7 @@
 {
   "name": "opencode-free-bridge",
-  "version": "1.5.3",
-  "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required)",
+  "version": "2.0.0",
+  "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes",
   "main": "server.js",
   "bin": {
     "opencode-free-bridge": "server.js"
@@ -10,13 +10,19 @@
     "start": "node server.js",
     "test": "node --test test/*.test.js",
     "verify": "node verify.js",
-    "verify:quick": "node verify.js --quick"
+    "verify:quick": "node verify.js --quick",
+    "capture": "node -e \"require('./capture').captureAndSave().then(r=>console.log(r.error?('capture failed: '+r.error):('saved '+r.path)))\""
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "files": [
     "server.js",
+    "identity.js",
+    "handshake.js",
+    "artifact.js",
+    "capture.js",
+    "probe.js",
     "token-budget.js",
     "verify.js",
     "install.sh",
