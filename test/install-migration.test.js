@@ -95,6 +95,15 @@ test("installer finds bun installed outside PATH", () => {
   assert.match(src, /\.bun\/bin\/bun/, "installer must look in ~/.bun/bin");
 });
 
+test("installer survives a probe that matches nothing under pipefail", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // set -euo pipefail + `grep` with no match exits 1 and aborted the whole
+  // install with no message. Empty probes must be tolerated.
+  assert.match(src, /pid_on_port/, "pid probing must go through a pipefail-safe helper");
+  assert.match(src, /grep -oP 'pid=\\K\[0-9\]\+' \| head -1 \|\| true/);
+});
+
 test("installer can replace its own running bridge", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");

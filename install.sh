@@ -164,19 +164,25 @@ legacy_unit_active() {
 # Is the port held by the bridge this installer is about to replace? Re-running
 # the installer on an existing install must work, so the bridge's own process
 # is not a conflict. Anything else is.
+#
+# Note the `|| true`: the installer runs under `set -euo pipefail`, and a
+# pipeline whose `grep` finds nothing exits 1, which would abort the whole
+# install with no message. Every probe here must be allowed to come up empty.
+pid_on_port() {
+  port_holder | grep -oP 'pid=\K[0-9]+' | head -1 || true
+}
+
 port_held_by_own_bridge() {
-  local holder pid cwd target
-  holder="$(port_holder)"
-  [ -n "$holder" ] || return 1
-  pid="$(printf '%s' "$holder" | grep -oP 'pid=\K[0-9]+' | head -1)"
+  local pid cwd target
+  pid="$(pid_on_port)"
   [ -n "$pid" ] || return 1
 
   # The detached bridge is started with `bun server.js` after a pushd, so its
   # cmdline is relative and only the cwd identifies it. readlink appends
   # " (deleted)" once the install directory has been replaced, which must not
   # defeat the match.
-  cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null | sed 's/ (deleted)$//')"
-  target="$(readlink -f "$BINDIR" 2>/dev/null)"
+  cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null | sed 's/ (deleted)$//' || true)"
+  target="$(readlink -f "$BINDIR" 2>/dev/null || true)"
   [ -n "$cwd" ] && [ -n "$target" ] && [ "$cwd" = "$target" ] && return 0
 
   tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$BINDIR/server.js" && return 0
@@ -185,7 +191,7 @@ port_held_by_own_bridge() {
 
 stop_own_bridge() {
   local pid
-  pid="$(port_holder | grep -oP 'pid=\K[0-9]+' | head -1)"
+  pid="$(pid_on_port)"
   [ -n "$pid" ] || return 0
 
   # If systemd supervises this bridge, stop it through systemd. Killing the pid
