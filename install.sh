@@ -4,14 +4,21 @@
 #   curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main/install.sh | bash
 #
 # What it does:
-#   1. requires Bun. The CLI ships as a Bun binary and the free-tier gate checks
-#      the transport fingerprint: measured 200 on Bun, 403 on Node and curl.
-#   2. copies the bridge and its tools into an install dir (server.js,
+#   1. finds Bun, or installs it. The CLI ships as a Bun binary and the
+#      free-tier gate checks the transport fingerprint: measured 200 on Bun,
+#      403 on Node and curl.
+#   2. downloads the bridge into a staging directory and validates it before
+#      touching anything that is already running
+#   3. retires a pre-2.3 `opencode-bridge.service` that would fight for the port
+#   4. copies the bridge and its tools into an install dir (server.js,
 #      identity.js, token-budget.js, verify.js, gate-drill.js and the
 #      transport-fingerprint files), backing up any existing install first
-#   3. registers a service so the bridge starts on boot and restarts on crash
-#      (systemd on Linux, launchd on macOS, a logon task on Windows Git Bash)
-#   4. starts it and runs the self-check
+#   5. registers a service so the bridge starts on boot and restarts on crash
+#      (systemd on Linux, launchd on macOS). Windows is not supported.
+#   6. waits for /health, then runs the self-check and the TLS fingerprint check
+#
+# It exits non-zero if the bridge does not come up. "Done" is only printed for
+# a bridge that answered.
 #
 # Env overrides:
 #   PORT       listen port            (default 20129)
@@ -75,9 +82,30 @@ elif [ -n "${ALLOW_NODE:-}" ] && command -v node >/dev/null 2>&1; then
   warn "runtime: node — NOT supported for live use. The free-tier gate refuses Node's"
   warn "transport fingerprint with 403. Proceeding because ALLOW_NODE is set."
 else
-  die "Bun is required but not found. Install it: https://bun.sh
-     (Node does not work: the free-tier gate returns 403 for its TLS fingerprint.
-      Set ALLOW_NODE=1 to install anyway for offline work.)"
+  # The one-line installer exists so a new user does not have to read a manual.
+  # Telling them "install Bun first" and exiting defeats that, so install it.
+  say "Bun is not installed; installing it now (required for the transport fingerprint)"
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -fsSL https://bun.sh/install | bash >/tmp/ofb-bun-install.log 2>&1; then
+      warn "Bun installation failed. Log:"
+      tail -5 /tmp/ofb-bun-install.log >&2 2>/dev/null || true
+      die "install Bun manually: https://bun.sh"
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if ! wget -qO- https://bun.sh/install | bash >/tmp/ofb-bun-install.log 2>&1; then
+      warn "Bun installation failed. Log:"
+      tail -5 /tmp/ofb-bun-install.log >&2 2>/dev/null || true
+      die "install Bun manually: https://bun.sh"
+    fi
+  else
+    die "neither curl nor wget is available, so Bun cannot be installed. Install Bun manually: https://bun.sh"
+  fi
+  rm -f /tmp/ofb-bun-install.log
+  if ! BUN_BIN="$(find_bun)"; then
+    die "Bun was installed but cannot be found in ~/.bun/bin. Open a new shell and re-run this installer."
+  fi
+  RUNTIME="$BUN_BIN"
+  say "runtime: bun ($("$RUNTIME" --version)) — installed by this script"
 fi
 # Bun has no version gate here: the bridge uses only long-stable APIs, and Bun
 # 1.4.2 (the CLI's own bundled version) and 1.4.3 were both verified. Node does.
@@ -425,11 +453,14 @@ UNIT
   <key>WorkingDirectory</key><string>$BINDIR</string>
   <key>EnvironmentVariables</key>
   <dict><key>PORT</key><string>$PORT</string><key>HOST</key><string>$HOST</string></dict>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/opencode-free-bridge.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/opencode-free-bridge.log</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict>
 </plist>
 PLIST
+    mkdir -p "$HOME/Library/Logs"
     launchctl unload "$plist" >/dev/null 2>&1 || true
     launchctl load "$plist"
     say "launchd agent installed and restarted"
@@ -472,10 +503,24 @@ if [ "$SERVICE_OK" != "1" ]; then
 fi
 
 say "Waiting for the bridge to come up..."
+BRIDGE_UP=0
 for _ in $(seq 1 20); do
-  if curl -fsS "http://$HOST:$PORT/health" >/dev/null 2>&1; then break; fi
+  # -m matters: a HOST that is not routable makes curl hang for minutes, and
+  # the installer used to sit there until the user killed it.
+  if curl -fsS -m 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then BRIDGE_UP=1; break; fi
   sleep 1
 done
+
+if [ "$BRIDGE_UP" != "1" ]; then
+  warn "the bridge did not answer on http://$HOST:$PORT/health after 20s"
+  if [ "$SERVICE_OK" = "1" ]; then
+    warn "inspect: systemctl status opencode-free-bridge ; journalctl -u opencode-free-bridge -n 30"
+  else
+    warn "inspect: $BINDIR/bridge.log"
+  fi
+  die "install finished but the service is not running"
+fi
+say "Bridge is answering on http://$HOST:$PORT"
 
 echo
 say "Running self-check (quick — full check: $RUNTIME $BINDIR/verify.js)"
@@ -501,6 +546,21 @@ case "$CHECK_RC" in
   124) warn "self-check hit the 120s cap; the bridge is installed, run the check again when upstream is responsive" ;;
   *) warn "self-check reported a problem; inspect the log with the command below" ;;
 esac
+
+# The TLS fingerprint is the gate. An outdated Bun installs and starts happily
+# and then earns a 403 that looks exactly like an exhausted IP allowance, so
+# check it here rather than letting the user debug the wrong thing.
+if [ -f "$BINDIR/transport-fingerprint.js" ] && [ -f "$BINDIR/transport-baseline.json" ]; then
+  set +e
+  ( cd "$BINDIR" && "$RUNTIME" transport-fingerprint.js --check >/dev/null 2>&1 )
+  TLS_RC=$?
+  set -e
+  if [ "$TLS_RC" != "0" ]; then
+    warn "this Bun build's TLS ClientHello does not match the recorded OpenCode CLI baseline"
+    warn "upstream inspects that fingerprint; expect 403 until it matches."
+    warn "inspect: cd $BINDIR && $RUNTIME transport-fingerprint.js --check"
+  fi
+fi
 
 echo
 say "Done."

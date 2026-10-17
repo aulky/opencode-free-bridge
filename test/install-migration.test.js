@@ -12,12 +12,15 @@ function hasInstaller() {
   return fs.existsSync(INSTALLER);
 }
 
-test("installer requires Bun and refuses to fall back silently", () => {
+test("installer installs Bun itself instead of dead-ending the user", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");
-  // A silent fallback to Node is what made old installs unfixable.
-  assert.match(src, /Bun is required but not found/);
+  // Telling a new user "install Bun first" and exiting defeats the point of a
+  // one-line installer. It must fetch Bun, and still never fall back to Node
+  // unless ALLOW_NODE is explicit.
+  assert.match(src, /bun\.sh\/install/, "installer must install Bun when it is missing");
   assert.match(src, /ALLOW_NODE/);
+  assert.doesNotMatch(src, /Bun is required but not found/, "installer must not dead-end on a missing Bun");
   // Every runtime invocation must go through $RUNTIME, not a hardcoded node.
   const hardcoded = src
     .split("\n")
@@ -122,6 +125,32 @@ test("installer parses staged files instead of running bun --check", () => {
   // upgrade fail its "syntax check".
   assert.doesNotMatch(src, /\$RUNTIME" --check/, "installer must not use bun --check");
   assert.match(src, /new Function\(src\)/, "installer must parse without executing");
+});
+
+test("installer refuses to claim success when the bridge never answered", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // A HOST that cannot be bound used to hang the health loop on curl with no
+  // timeout, then print "Done" anyway.
+  assert.match(src, /curl -fsS -m 2/, "health probe must have a timeout");
+  assert.match(src, /BRIDGE_UP/, "installer must track whether /health answered");
+  assert.match(src, /install finished but the service is not running/);
+});
+
+test("installer checks the TLS fingerprint before declaring success", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // An outdated Bun installs and runs, then earns a 403 that looks exactly
+  // like an exhausted IP allowance. The installer must say so.
+  assert.match(src, /transport-fingerprint\.js --check/);
+  assert.match(src, /does not match the recorded OpenCode CLI baseline/);
+});
+
+test("macOS service redirects its log where the docs say it is", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  assert.match(src, /StandardOutPath/);
+  assert.match(src, /Library\/Logs\/opencode-free-bridge\.log/);
 });
 
 test("installer stages and validates downloads before stopping the old bridge", () => {
