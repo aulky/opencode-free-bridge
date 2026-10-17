@@ -1,5 +1,54 @@
 # Changelog
 
+## [2.1.0] — 2026-10-17
+
+### Wire values derived from the same sources the CLI reads
+
+v2.0.0 derived the *identity* (session shape, UA, headers, two tool schemas).
+v2.1.0 closes the remaining wire layers so a path or tool-set migration
+upstream no longer needs a bridge release.
+
+- **Endpoints from the provider catalog (`identity.extractCatalog`)**: The
+  `opencode` entry in `models.opencode.ai/api.json` — the same file the real CLI
+  reads at boot — carries the live inference base (`api`). The bridge derives
+  `chatUrl`/`responsesUrl` from it and reads them **per request**
+  (`server.resolveEndpoints`), so the `/zen/v1` → `/inference/v1` move (and any
+  future one) applies on the next request without a restart. `OPENCODE_CHAT_URL`
+  / `OPENCODE_RESPONSES_URL` still pin the value when set.
+- **Tool allowlist from every tool plugin source**: Extraction now reads all
+  eleven `packages/core/src/tool/plugin/*.ts` files (`read`, `shell`, `glob`,
+  `edit`, `write`, `grep`, `question`, `skill`, `subagent`, `webfetch`,
+  `websearch`) instead of only `read.ts`/`shell.ts`. The extractor understands
+  the three description forms upstream uses (array joined with `" "` or `"\n"`,
+  exported template literal, `editor.add` literal) and single-quoted strings.
+- **`full` tool scope on self-heal**: `getToolList(flat, "full")` sends every
+  name derived from the release's tool sources. The gate-rejection retry now
+  always uses it, so a renamed or newly-required tool is picked up without a
+  bridge release. The default `core` scope still sends the minimal proven set.
+- **A gate rejection is always retried once, with fresh values**: The session id
+  and the tool set are minted per request, so the retry is a genuinely different
+  request even when the recipe did not change. Previously a `no-change` verdict
+  skipped the retry and surfaced the 403.
+- **Self-update (`update: auto`, in miniature)**: Polls this repo's
+  `package.json` at most every 6h, downloads the shipped files, syntax-checks
+  them, then renames them into place and exits for the service manager to
+  restart. `AUTO_UPDATE=0` disables it. A failed check or partial download
+  leaves the running install untouched.
+- **Drills**: `routing` proves the endpoint is read per request (a fake server
+  started *after* boot receives the request); `allowlist` proves a renamed tool
+  reaches the wire in `full` scope. `npm run drill` is now 6/6.
+
+### Measured: what the gate does and does not check
+
+| Condition | Result |
+|---|---|
+| `stream: true` | required — `stream: false` returns `403 FreeTierError` |
+| a tool named `read` present in `tools` | required |
+| tool *schemas* | not compared — `read` with `parameters: {}` is accepted |
+| exact header set, `b3`/`traceparent`, TLS fingerprint | not checked |
+| session id shape | must be minted by the client's generator; a hand-written string of the same shape is rejected |
+| `/inference/v1/*` vs `/inference/openai/v1/*` | both accepted today; catalog value used |
+
 ## [2.0.0] — 2026-10-17
 
 ### Lean adaptive identity — handshake + source derivation in a single module

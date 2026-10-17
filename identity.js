@@ -66,7 +66,23 @@ const SOURCE_FILES = Object.freeze({
   modelRequest: "packages/core/src/session/model-request.ts",
   readTool: "packages/core/src/tool/plugin/read.ts",
   shellTool: "packages/core/src/tool/plugin/shell.ts",
+  globTool: "packages/core/src/tool/plugin/glob.ts",
+  editTool: "packages/core/src/tool/plugin/edit.ts",
+  writeTool: "packages/core/src/tool/plugin/write.ts",
+  grepTool: "packages/core/src/tool/plugin/grep.ts",
+  questionTool: "packages/core/src/tool/plugin/question.ts",
+  skillTool: "packages/core/src/tool/plugin/skill.ts",
+  subagentTool: "packages/core/src/tool/plugin/subagent.ts",
+  webfetchTool: "packages/core/src/tool/plugin/webfetch.ts",
+  websearchTool: "packages/core/src/tool/plugin/websearch.ts",
 });
+
+// The provider/model catalog the real CLI consumes at boot. The `opencode`
+// provider entry carries the inference endpoints (`api` field): today
+// `https://opencode.ai/inference/openai/v1`, formerly `/zen/v1`. Deriving the
+// wire URLs from here made the /zen → /inference migration detectable — the
+// URL is no longer a hardcoded constant.
+const CATALOG_URL = process.env.OPENCODE_CATALOG_URL || "https://models.opencode.ai/api.json";
 
 const DEFAULT_RECIPE = Object.freeze({
   channel: "latest",
@@ -77,6 +93,14 @@ const DEFAULT_RECIPE = Object.freeze({
   sessionLength: 26,
   sessionMultiplier: 0x1000,
   userAgentTemplate: "opencode/${app.channel}/${app.version}/${app.name}",
+  // Wire endpoints, resolved from the upstream model catalog (field `api` of
+  // the `opencode` provider). The fallback here matches today's gate; a catalog
+  // read at refresh time replaces them, so a path migration upstream is picked
+  // up without a bridge release.
+  chatUrl: "https://opencode.ai/inference/v1/chat/completions",
+  responsesUrl: "https://opencode.ai/inference/v1/responses",
+  modelsUrl: "https://opencode.ai/inference/v1/models",
+  catalogBase: "https://opencode.ai",
   // The header names upstream's own request builder sets, in its order. This is
   // the fallback when the source read fails, so it must be the complete set —
   // a partial list would silently stop sending a header the gate checks.
@@ -151,6 +175,10 @@ let recipe = { ...DEFAULT_RECIPE };
 let toolProfile = null;
 let toolProfileSource = "default";
 let toolProfileVersion = DEFAULT_RECIPE.version;
+// The gate allowlist: tool names upstream accepts. Derived from the tool plugin
+// sources at the release SHA; the wire sends these names (schema is not
+// fingerprinted). Empty = fall back to the tool profile's own key order.
+let toolNames = [];
 let lastRelease = null;
 let lastAvailable = null;
 let lastCheckTime = 0;
@@ -333,30 +361,48 @@ function extractToolFromSource(source, fallbackName) {
     }
   }
 
-  // 1. Tool description: either an array builder `const description = (...) => [ ... ].join(" ")`
-  //    or a string literal `description: "..."` inside `editor.add({ ... })`.
+  // 1. Tool description. Three upstream forms:
+  //    (a) array literal (optionally inside an arrow fn) joined with " " or "\n"
+  //    (b) exported template/string literal
+  //    (c) a `description` key inside `editor.add({ ... })`
   let description = null;
   const builderMatch = source.match(
-    /const\s+description\s*=\s*\([^)]*\)\s*=>\s*\[([\s\S]*?)\]\.join\(\s*" "\s*\)/m
+    /const\s+description\s*=\s*(?:\([^)]*\)\s*=>\s*)?\[([\s\S]*?)\]\.join\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/m
   );
+  const litRe = /"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`/g;
   if (builderMatch) {
+    // Groups are the joiner's *contents* (`" "` gives ` `, `"\n"` gives `\n`).
+    const rawJoiner = builderMatch[2] !== undefined ? builderMatch[2] : builderMatch[3];
+    const joiner = String(rawJoiner === undefined ? " " : rawJoiner).replace(/\\n/g, "\n");
     const parts = [];
-    const litRe = /"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`/g;
     let lm;
     while ((lm = litRe.exec(builderMatch[1])) !== null) {
-      const raw = lm[1] !== undefined ? lm[1] : interpolateTemplate(lm[2], vars);
+      const raw = lm[1] !== undefined ? lm[1] : interpolateTemplate(lm[2] !== undefined ? lm[2] : (lm[3] || ""), vars);
       if (raw) parts.push(raw);
     }
-    if (parts.length > 0) description = parts.join(" ");
+    if (parts.length > 0) description = parts.join(joiner);
   } else {
-    const addBlock = source.match(/editor\.add\(\{([\s\S]*?)\binput\s*:/);
-    if (addBlock) {
-      const descMatch = addBlock[1].match(/description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`)/);
-      if (descMatch) {
+    // multi-line template literal — match lazily from the first backtick
+    const tpl = source.match(/export\s+const\s+description\s*=\s*`([\s\S]*?)`/m);
+    if (tpl) description = interpolateTemplate(tpl[1], vars);
+    else {
+      const dq = source.match(/export\s+const\s+description\s*=\s*"((?:[^"\\]|\\.)*)"/m);
+      const sq = source.match(/export\s+const\s+description\s*=\s*'((?:[^'\\]|\\.)*)'/m);
+      if (dq) description = dq[1];
+      else if (sq) description = interpolateTemplate(sq[1], vars);
+    }
+  }
+  if (!description || description.length < 20) {
+    const addBlock0 = source.match(/editor\.add\(\{([\s\S]*?)\binput\s*:/);
+    if (addBlock0) {
+      const descMatch0 = addBlock0[1].match(
+        /description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)/
+      );
+      if (descMatch0) {
         description =
-          descMatch[1] !== undefined
-            ? descMatch[1]
-            : interpolateTemplate(descMatch[2], vars);
+          descMatch0[1] !== undefined
+            ? descMatch0[1]
+            : interpolateTemplate(descMatch0[2] !== undefined ? descMatch0[2] : (descMatch0[3] || ""), vars);
       }
     }
   }
@@ -370,13 +416,12 @@ function extractToolFromSource(source, fallbackName) {
   const properties = {};
   const required = [];
   const fieldRe =
-    /([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([\s\S]*?\.annotate\(\{\s*description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`)\s*,?\s*\}\))/g;
+    /([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([\s\S]*?\.annotate\(\{\s*description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)\s*,?\s*\}\))/g;
   let fm;
   while ((fm = fieldRe.exec(structMatch[1])) !== null) {
     const key = fm[1];
     const expr = fm[2];
-    const fieldDesc =
-      fm[3] !== undefined ? fm[3] : interpolateTemplate(fm[4] || "", vars);
+    const fieldDesc = fm[3] !== undefined ? fm[3] : interpolateTemplate(fm[4] !== undefined ? fm[4] : (fm[5] || ""), vars);
 
     const isOptional =
       expr.includes("Schema.optionalKey") ||
@@ -415,6 +460,66 @@ function extractToolFromSource(source, fallbackName) {
       additionalProperties: false,
     },
   };
+}
+
+/**
+ * Resolve wire endpoints from the upstream provider catalog.
+ *
+ * The catalog is the same file the real CLI reads at boot
+ * (`models.opencode.ai/api.json`). Its `opencode` provider entry carries the
+ * live inference base URLs — this is how the /zen/v1 → /inference/v1 migration
+ * would have been surfaced without a bridge release. Every resolved URL is
+ * sanity-checked before adoption; a malformed catalog changes nothing.
+ */
+async function extractCatalog() {
+  const out = {};
+  let json;
+  try {
+    json = await fetchJson(CATALOG_URL, SOURCE_TIMEOUT_MS);
+  } catch {
+    return out;
+  }
+  const oc = json?.opencode;
+  const api = typeof oc?.api === "string" ? oc.api.replace(/\/+$/, "") : null;
+  if (api && /^https:\/\/[a-z0-9.-]+/.test(api)) {
+    out.catalogBase = api;
+    out.chatUrl = `${api}/chat/completions`;
+    // The Responses lane is the same base with /responses — that is how the
+    // real CLI's @ai-sdk/openai route is built. Keep the current value if the
+    // derived URL would be identical to the chat URL (malformed catalog).
+    if (api.endsWith("/v1")) out.responsesUrl = `${api}/responses`;
+  }
+  for (const m of Object.values(oc?.models || {})) {
+    const mp = m?.provider?.api;
+    if (typeof mp === "string" && mp !== api && /^https:\/\//.test(mp)) {
+      // per-model override exists — record the distinct bases so the caller can
+      // route anthropic-protocol models correctly.
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Extract the tool *name list* (the gate's allowlist) from all fetched tool
+ * source files. Schema details are secondary — the upstream gate validates the
+ * tool name against its list (schema content is not fingerprinted), so the
+ * wire needs correct names, not byte-identical schemas.
+ */
+function extractToolNames(files = {}) {
+  const names = [];
+  const seen = new Set();
+  for (const [key] of Object.entries(SOURCE_FILES)) {
+    if (!key.endsWith("Tool")) continue;
+    const source = files[key];
+    if (typeof source !== "string" || !source.trim()) continue;
+    const nameMatch = source.match(/export\s+const\s+name\s*=\s*"([a-z][a-z0-9_-]*)"/i);
+    const name = nameMatch ? nameMatch[1] : null;
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
 }
 
 /**
@@ -484,22 +589,23 @@ function extractRecipe(files = {}) {
   }
 
   const extractedTools = {};
-  const readDef = extractToolFromSource(files.readTool, "read");
-  if (readDef) {
-    extractedTools[readDef.name] = {
-      description: readDef.description,
-      parameters: readDef.parameters,
-    };
-  }
-  const shellDef = extractToolFromSource(files.shellTool, "shell");
-  if (shellDef) {
-    extractedTools[shellDef.name] = {
-      description: shellDef.description,
-      parameters: shellDef.parameters,
-    };
+  const toolKeys = Object.keys(SOURCE_FILES).filter((k) => k.endsWith("Tool"));
+  for (const key of toolKeys) {
+    const fallbackName = key.replace(/Tool$/, "").toLowerCase();
+    const def = extractToolFromSource(files[key], fallbackName);
+    if (def) {
+      extractedTools[def.name] = {
+        description: def.description,
+        parameters: def.parameters,
+      };
+    }
   }
   if (Object.keys(extractedTools).length > 0) {
     out.tools = extractedTools;
+  }
+  const toolNames = extractToolNames(files);
+  if (toolNames.length > 0) {
+    out.toolNames = toolNames;
   }
 
   return out;
@@ -561,6 +667,14 @@ function applyRecipe(update = {}, tag = null) {
     changed.push("sessionPrefix");
   }
 
+  for (const k of ["chatUrl", "responsesUrl", "modelsUrl", "catalogBase"]) {
+    const v = clampString(update[k], 256);
+    if (v && /^https?:\/\/[a-z0-9.:-]+/i.test(v) && v !== next[k]) {
+      next[k] = v;
+      changed.push(k);
+    }
+  }
+
   if (typeof update.userAgentTemplate === "string") {
     const probe = buildUserAgent({ ...next, userAgentTemplate: update.userAgentTemplate });
     if (/^opencode\/[A-Za-z0-9-]+\/\d+\.\d+\.\d+\/[A-Za-z0-9-]+$/.test(probe)) {
@@ -582,6 +696,19 @@ function applyRecipe(update = {}, tag = null) {
 
   if (Array.isArray(update.optionalHeaders)) {
     optionalHeaders = update.optionalHeaders.map(String);
+  }
+
+  if (Array.isArray(update.toolNames) && update.toolNames.length > 0) {
+    const incoming = update.toolNames.map(String).filter((n) => /^[a-z][a-z0-9_-]*$/i.test(n));
+    if (incoming.length > 0) {
+      const same =
+        incoming.length === toolNames.length &&
+        incoming.every((n, i) => n === toolNames[i]);
+      if (!same) {
+        toolNames = incoming;
+        changed.push("toolNames");
+      }
+    }
   }
 
   if (update.tools && typeof update.tools === "object") {
@@ -691,6 +818,12 @@ async function refresh({ force = false, recheck = false } = {}) {
       if (sourceRead) {
         Object.assign(update, extractRecipe(fetchedFiles));
       }
+
+      // Endpoints live in the provider catalog, not in the git source tree.
+      // Missing catalog or missing `opencode` entry leaves the endpoints at
+      // their current values — a catalog outage must not blank the wire URLs.
+      const catalog = await extractCatalog();
+      Object.assign(update, catalog);
 
       const changed = applyRecipe(update, ref);
       return {
@@ -821,6 +954,29 @@ function createId(descending = true, timestamp = Date.now()) {
 
 // --- Accessors & Tool Formatting ---------------------------------------------
 
+/**
+ * The gate's tool-name allowlist, in upstream's own order. Falls back to the
+ * tool profile's key order when the source read has not produced a list yet.
+ */
+function getToolNames() {
+  if (toolNames.length > 0) return toolNames.slice();
+  return Object.keys(getTools());
+}
+
+/**
+ * Current wire endpoints. `chatUrl` / `responsesUrl` are resolved from the
+ * upstream provider catalog at refresh time; `server.js` reads these per
+ * request, so an endpoint migration applies without a restart.
+ */
+function getEndpoints() {
+  return {
+    chatUrl: recipe.chatUrl,
+    responsesUrl: recipe.responsesUrl,
+    modelsUrl: recipe.modelsUrl,
+    catalogBase: recipe.catalogBase,
+  };
+}
+
 function getRecipe() {
   return { ...recipe };
 }
@@ -843,22 +999,23 @@ function getHeaderNames() {
   return Array.isArray(recipe.headers) ? recipe.headers.slice() : DEFAULT_RECIPE.headers.slice();
 }
 
-function getToolList(flat = false) {
+function getToolList(flat = false, scope = null) {
   const profile = getTools();
   const available = Object.keys(profile);
+  const mode = scope || process.env.TOOL_PROFILE_SCOPE || "core";
 
-  // A source-derived profile is sent whole. Filtering it through a hardcoded
-  // name list would defeat the point of deriving it: if upstream renames
-  // `shell`, the extractor records the new name but a fixed list would keep
-  // sending the old one — adapting the recipe while silently dropping the
-  // change from the wire. The core filter exists only for oversized profiles
-  // (the retired capture path), where the extra tools cost prompt tokens.
-  const ordered =
-    toolProfileSource === "source" || available.length <= CORE_TOOL_NAMES.length
-      ? available
-      : CORE_TOOL_NAMES.filter((n) => profile[n]).length > 0
-        ? CORE_TOOL_NAMES.filter((n) => profile[n])
-        : available;
+  // `core` sends the minimum proven set. `full` sends every name derived from
+  // the release's tool plugin sources — the shape the real CLI uses. The
+  // reactive self-heal retries with `full` so a renamed/added upstream tool is
+  // picked up without a bridge release.
+  let ordered;
+  if (mode === "full") {
+    ordered = getToolNames().filter((n) => profile[n]);
+    if (ordered.length === 0) ordered = available;
+  } else {
+    const coreNames = CORE_TOOL_NAMES.filter((n) => profile[n]);
+    ordered = coreNames.length > 0 ? coreNames : available;
+  }
 
   return ordered.map((name) => {
     const def = profile[name];
@@ -965,6 +1122,8 @@ function getState() {
     headers: getHeaderNames(),
     optionalHeaders: optionalHeaders.slice(),
     unsentHeaders: getUnsentHeaders(),
+    toolNames: getToolNames(),
+    endpoints: getEndpoints(),
     inFlight: Boolean(refreshInFlight),
     tools: {
       source: toolProfileSource,
@@ -979,6 +1138,7 @@ function __reset() {
   toolProfile = null;
   toolProfileSource = "default";
   toolProfileVersion = DEFAULT_RECIPE.version;
+  toolNames = [];
   lastRelease = null;
   lastAvailable = null;
   lastCheckTime = 0;
@@ -1034,6 +1194,8 @@ module.exports = {
   getTools,
   getHeaderNames,
   getUnsentHeaders,
+  getToolNames,
+  getEndpoints,
   buildGateHeaders,
   getSessionPrefix,
   createSessionId,

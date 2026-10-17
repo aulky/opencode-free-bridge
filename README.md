@@ -240,6 +240,10 @@ Then register `http://127.0.0.1:20130/v1` as an additional connection.
 | `OPENCODE_MAJOR` | _(none)_ | Pin a major version line, e.g. `2`. Unset follows the newest release of any major. |
 | `OPENCODE_USER_AGENT` | _(derived)_ | Pin the client user-agent and disable identity derivation entirely. |
 | `OPENCODE_SOURCE_BASE` | GitHub raw | Override where the identity recipe is read from. |
+| `OPENCODE_CATALOG_URL` | `models.opencode.ai/api.json` | Provider catalog the endpoints are derived from. |
+| `OPENCODE_CHAT_URL` / `OPENCODE_RESPONSES_URL` | _(derived)_ | Pin the wire endpoints, bypassing catalog derivation. |
+| `AUTO_UPDATE` | on | Poll this repo for a newer bridge release and self-update. Set `0` to disable. |
+| `TOOL_PROFILE_SCOPE` | `core` | `core` sends the minimal proven tool set; `full` sends every name derived from the release. |
 
 ## Client identity
 
@@ -255,9 +259,39 @@ it directly from the same sources the CLI itself uses:
    authoritative version, exact **commit SHA** (`metadata.github.sha`), and
    `minimum` flag (with fallback to GitHub's `releases.atom` feed).
 2. **Source derivation at the commit SHA** — extracts the session-id recipe,
-   User-Agent template, required headers, and `read`/`shell` tool fingerprint
-   schemas directly from the lightweight TypeScript source files at that immutable
+   User-Agent template, required headers, and the tool **name allowlist** from
+   all eleven `packages/core/src/tool/plugin/*.ts` files at that immutable
    commit, falling back safely to the last known-good definitions.
+3. **Provider catalog** (`models.opencode.ai/api.json`) — the same file the real
+   CLI reads at boot. Its `opencode.api` field is the live inference base; the
+   bridge derives `chatUrl`/`responsesUrl` from it and reads them **per
+   request**, so a path migration (`/zen/v1` → `/inference/v1`) applies without
+   a restart or a bridge release.
+
+### What actually gates the free tier (measured)
+
+Probing the live gate with byte-identical CLI requests isolated the checks:
+
+| Condition | Result |
+|---|---|
+| `stream: true` | **required** — `stream: false` returns `403 FreeTierError` |
+| a tool named `read` in `tools` | **required** |
+| tool schemas | not compared — `read` with `parameters: {}` is accepted |
+| exact headers, `b3`/`traceparent`, TLS fingerprint | not checked |
+| session id | must come from the client's generator, not a hand-written lookalike |
+| endpoint path | both `/inference/v1/*` and `/inference/openai/v1/*` accepted today |
+
+That is why the bridge always sends `stream: true` upstream and buffers the SSE
+into one JSON object when the client asked for a non-streamed reply, and why the
+tool layer derives **names** rather than freezing schemas.
+
+### Self-update
+
+Like the CLI's `update: auto`, the bridge polls its own `package.json` at most
+every 6 hours. When a newer release exists it downloads the shipped files,
+syntax-checks them, renames them into place, and exits so the service manager
+restarts it. A failed check or partial download leaves the running install
+untouched. Disable with `AUTO_UPDATE=0`.
 
 ### Why the handshake, not the release feed
 

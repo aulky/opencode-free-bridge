@@ -630,7 +630,7 @@ describe("server unit & integration tests", () => {
       }
     });
 
-    it("does not retry when the identity learned nothing, and surfaces the real error", async () => {
+    it("always retries once with fresh values, then surfaces the real error", async () => {
       let calls = 0;
       mockFetchImpl = async () => {
         calls++;
@@ -648,7 +648,9 @@ describe("server unit & integration tests", () => {
           model: "big-pickle",
           messages: [{ role: "user", content: "hi" }],
         });
-        assert.equal(calls, 1, "no retry loop when nothing changed");
+        // Two upstream calls: the original and one retry with a freshly minted
+        // session id + full tool set. Still bounded — never a retry loop.
+        assert.equal(calls, 2, "exactly one retry, never a loop");
         assert.equal(res.status, 403);
         assert.equal(res.body.error.type, "FreeTierError");
       } finally {

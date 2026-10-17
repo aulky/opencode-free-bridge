@@ -245,6 +245,48 @@ describe("identity: recipe & tool extraction", () => {
     const r = identity.extractRecipe({ identifier: 'const length = 3\nconst chars = "ab"' });
     assert.equal(r.sessionLength, undefined);
   });
+
+  it("extracts the tool allowlist from every tool source, not just read/shell", () => {
+    const r = identity.extractRecipe({
+      globTool: 'export const name = "glob"\n',
+      editTool: 'export const name = "edit"\n',
+      writeTool: 'export const name = "write"\n',
+      readTool: 'export const name = "read"\n',
+      shellTool: 'export const name = "shell"\n',
+    });
+    assert.deepEqual(r.toolNames, ["read", "shell", "glob", "edit", "write"]);
+  });
+
+  it("extracts a tool whose description is an exported template literal", () => {
+    const src = [
+      'export const name = "webfetch"',
+      'export const description = `Fetch content from an HTTP or HTTPS URL and return it as text, markdown, or HTML. Markdown is the default.`',
+      'export const Input = Schema.Struct({',
+      '  url: Schema.String.annotate({ description: "The HTTP or HTTPS URL to fetch content from" }),',
+      '})',
+    ].join("\n");
+    const def = identity.extractToolFromSource(src, "webfetch");
+    assert.equal(def.name, "webfetch");
+    assert.ok(def.description.startsWith("Fetch content"));
+    assert.deepEqual(Object.keys(def.parameters.properties), ["url"]);
+  });
+
+  it("extracts a tool whose description is an array joined with a newline", () => {
+    const src = [
+      'export const name = "skill"',
+      'export const description = [',
+      '  "Load a specialized skill.",',
+      '  "The skill ID must match an available skill.",',
+      '].join("\\n")',
+      'export const Input = Schema.Struct({',
+      '  id: Schema.String.annotate({ description: "The ID of an available skill" }),',
+      '})',
+    ].join("\n");
+    const def = identity.extractToolFromSource(src, "skill");
+    assert.equal(def.name, "skill");
+    assert.equal(def.description, "Load a specialized skill.\nThe skill ID must match an available skill.");
+    assert.deepEqual(Object.keys(def.parameters.properties), ["id"]);
+  });
 });
 
 describe("identity: applying a recipe", () => {
@@ -485,6 +527,32 @@ describe("identity: self-healing on gate rejection", () => {
   });
 });
 
+describe("identity: adaptive endpoints", () => {
+  it("adopts catalog-derived endpoints and exposes them per request", () => {
+    const changed = identity.applyRecipe({
+      chatUrl: "https://opencode.ai/inference/openai/v1/chat/completions",
+      responsesUrl: "https://opencode.ai/inference/openai/v1/responses",
+    });
+    assert.ok(changed.includes("chatUrl"));
+    const e = identity.getEndpoints();
+    assert.equal(e.chatUrl, "https://opencode.ai/inference/openai/v1/chat/completions");
+    assert.equal(e.responsesUrl, "https://opencode.ai/inference/openai/v1/responses");
+    assert.equal(e.modelsUrl, identity.DEFAULT_RECIPE.modelsUrl);
+  });
+
+  it("rejects a malformed endpoint instead of adopting it", () => {
+    identity.applyRecipe({ chatUrl: "not-a-url" });
+    assert.equal(identity.getEndpoints().chatUrl, identity.DEFAULT_RECIPE.chatUrl);
+  });
+
+  it("reports endpoints and the tool allowlist in state", () => {
+    identity.applyRecipe({ toolNames: ["read", "shell", "glob"] });
+    const st = identity.getState();
+    assert.deepEqual(st.toolNames, ["read", "shell", "glob"]);
+    assert.equal(typeof st.endpoints.chatUrl, "string");
+  });
+});
+
 describe("identity: gate header wiring", () => {
   beforeEach(() => identity.__reset());
 
@@ -569,18 +637,25 @@ describe("identity: tool profile formatting", () => {
     assert.ok(responses.every((t) => t.type === "function" && !t.function && t.strict === false));
   });
 
-  it("sends a source-derived profile whole, so a renamed tool reaches the wire", () => {
-    // Upstream renamed `shell` to `run`. The extractor records the new name;
-    // a hardcoded core filter would keep sending `shell` and silently drop it.
+  it("sends a source-derived profile whole in `full` scope, so a renamed tool reaches the wire", () => {
+    // Upstream renamed `shell` to `run`. The extractor records the new name; a
+    // hardcoded core filter would keep sending `shell` and silently drop it.
+    // The retry after a gate rejection uses `full` scope for exactly this case.
     identity.applyRecipe({
       tools: {
         read: { description: "r".repeat(30), parameters: { type: "object", properties: {} } },
         run: { description: "x".repeat(30), parameters: { type: "object", properties: {} } },
       },
+      toolNames: ["read", "run"],
     });
     assert.deepEqual(
-      identity.getToolList(false).map((t) => t.function.name),
+      identity.getToolList(false, "full").map((t) => t.function.name),
       ["read", "run"]
+    );
+    // The default scope stays minimal: only the proven core names are sent.
+    assert.deepEqual(
+      identity.getToolList(false).map((t) => t.function.name),
+      ["read"]
     );
   });
 

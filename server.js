@@ -14,8 +14,10 @@ const HOST = process.env.HOST || "127.0.0.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(10 * 1024 * 1024), 10);
 const CORS_ORIGIN = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORIGIN : "";
-// OpenCode v2 moved free-tier inference from /zen/v1/* to /inference/v1/*.
-// Requests to /zen/v1/* now fail with 403 FreeTierError.
+// Wire endpoints. These are *defaults*; the live values come from identity.js,
+// which resolves them from the upstream provider catalog (`opencode.api` in
+// models.opencode.ai/api.json) at refresh time. Reading them per request means
+// a /zen/v1 → /inference/v1 style migration applies without a restart.
 const OPENCODE_RESPONSES_URL =
   process.env.OPENCODE_RESPONSES_URL || "https://opencode.ai/inference/v1/responses";
 const OPENCODE_CHAT_URL =
@@ -26,6 +28,106 @@ const OPENCODE_RELEASES_ATOM_URL =
   process.env.OPENCODE_RELEASES_ATOM_URL || "https://github.com/anomalyco/opencode/releases.atom";
 const UPDATE_HINT =
   "Update opencode-free-bridge: curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main/install.sh | bash";
+// Self-update (like the CLI's `update: auto`): poll this repo's package.json and
+// replace the installed files when a newer release exists. Enabled by default;
+// AUTO_UPDATE=0 disables it. Files are syntax-checked before being swapped in,
+// and the swap is rename-per-file, so a partial download can never leave a
+// broken install.
+const UPDATE_BASE_URL =
+  process.env.OPENCODE_BRIDGE_UPDATE_BASE ||
+  "https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main";
+const AUTO_UPDATE = process.env.AUTO_UPDATE !== "0" && process.env.AUTO_UPDATE !== "false";
+const UPDATE_FILES = ["package.json", "identity.js", "token-budget.js", "verify.js", "server.js"];
+let updateInFlight = null;
+let lastUpdateCheck = 0;
+const UPDATE_CHECK_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Compare two `x.y.z` versions. Returns true when `remote` is newer.
+ */
+function isNewerVersion(current, remote) {
+  const a = String(current).split(".").map(Number);
+  const b = String(remote).split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const av = Number.isFinite(a[i]) ? a[i] : 0;
+    const bv = Number.isFinite(b[i]) ? b[i] : 0;
+    if (bv !== av) return bv > av;
+  }
+  return false;
+}
+
+/**
+ * The CLI's `update: auto`, in miniature: check this repo's published
+ * package.json, and when it is newer, download every shipped file into a temp
+ * file, syntax-check the JS, then rename them into place and exit so the
+ * service manager restarts us. Any failure leaves the running install intact.
+ *
+ * Deliberately *not* on the request path: it runs alongside model discovery,
+ * at most once per UPDATE_CHECK_TTL_MS.
+ */
+async function checkAndApplyUpdate() {
+  if (!AUTO_UPDATE) return { updated: false, reason: "disabled" };
+  if (updateInFlight) return updateInFlight;
+  if (Date.now() - lastUpdateCheck < UPDATE_CHECK_TTL_MS) {
+    return { updated: false, reason: "fresh" };
+  }
+  updateInFlight = (async () => {
+    lastUpdateCheck = Date.now();
+    const fs = require("fs");
+    const path = require("path");
+    const { spawnSync } = require("child_process");
+    const tmpFiles = [];
+    try {
+      const pkgRes = await fetch(`${UPDATE_BASE_URL}/package.json`, {
+        headers: { "Cache-Control": "no-cache" },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!pkgRes.ok) throw new Error(`HTTP ${pkgRes.status} fetching package.json`);
+      const remotePkg = await pkgRes.json();
+      const remoteVersion = String(remotePkg?.version || "").trim();
+      if (!/^\d+\.\d+\.\d+$/.test(remoteVersion)) throw new Error("invalid remote version");
+      if (!isNewerVersion(VERSION, remoteVersion)) {
+        return { updated: false, reason: "up-to-date" };
+      }
+
+      for (const file of UPDATE_FILES) {
+        const res = await fetch(`${UPDATE_BASE_URL}/${file}`, {
+          headers: { "Cache-Control": "no-cache" },
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${file}`);
+        const text = await res.text();
+        if (!text || text.length < 20) throw new Error(`empty response for ${file}`);
+        const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
+        fs.writeFileSync(tmpPath, text, "utf8");
+        if (file.endsWith(".js")) {
+          const chk = spawnSync(process.execPath, ["--check", tmpPath], { encoding: "utf8" });
+          if (chk.status !== 0) throw new Error(`syntax check failed for ${file}`);
+        }
+        tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
+      }
+
+      for (const { tmpPath, targetPath } of tmpFiles) fs.renameSync(tmpPath, targetPath);
+      console.log(
+        `[opencode-free-bridge] Self-updated ${VERSION} → ${remoteVersion}; exiting for service restart.`
+      );
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 2000).unref();
+      return { updated: true, version: remoteVersion };
+    } catch (err) {
+      for (const { tmpPath } of tmpFiles) {
+        try {
+          if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+        } catch {}
+      }
+      console.warn(`[opencode-free-bridge] Self-update skipped: ${err.message}`);
+      return { updated: false, error: err.message };
+    } finally {
+      updateInFlight = null;
+    }
+  })();
+  return updateInFlight;
+}
 
 function isFreeTierCliGateError(status, errType, errMsg) {
   if (errType === "FreeTierError" || errType === "UpgradeRequired") return true;
@@ -46,6 +148,21 @@ function isFreeTierCliGateError(status, errType, errMsg) {
   );
 }
 const identity = require("./identity");
+
+/**
+ * Wire endpoints for this request. Environment variables pin them; otherwise
+ * the values derived from the upstream provider catalog are used, falling back
+ * to the shipped defaults until the first successful refresh. Resolved per
+ * call, so a catalog change applies on the next request.
+ */
+function resolveEndpoints() {
+  const derived = identity.getEndpoints();
+  return {
+    responsesUrl: process.env.OPENCODE_RESPONSES_URL || derived.responsesUrl || OPENCODE_RESPONSES_URL,
+    chatUrl: process.env.OPENCODE_CHAT_URL || derived.chatUrl || OPENCODE_CHAT_URL,
+    modelsUrl: process.env.OPENCODE_MODELS_URL || derived.modelsUrl || OPENCODE_MODELS_URL,
+  };
+}
 
 // The identity (user-agent, session-id format, header set) is owned by
 // identity.js, which derives it from opencode's public source and refreshes it
@@ -138,8 +255,9 @@ async function discoverModels() {
   if (discoveryInFlight) return discoveryInFlight;
   discoveryInFlight = (async () => {
     refreshCliVersion().catch(() => {});
+    checkAndApplyUpdate().catch(() => {});
     try {
-    const res = await fetch(OPENCODE_MODELS_URL, {
+    const res = await fetch(resolveEndpoints().modelsUrl, {
       headers: {
         "Authorization": "Bearer public",
         "User-Agent": currentUserAgent,
@@ -259,20 +377,20 @@ function markProtocolSupport(modelId, useResponses) {
 //
 // The names below are kept for the call sites and tests that predate the
 // change; they are read from the live profile, not frozen at load time.
-function getFingerprintNames() {
+function getFingerprintNames(scope = null) {
   // Only the names actually sent upstream. A capture carries ~10 tools but
   // `TOOL_PROFILE_SCOPE=core` sends a subset; treating the unsent ones as
   // fingerprints would alias an unrelated client tool (`glob` → `glob_client`)
   // for no reason.
-  return identity.getToolList(false).map((t) => t.function.name);
+  return identity.getToolList(false, scope).map((t) => t.function.name);
 }
 
 function getFingerprintDefinitions() {
   return identity.getTools();
 }
 
-function getCanonicalTools(flat) {
-  return identity.getToolList(flat);
+function getCanonicalTools(flat, scope = null) {
+  return identity.getToolList(flat, scope);
 }
 
 /**
@@ -329,9 +447,9 @@ function getToolName(tool) {
  * The definitions are resolved per call from identity.js, so a profile update
  * takes effect on the next request without a restart.
  */
-function prepareToolsWithFingerprint(clientTools = [], flat = false) {
-  const fingerprintNames = getFingerprintNames();
-  const canonical = getCanonicalTools(flat);
+function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = null) {
+  const fingerprintNames = getFingerprintNames(scope);
+  const canonical = getCanonicalTools(flat, scope);
   const canonicalByName = new Map(
     canonical.map((t) => [flat ? t.name : t.function.name, t])
   );
@@ -619,13 +737,14 @@ function transformChatMessages(messages = [], originalToAlias = null, placeholde
   return out;
 }
 
-function buildUpstreamPayload(body, targetModel, useResponses) {
+function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
   const requestedTokens =
     body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens;
   const maxTokens = effectiveMaxTokens(requestedTokens, targetModel, body);
   const { tools, placeholderNote, aliasToOriginal, originalToAlias } = prepareToolsWithFingerprint(
     body.tools,
-    useResponses
+    useResponses,
+    scope
   );
   if (useResponses) {
     const upstreamBody = {
@@ -1067,7 +1186,8 @@ function handleRequest(req, res) {
       let reader = null;
       try {
         let { upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses);
-        let upstreamUrl = useResponses ? OPENCODE_RESPONSES_URL : OPENCODE_CHAT_URL;
+        const liveEndpoints = resolveEndpoints();
+        let upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
 
         let upstreamRes = await fetch(upstreamUrl, {
           method: "POST",
@@ -1096,7 +1216,7 @@ function handleRequest(req, res) {
             useResponses = !useResponses;
             markProtocolSupport(targetModel, useResponses);
             ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses));
-            upstreamUrl = useResponses ? OPENCODE_RESPONSES_URL : OPENCODE_CHAT_URL;
+            upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
             upstreamRes = await fetch(upstreamUrl, {
               method: "POST",
               headers: upstreamHeaders,
@@ -1160,37 +1280,42 @@ function handleRequest(req, res) {
             .onGateRejection(gateStatus, errType, rawMsg, false)
             .catch(() => ({ retry: false, reason: "refresh-error" }));
 
-          if (verdict.retry) {
-            syncUserAgent();
-            console.warn(
-              `[opencode-free-bridge] Identity refreshed (${verdict.reason}) after upstream ${gateStatus}; retrying once`
-            );
-            // Rebuild the body too: the tool profile may have changed, and the
-            // tools are part of what the gate inspects.
-            ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
-              body,
-              targetModel,
-              useResponses
-            ));
-            // Re-mint the session id. The one minted before this request was
-            // produced by the recipe the gate just rejected; replaying it would
-            // send the same rejected shape and fail identically. The cached
-            // entry is dropped so the next request also gets a correct id.
-            const retrySessionId = regenerateSessionId(req, body, sessionId);
-            upstreamRes = await fetch(upstreamUrl, {
-              method: "POST",
-              headers: buildUpstreamHeaders(req, retrySessionId),
-              body: JSON.stringify(upstreamBody),
-              signal: abortController.signal,
-            });
-          }
+          // Always retry once on a gate rejection, even when the refresh learned
+          // nothing new. Two inputs to the gate are *minted per request* rather
+          // than read from the recipe — the session id and the tool set — so a
+          // retry with fresh values is a genuinely different request. Measured
+          // upstream behaviour: a session id this bridge did not mint (or one
+          // minted by a rejected recipe) is refused with FreeTierError even
+          // when every header matches, while the same request with a freshly
+          // minted id is accepted.
+          syncUserAgent();
+          console.warn(
+            `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}, ${verdict.reason || "unknown"}); refreshing identity and retrying once with full tool set`
+          );
+          ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
+            body,
+            targetModel,
+            useResponses,
+            "full"
+          ));
+          // Re-mint the session id. The one minted before this request was
+          // produced by the recipe the gate just rejected; replaying it would
+          // send the same rejected shape and fail identically. The cached
+          // entry is dropped so the next request also gets a correct id.
+          const retrySessionId = regenerateSessionId(req, body, sessionId);
+          upstreamRes = await fetch(upstreamUrl, {
+            method: "POST",
+            headers: buildUpstreamHeaders(req, retrySessionId),
+            body: JSON.stringify(upstreamBody),
+            signal: abortController.signal,
+          });
 
           if (!upstreamRes.ok) {
             // Either nothing was learned (a retry would replay the same rejected
             // request) or the retry was rejected too. Surface the real error
             // instead of looping.
             console.warn(
-              `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}): ${rawMsg} — ${verdict.retry ? "retry also rejected" : `no identity change to apply (${verdict.reason || "unknown"})`} — ${UPDATE_HINT}`
+              `[opencode-free-bridge] Upstream CLI gate rejected the retry too (${gateStatus}): ${rawMsg} — ${UPDATE_HINT}`
             );
             let retryText = "";
             try {
@@ -1690,6 +1815,9 @@ module.exports = {
   prepareChatTools,
   restoreClientToolName,
   buildUpstreamPayload,
+  isNewerVersion,
+  checkAndApplyUpdate,
+  resolveEndpoints,
   buildUpstreamHeaders,
   extractResponsesFinishReason,
   getPersistentSessionId,

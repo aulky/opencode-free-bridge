@@ -45,7 +45,14 @@
 
 const http = require("http");
 
-const DRILLS = ["version-floor", "legacy-shape", "empty-tools", "session-shape"];
+const DRILLS = [
+  "version-floor",
+  "legacy-shape",
+  "empty-tools",
+  "session-shape",
+  "routing",
+  "allowlist",
+];
 
 function ask(port, body) {
   return new Promise((resolve, reject) => {
@@ -246,6 +253,107 @@ async function drillSessionShape({ identity, __syncUserAgent, sessionCache }) {
   );
 }
 
+/**
+ * routing — the wire endpoint is read per request from the derived value.
+ *
+ * The whole point of deriving endpoints from the upstream catalog is that a
+ * path migration upstream (the /zen/v1 → /inference/v1 move) must not need a
+ * bridge release. This drill proves the read happens on the request path, not
+ * at boot: it repoints the chat endpoint at a local fake *after* the bridge is
+ * up, sends a request, and checks the fake received it.
+ */
+async function drillRouting({ identity }) {
+  console.log("\nrouting — endpoint derived at request time, not frozen at boot");
+
+  const received = [];
+  const fake = http.createServer((req, res) => {
+    received.push(req.url);
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-fake",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { content: "OK" }, finish_reason: null }],
+      })}\n\n`
+    );
+    res.write(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-fake",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      })}\n\n`
+    );
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise((resolve) => fake.listen(0, "127.0.0.1", resolve));
+  const fakePort = fake.address().port;
+
+  const before = identity.getEndpoints().chatUrl;
+  identity.applyRecipe({ chatUrl: `http://127.0.0.1:${fakePort}/inference/openai/v1/chat/completions` });
+
+  const res = await ask(port(), {
+    model: "big-pickle",
+    messages: [{ role: "user", content: "Reply with exactly: OK" }],
+  });
+
+  identity.applyRecipe({ chatUrl: before });
+  await new Promise((resolve) => fake.close(resolve));
+
+  console.log(`  endpoint before : ${before}`);
+  console.log(`  endpoint staged : http://127.0.0.1:${fakePort}/inference/openai/v1/chat/completions`);
+  console.log(`  fake received   : ${JSON.stringify(received)}`);
+  console.log(`  client saw      : HTTP ${res.status} ${JSON.stringify(content(res))}`);
+
+  line(received.length === 1, "the request went to the newly derived endpoint");
+  line(
+    received[0] === "/inference/openai/v1/chat/completions",
+    "the full derived path was used, not the boot-time one"
+  );
+  line(res.status === 200, "client received 200");
+  line(identity.getEndpoints().chatUrl === before, "endpoint restored after the drill");
+
+  return received.length === 1 && res.status === 200;
+}
+
+/**
+ * allowlist — tool names are derived from the release's tool sources.
+ *
+ * The gate validates which tools are present; the schemas are not compared.
+ * This checks that a name learned from source reaches the wire in `full` scope
+ * (the scope the gate-rejection retry uses) even when everything else is
+ * unchanged, which is what makes an upstream rename self-healing.
+ */
+async function drillAllowlist({ identity }) {
+  console.log("\nallowlist — source-derived tool names reach the wire");
+
+  const before = identity.getState().toolNames;
+  // Simulate upstream renaming `shell` → `run` in its tool sources.
+  identity.applyRecipe({
+    tools: {
+      read: { description: "r".repeat(30), parameters: { type: "object", properties: {} } },
+      run: { description: "x".repeat(30), parameters: { type: "object", properties: {} } },
+    },
+    toolNames: ["read", "run"],
+  });
+
+  const core = identity.getToolList(false).map((t) => t.function.name);
+  const full = identity.getToolList(false, "full").map((t) => t.function.name);
+
+  console.log(`  allowlist       : ${JSON.stringify(identity.getState().toolNames)}`);
+  console.log(`  core scope wire : ${JSON.stringify(core)}`);
+  console.log(`  full scope wire : ${JSON.stringify(full)}`);
+
+  line(core.length > 0, "core scope still sends a gate anchor");
+  line(full.includes("run"), "the renamed tool reaches the wire in full scope");
+  line(!full.includes("shell"), "the retired name is not kept alive");
+
+  identity.__setToolProfile(null, "default");
+  identity.applyRecipe({ toolNames: before });
+
+  return full.includes("run") && core.length > 0;
+}
+
 async function main() {
   const wanted = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const drills = wanted.length > 0 ? wanted : DRILLS;
@@ -271,14 +379,15 @@ async function main() {
 
   const results = [];
   for (const name of drills) {
-    const fn =
-      name === "version-floor"
-        ? drillVersionFloor
-        : name === "legacy-shape"
-          ? drillLegacyShape
-          : name === "empty-tools"
-            ? drillEmptyTools
-            : drillSessionShape;
+    const DRILL_FNS = {
+      "version-floor": drillVersionFloor,
+      "legacy-shape": drillLegacyShape,
+      "empty-tools": drillEmptyTools,
+      "session-shape": drillSessionShape,
+      routing: drillRouting,
+      allowlist: drillAllowlist,
+    };
+    const fn = DRILL_FNS[name];
     // A cached session id from a previous drill would be reused for an
     // identical message and hide the condition being staged.
     sessionCache.clear();
