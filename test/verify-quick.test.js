@@ -25,3 +25,18 @@ test("installer bounds its self-check with a timeout", () => {
   assert.match(src, /timeout 120/, "installer must not wait forever on a throttled upstream");
   assert.match(src, /self-check did not finish/, "installer must explain a timed-out self-check");
 });
+
+test("installer detaches the bridge without a subshell", () => {
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // Regression: `( cd ... && nohup ... & )` leaves bash waiting on the child, so
+  // a piped installer blocked until the bridge exited. Measured 70s in a minimal
+  // repro and 102s on a real install; the pushd+setsid form finishes in 0.004s.
+  assert.doesNotMatch(
+    src,
+    /\(\s*cd[^)]*&\s*\)/,
+    "installer must not background the bridge inside a subshell"
+  );
+  assert.match(src, /pushd "\$BINDIR"/, "installer must change directory without forking");
+  assert.match(src, /setsid env PORT=/, "installer must detach into a new session");
+  assert.match(src, /<\/dev\/null/, "detached bridge must not inherit the caller's stdin");
+});

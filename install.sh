@@ -245,7 +245,23 @@ if [ "$SERVICE_OK" != "1" ]; then
   say "Starting in the background (no service manager)"
   pkill -f -- "$BINDIR/server.js" 2>/dev/null || true
   sleep 0.5
-  (cd "$BINDIR" && PORT="$PORT" HOST="$HOST" nohup "$RUNTIME" server.js >"$BINDIR/bridge.log" 2>&1 &)
+  # Two things matter here, and both were measured:
+  #
+  #   * No subshell. `( ... & )` leaves bash waiting on the child, so a piped
+  #     installer blocks until the bridge exits — 70s in a minimal repro, and a
+  #     real install that never returned.
+  #   * setsid + stdin from /dev/null, so the child owns no descriptor of the
+  #     caller's terminal or pipe.
+  #
+  # pushd/popd changes directory without forking. Measured: 0.004s.
+  pushd "$BINDIR" >/dev/null
+  if command -v setsid >/dev/null 2>&1; then
+    setsid env PORT="$PORT" HOST="$HOST" "$RUNTIME" server.js </dev/null >"$BINDIR/bridge.log" 2>&1 &
+  else
+    env PORT="$PORT" HOST="$HOST" nohup "$RUNTIME" server.js </dev/null >"$BINDIR/bridge.log" 2>&1 &
+  fi
+  disown 2>/dev/null || true
+  popd >/dev/null
 fi
 
 say "Waiting for the bridge to come up..."

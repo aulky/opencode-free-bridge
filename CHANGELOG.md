@@ -1,3 +1,25 @@
+## 2.3.6 — the installer returns, and the bridge survives it
+
+2.3.5 cut the self-check from eighteen minutes to seconds. The installer still
+took 102s on a piped run, and never returned on a normal one.
+
+The bridge was started as `( cd "$BINDIR" && nohup … & )`. That subshell does
+not detach anything: bash keeps waiting on the child, so an installer whose
+output is piped blocks until the bridge exits — which is never. Minimal repro:
+**70s**, then killed. Real install: **102s**, then killed. A `setsid` inside the
+subshell did not help; the subshell itself is the problem.
+
+Replaced with `pushd`/`popd` (changes directory without forking) plus `setsid`
+and stdin from `/dev/null`. Measured: **0.004s** in the repro, **6s** for a full
+piped install.
+
+The detached process is now verified rather than assumed: `PPID 1`, its own
+session id, `fd 0 → /dev/null`, correct `cwd`, and `/health` answering 200 after
+the installer has exited.
+
+One regression test asserts the installer never backgrounds the bridge inside a
+subshell again.
+
 ## 2.3.5 — the installer no longer looks hung
 
 Found by leaving the migration test running: it hit a 300s cap. The installer was
