@@ -1572,17 +1572,27 @@ function handleRequest(req, res) {
             // The retry already used the freshest derived identity (endpoint,
             // session id, full tool set) — so a repeated FreeTierError is not a
             // shape problem this bridge can learn its way out of. Measured
-            // upstream behaviour: the same rejection body is returned when the
-            // caller's IP is over its free-tier allowance, and identical
-            // requests then alternate between 200 and 403 within seconds. Say
-            // that instead of pointing at an update that would not help.
+            // Two different failures return this same body, and telling them
+            // apart matters because the fix is completely different:
+            //
+            //   1. per-IP allowance — identical requests alternate 200/403.
+            //   2. transport fingerprint — measured: with byte-identical
+            //      headers and body, Node and curl are refused 100% while Bun
+            //      succeeds 100% from the same IP in the same minute. The CLI
+            //      ships as a Bun binary, so its TLS ClientHello is Bun's.
+            //
+            // The runtime is the discriminator we can check locally, so say
+            // that instead of guessing at an allowance the user cannot verify.
             const budgetSuspected =
               (gateStatus === 403 || gateStatus === 401) &&
               /freetiererror|free tier|only available in opencode/i.test(rawMsg);
+            const onNode = typeof Bun === "undefined";
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${gateStatus}): ${rawMsg} — ${
                 budgetSuspected
-                  ? "the request shape already matches upstream; this is most likely the per-IP free-tier allowance (identical requests alternate 200/403), not a stale bridge"
+                  ? onNode
+                    ? "request shape already matches upstream, and this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before assuming an allowance limit"
+                    : "request shape and transport both match upstream; if this persists it is the per-IP free-tier allowance (identical requests alternate 200/403)"
                   : `no further identity change to apply; ${UPDATE_HINT}`
               }`
             );

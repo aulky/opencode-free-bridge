@@ -18,10 +18,36 @@ The bridge was already runnable on Bun without modification — no API used here
 is Node-specific. Verified under Bun 1.4.2: **84/84 tests**, **9/9 drills**,
 and the outbound ClientHello structurally identical to the CLI's — same 17 ciphers, same 12 extensions, same order. (The random and key_share fields differ on every connection, as they must.)
 
-Node stays supported. Every gate measured so far passes on it, and no failure
-has ever been traced to the transport. But the transport is the one layer where
-a gate could distinguish the two without any application-layer tell, so Bun is
-now the recommended runtime and the Node startup prints the measured difference.
+Node does **not** pass. This entry originally claimed it did; that was wrong, and
+the measurement that overturned it is below.
+
+### Correction: the transport is not cosmetic, it is the gate
+
+Run against the live endpoint from one IP, in one minute, with identical
+headers and body:
+
+| client | result |
+|---|---|
+| real CLI v2.0.32 | 200 |
+| bridge on Bun | **200 (6/6)** |
+| bridge on Node | **403 (0/6)** |
+| curl (HTTP/1.1 and HTTP/2) | 403 |
+
+Adding the CLI's `Accept-Encoding`, `Accept-Language` and `Sec-Fetch-Mode` to
+Node did not help. Forcing Node onto HTTP/2 did not help. Replacing Node's
+cipher list with Bun's did not help. Removing `Authorization` from the Bun
+request did not hurt. The only variable that tracked the outcome was the HTTP
+runtime, and the CLI ships as a Bun binary.
+
+So the free-tier gate inspects the transport fingerprint, not just the headers.
+This was invisible to every earlier test because those tests compared headers at
+the application layer — exactly the layer the gate had already stopped relying
+on.
+
+The misleading log line is gone. A 403 on Node now says the process is on Node
+and names the fix, instead of guessing at a per-IP allowance the user cannot
+check. On Bun the allowance explanation remains, because there the transport
+and shape are both already correct.
 
 - Startup banner reports the runtime and, on Node, the exact TLS delta. It warns
   rather than refuses: refusing would break every existing Node install over a

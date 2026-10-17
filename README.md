@@ -41,9 +41,21 @@ compared byte for byte. The CLI ships as a Bun binary, so its HTTP stack is
 Bun's; running the bridge on Bun makes the transport identical instead of
 merely similar.
 
-Node remains fully supported — every gate measured so far passes on it, and the
-startup banner says so. But if upstream ever fingerprints the transport, Bun is
-the runtime that already matches.
+Node does not work against the live endpoint, and this is measured rather than
+assumed. From one IP in one minute, with identical headers and body:
+
+| client | result |
+|---|---|
+| real CLI v2.0.32 | 200 |
+| bridge on Bun | 200 (6/6) |
+| bridge on Node | 403 (0/6) |
+| curl, HTTP/1.1 or HTTP/2 | 403 |
+
+Copying the CLI's extra headers onto Node did not help; forcing HTTP/2 did not
+help; substituting Bun's cipher list did not help. The free-tier gate inspects
+the transport fingerprint. Bun is therefore required, not merely recommended —
+`bun server.js` is the supported configuration, and the startup banner says
+which runtime is in use.
 
 ```bash
 bun server.js          # identical transport to the CLI
