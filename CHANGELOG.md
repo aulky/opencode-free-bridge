@@ -45,6 +45,25 @@ upstream no longer needs a bridge release.
   started *after* boot receives the request); `allowlist` proves a renamed tool
   reaches the wire in `full` scope; `retry-endpoint` proves the self-heal retry
   lands on the endpoint learned by the refresh. `npm run drill` is now 7/7.
+- **Budget rejections no longer carry the update hint**: when the retry already
+  used the freshest derived identity, a repeated `403 FreeTierError` is the
+  per-IP allowance, not a stale bridge. Measured: identical, byte-for-byte CLI
+  requests alternate between `200` and `403` within seconds on the same host.
+  The error is surfaced verbatim instead of pointing at `install.sh`.
+
+### Cross-host validation (m1, different IP)
+
+The adaptive bridge was deployed beside the v1.5.3 bridge on a second host and
+staged with the **old** v1.5.3 wire pattern (UA `2.0.29`, `read`+`shell` tools,
+and a broken session prefix). Upstream rejected the staged request with
+`403 FreeTierError`; the bridge refreshed from the handshake + source + catalog,
+re-minted the session id, escalated to the full derived tool set, retried, and
+the client received `200 "ok"`. The v1.5.3 bridge on the same host, which has no
+refresh path, returned `403` at the same moment.
+
+The same host also produced a useful negative result: once its per-IP allowance
+was exhausted, byte-identical CLI requests alternated `200`/`403`, which is how
+the budget gate was distinguished from a shape gate.
 
 ### What is still not self-healing
 

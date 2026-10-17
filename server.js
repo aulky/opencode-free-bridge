@@ -1049,6 +1049,12 @@ function handleRequest(req, res) {
           // mapping is needed before the next gate move is followed.
           headers: idState.headers,
           unsentHeaders: idState.unsentHeaders,
+          // The values derived from upstream sources: the wire endpoints (from
+          // the provider catalog) and the tool allowlist (from the release's
+          // tool plugin sources). Visible because they are the layers that
+          // change without a bridge release.
+          endpoints: idState.endpoints,
+          toolNames: idState.toolNames,
           tools: idState.tools,
         },
       })
@@ -1316,11 +1322,22 @@ function handleRequest(req, res) {
           });
 
           if (!upstreamRes.ok) {
-            // Either nothing was learned (a retry would replay the same rejected
-            // request) or the retry was rejected too. Surface the real error
-            // instead of looping.
+            // The retry already used the freshest derived identity (endpoint,
+            // session id, full tool set) — so a repeated FreeTierError is not a
+            // shape problem this bridge can learn its way out of. Measured
+            // upstream behaviour: the same rejection body is returned when the
+            // caller's IP is over its free-tier allowance, and identical
+            // requests then alternate between 200 and 403 within seconds. Say
+            // that instead of pointing at an update that would not help.
+            const budgetSuspected =
+              (gateStatus === 403 || gateStatus === 401) &&
+              /freetiererror|free tier|only available in opencode/i.test(rawMsg);
             console.warn(
-              `[opencode-free-bridge] Upstream CLI gate rejected the retry too (${gateStatus}): ${rawMsg} — ${UPDATE_HINT}`
+              `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${gateStatus}): ${rawMsg} — ${
+                budgetSuspected
+                  ? "the request shape already matches upstream; this is most likely the per-IP free-tier allowance (identical requests alternate 200/403), not a stale bridge"
+                  : `no further identity change to apply; ${UPDATE_HINT}`
+              }`
             );
             let retryText = "";
             try {
@@ -1337,7 +1354,10 @@ function handleRequest(req, res) {
             return res.end(
               JSON.stringify({
                 error: {
-                  message: `${retryMsg} (${UPDATE_HINT})`,
+                  // Point at an update only when the shape is plausibly stale.
+                  // A budget rejection already carries the newest identity, so
+                  // an "update the bridge" hint would send the user the wrong way.
+                  message: budgetSuspected ? retryMsg : `${retryMsg} (${UPDATE_HINT})`,
                   type: retryType,
                   code: upstreamRes.status,
                 },

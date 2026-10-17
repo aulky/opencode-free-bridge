@@ -658,7 +658,7 @@ describe("server unit & integration tests", () => {
       }
     });
 
-    it("appends update hint only when upstream returns OpenCode CLI / FreeTierError gate rejection", async () => {
+    it("omits the update hint when the refreshed identity is already rejected (budget gate)", async () => {
       mockFetchImpl = async () => ({
         ok: false,
         status: 403,
@@ -677,7 +677,10 @@ describe("server unit & integration tests", () => {
       });
       assert.equal(gateRes.status, 403);
       assert.match(gateRes.body.error.message, /Free models are only available in OpenCode CLI/);
-      assert.match(gateRes.body.error.message, /install\.sh \| bash/);
+      // The retry already carried the freshest derived identity (endpoint,
+      // session id, full tool set), so a repeated rejection is the per-IP
+      // allowance, not a stale bridge. Pointing at install.sh would mislead.
+      assert.doesNotMatch(gateRes.body.error.message, /install\.sh \| bash/);
 
       // Non-gate error (e.g. 429 rate limit) must NOT include update hint
       mockFetchImpl = async () => ({
