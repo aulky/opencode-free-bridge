@@ -165,14 +165,20 @@ legacy_unit_active() {
 # the installer on an existing install must work, so the bridge's own process
 # is not a conflict. Anything else is.
 port_held_by_own_bridge() {
-  local holder pid
+  local holder pid cwd target
   holder="$(port_holder)"
   [ -n "$holder" ] || return 1
   pid="$(printf '%s' "$holder" | grep -oP 'pid=\K[0-9]+' | head -1)"
   [ -n "$pid" ] || return 1
-  case "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" in
-    "$(readlink -f "$BINDIR" 2>/dev/null)") return 0 ;;
-  esac
+
+  # The detached bridge is started with `bun server.js` after a pushd, so its
+  # cmdline is relative and only the cwd identifies it. readlink appends
+  # " (deleted)" once the install directory has been replaced, which must not
+  # defeat the match.
+  cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null | sed 's/ (deleted)$//')"
+  target="$(readlink -f "$BINDIR" 2>/dev/null)"
+  [ -n "$cwd" ] && [ -n "$target" ] && [ "$cwd" = "$target" ] && return 0
+
   tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$BINDIR/server.js" && return 0
   return 1
 }
@@ -181,6 +187,20 @@ stop_own_bridge() {
   local pid
   pid="$(port_holder | grep -oP 'pid=\K[0-9]+' | head -1)"
   [ -n "$pid" ] || return 0
+
+  # If systemd supervises this bridge, stop it through systemd. Killing the pid
+  # directly would be undone immediately by Restart=always.
+  if systemctl is-active --quiet opencode-free-bridge 2>/dev/null; then
+    say "Stopping the running bridge service to replace it"
+    systemctl stop opencode-free-bridge 2>/dev/null || true
+    return 0
+  fi
+  if systemctl --user is-active --quiet opencode-free-bridge 2>/dev/null; then
+    say "Stopping the running bridge service to replace it"
+    systemctl --user stop opencode-free-bridge 2>/dev/null || true
+    return 0
+  fi
+
   say "Stopping the running bridge (pid $pid) to replace it"
   kill "$pid" 2>/dev/null || true
   for _ in $(seq 1 20); do
