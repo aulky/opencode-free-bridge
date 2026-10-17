@@ -4,8 +4,8 @@
  *
  * Answers the only question a new user has: "does this actually work?"
  *
- *   node verify.js          full check: every discovered model, real prompt
- *   node verify.js --quick  one probe per model, faster
+ *   bun verify.js          full check: every discovered model, real prompt
+ *   bun verify.js --quick  one probe per model, faster
  *
  * Exit code is 0 when at least one model answers, 1 otherwise, so it can be
  * wired into CI or a post-install step.
@@ -117,7 +117,7 @@ async function probe(model) {
   const health = await checkHealth();
   if (!health.ok) {
     console.log(`  ${bad("FAIL")} bridge not reachable: ${health.detail}`);
-    console.log(`\n  Start it first:  ${C.cyan}node server.js${C.reset}`);
+    console.log(`\n  Start it first:  ${C.cyan}bun server.js${C.reset}`);
     console.log(`  Or install it:   ${C.cyan}bash install.sh${C.reset}\n`);
     process.exit(1);
   }

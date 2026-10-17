@@ -46,8 +46,8 @@
  * because upstream applies a per-IP cooldown after a burst of failures.
  *
  * Usage:
- *   node gate-drill.js            # both drills
- *   node gate-drill.js version    # one drill
+ *   bun gate-drill.js            # all drills
+ *   bun gate-drill.js full-corrupt  # one drill
  */
 
 const http = require("http");

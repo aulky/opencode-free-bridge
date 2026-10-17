@@ -35,21 +35,10 @@ const MAX_OUTPUT_TOKENS = 131072;
 const MIN_PLAIN_TOKENS = 512;
 
 // Models that think before answering. The provider catalog states this
-// outright (`reasoning: true` on 122 of 127 models), so the bridge asks it
-// instead of matching substrings of the name — a rename, a new family, or a
-// model that ships without reasoning would each silently defeat a name list.
-// The substring list survives only as a fallback for the cold-start window
-// before the catalog has been read.
-const REASONING_MODEL_HINTS = [
-  "muse",
-  "mimo",
-  "nemotron",
-  "longcat",
-  "cat-jam",
-  "pickle",
-  "step-",
-  "deepseek",
-];
+// outright (`reasoning: true` on every live free model), and the catalog is
+// cached on disk after its first fetch, so the bridge asks it instead of
+// maintaining a hand-written substring list.
+const REASONING_MODEL_HINTS = Object.freeze([]);
 
 function isReasoningModel(modelId) {
   const id = String(modelId || "").toLowerCase();
@@ -58,9 +47,9 @@ function isReasoningModel(modelId) {
     const facts = require("./identity").getModelFacts(id);
     if (facts && typeof facts.reasoning === "boolean") return facts.reasoning;
   } catch {
-    // identity unavailable (tests importing this module alone): fall through.
+    // identity unavailable: fall through.
   }
-  return REASONING_MODEL_HINTS.some((hint) => id.includes(hint));
+  return false;
 }
 
 // A request counts as reasoning-bound when it targets a known thinking model,

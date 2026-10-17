@@ -1,3 +1,30 @@
+## 2.3.9 — full audit remediation
+
+- **Catalog warm-start & reactive refresh (`HIGH-1`):** `identity.js` now loads
+  `~/.opencode-free-bridge/cache/catalog.json` at module boot and populates the
+  catalog during `refresh()` whenever `freeModels` is still empty, even when the
+  CLI version has not moved (`cmp === 0` or `reactive` mode). Cold-start model
+  aliases, verdicts, and token-budget facts are active from the first request,
+  and `/v1/models` now discovers all 10 catalog-active free models immediately.
+- **Self-update safety (`HIGH-2`):** `checkAndApplyUpdate()` skips overwriting
+  files when running inside a git checkout (`.git` present, unless forced via
+  `AUTO_UPDATE=1`) and includes `gate-drill.js`, `transport-fingerprint.js`, and
+  `transport-baseline.json` in `UPDATE_FILES`.
+- **Zero hardcoded model hints (`MED-1`):** `REASONING_MODEL_HINTS` in
+  `token-budget.js` is now empty; reasoning detection relies strictly on
+  catalog `reasoning` facts (or explicit `reasoning_effort`).
+- **Catalog URL host validation (`MED-2`):** `parseCatalogData()` only adopts
+  `api` base URLs under `https://*.opencode.ai`.
+- **Installer & TLS parser hardening (`MED-3`, `MED-4`):** `install.sh`
+  validates `PORT`/`HOST`/`BINDIR`, escapes `RUNTIME`/`BINDIR` in `sed`
+  replacements, backs up all shipped files, and uses `$RUNTIME` rather than
+  `node` to print the installed version. `parseClientHello()` validates buffer
+  bounds at every field offset.
+- **SSE error termination (`LOW-1`):** Streaming responses (`useResponses` and
+  Chat SSE) stop emitting trailing completion chunks and duplicate `[DONE]`
+  markers after an in-stream error event.
+
+
 ## 2.3.8 — no hand-written model names
 
 `MODEL_MAP` was a 17-entry table mapping shorthands to model ids:

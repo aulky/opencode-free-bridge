@@ -37,7 +37,16 @@ const UPDATE_BASE_URL =
   process.env.OPENCODE_BRIDGE_UPDATE_BASE ||
   "https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main";
 const AUTO_UPDATE = process.env.AUTO_UPDATE !== "0" && process.env.AUTO_UPDATE !== "false";
-const UPDATE_FILES = ["package.json", "identity.js", "token-budget.js", "verify.js", "server.js"];
+const UPDATE_FILES = [
+  "package.json",
+  "identity.js",
+  "token-budget.js",
+  "verify.js",
+  "gate-drill.js",
+  "transport-fingerprint.js",
+  "transport-baseline.json",
+  "server.js",
+];
 let updateInFlight = null;
 let lastUpdateCheck = 0;
 const UPDATE_CHECK_TTL_MS = 6 * 60 * 60 * 1000;
@@ -71,10 +80,18 @@ async function checkAndApplyUpdate() {
   if (Date.now() - lastUpdateCheck < UPDATE_CHECK_TTL_MS) {
     return { updated: false, reason: "fresh" };
   }
+  const fs = require("fs");
+  const path = require("path");
+  if (
+    process.env.AUTO_UPDATE !== "1" &&
+    process.env.AUTO_UPDATE !== "force" &&
+    !process.env.OPENCODE_BRIDGE_UPDATE_BASE &&
+    fs.existsSync(path.join(__dirname, ".git"))
+  ) {
+    return { updated: false, reason: "git-checkout" };
+  }
   updateInFlight = (async () => {
     lastUpdateCheck = Date.now();
-    const fs = require("fs");
-    const path = require("path");
     const { spawnSync } = require("child_process");
     const tmpFiles = [];
     try {
@@ -1616,8 +1633,10 @@ function handleRequest(req, res) {
             let hasToolCalls = false;
             let upstreamFinishReason = null;
             let streamUsage = null;
+            let streamAbortedByError = false;
 
             const handleResponsesStreamLine = (line) => {
+              if (streamAbortedByError) return;
               if (!line.startsWith("data: ")) return;
               const rawJson = line.slice(6).trim();
               if (!rawJson || rawJson === "[DONE]") return;
@@ -1625,6 +1644,7 @@ function handleRequest(req, res) {
                 const ev = JSON.parse(rawJson);
                 const inStreamError = extractStreamError(ev);
                 if (inStreamError) {
+                  streamAbortedByError = true;
                   console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${inStreamError}`);
                   res.write(
                     `data: ${JSON.stringify({
@@ -1736,6 +1756,7 @@ function handleRequest(req, res) {
             };
 
             await consumeSseLines(reader, decoder, handleResponsesStreamLine);
+            if (streamAbortedByError) return res.end();
 
             const finalFinishReason = upstreamFinishReason || (hasToolCalls ? "tool_calls" : "stop");
             res.write(
@@ -1764,7 +1785,9 @@ function handleRequest(req, res) {
           } else {
             // Chat Completions API SSE stream
             const hasAliases = aliasToOriginal.size > 0;
+            let streamAbortedByError = false;
             const handleChatStreamLine = (line) => {
+              if (streamAbortedByError) return;
               if (!line.startsWith("data: ")) return;
               const raw = line.slice(6).trim();
               if (!raw) return;
@@ -1780,6 +1803,7 @@ function handleRequest(req, res) {
                 const maybe = JSON.parse(raw);
                 const streamErr = extractStreamError(maybe);
                 if (streamErr) {
+                  streamAbortedByError = true;
                   console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${streamErr}`);
                   res.write(
                     `data: ${JSON.stringify({

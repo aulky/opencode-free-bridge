@@ -159,6 +159,9 @@ describe("server unit & integration tests", () => {
     assert.equal("x-opencode-request" in headers, false);
 
     // Chat payload with client 'read' tool conflict + max_tokens: 50 on longcat
+    identity.applyRecipe({
+      modelFacts: { "longcat-2.5-preview-free": { reasoning: true, maxOutput: 131072 } },
+    });
     const { upstreamBody, aliasToOriginal } = buildUpstreamPayload(
       {
         model: "longcat-2.5-preview-free",
@@ -359,7 +362,11 @@ describe("server unit & integration tests", () => {
           ]),
         };
       };
-
+      // Reasoning status comes from the catalog (`modelFacts`), not a
+      // substring list in token-budget.js.
+      identity.applyRecipe({
+        modelFacts: { "cat-jam-free": { reasoning: true, maxOutput: 131072 } },
+      });
       const res = await httpRequest(port, "POST", "/v1/chat/completions", {
         model: "cat-jam-free",
         max_tokens: 0,
@@ -631,6 +638,30 @@ describe("server unit & integration tests", () => {
       assert.match(res.raw, /"error"/);
       assert.match(res.raw, /503/);
       assert.match(res.raw, /\[DONE\]/);
+    });
+
+    it("does not emit trailing completion chunks or duplicate [DONE] after an in-stream error", async () => {
+      srv_markProtocolSupport("big-pickle", true);
+      mockFetchImpl = async () => ({
+        ok: true,
+        status: 200,
+        body: sseStreamFromLines([
+          'data: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+          'data: {"error":{"type":"server_error","message":"Streaming response failed: [503] Upstream unavailable"}}\n\n',
+          'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        ]),
+      });
+
+      const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      });
+
+      assert.equal(res.status, 200);
+      const doneCount = (res.raw.match(/data: \[DONE\]/g) || []).length;
+      assert.equal(doneCount, 1, `expected exactly 1 [DONE] marker, got ${doneCount}`);
+      assert.doesNotMatch(res.raw, /"finish_reason":"stop"/);
     });
 
     it("re-derives the endpoint and retries once when the path moves (404)", async () => {

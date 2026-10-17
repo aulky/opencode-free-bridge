@@ -15,8 +15,14 @@ test("parseClientHello reads ciphers and extension order from raw bytes", async 
   assert.equal(fp.legacyVersion, "0x303", "TLS 1.2 legacy version in ClientHello");
 });
 
-test("parseClientHello rejects non-TLS input", () => {
+test("parseClientHello rejects non-TLS and truncated input", () => {
   assert.throws(() => parseClientHello(Buffer.from("GET / HTTP/1.1\r\n\r\n")), /not a TLS handshake/);
+  assert.throws(() => parseClientHello(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x05])), /not a TLS handshake/);
+  const truncated = Buffer.alloc(44);
+  truncated[0] = 0x16;
+  truncated[5] = 0x01;
+  truncated[43] = 32; // session-id length beyond buffer end
+  assert.throws(() => parseClientHello(truncated), /truncated ClientHello/);
 });
 
 test("the supported runtime's fingerprint matches the recorded baseline", async () => {

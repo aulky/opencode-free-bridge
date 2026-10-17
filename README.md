@@ -145,6 +145,7 @@ reason; the offline drills still run and still decide the exit code:
 | `routing` | a chat URL repointed *after* boot | the endpoint is read per request, not frozen at startup |
 | `allowlist` | a tool renamed in the release's sources | the derived name reaches the wire in `full` scope and the retired name is dropped |
 | `retry-endpoint` | a gate rejection plus a catalog move | the self-heal retry lands on the refreshed endpoint |
+| `full-corrupt` | every adaptive layer broken at once (version, session prefix/length/charset, tool set) | one request triggers one refresh + retry and heals all layers back to the source-derived state |
 
 ```
   OK  bridge v1.5.0, 9 free models discovered
@@ -258,16 +259,16 @@ The list is discovered from upstream at runtime. As of the last update:
 
 | Model ID | Notes |
 |---|---|
-| `muse-spark-1.3-contributor-free` | Meta Muse Spark 1.3 (Responses API) |
-| `muse-spark-1.2-contributor-free` | Meta Muse Spark 1.2 |
 | `big-pickle` | Reasoning model |
+| `beam-free` | Reasoning model |
 | `mimo-v2.6-flash-free` | Xiaomi MiMo V2.6 Flash |
 | `nemotron-3.5-lightning-free` | NVIDIA Nemotron 3.5 Lightning |
-| `cat-jam-free` | — |
+| `nemotron-3.5-super-vl-free` | NVIDIA Nemotron 3.5 Super VL |
+| `nemotron-3-ultra-free` | NVIDIA Nemotron 3 Ultra |
 | `longcat-2.5-preview-free` | LongCat 2.5 Preview |
-| `space-bunny-free` | Space Bunny Preview |
 | `deepseek-v4.1-flash-free` | DeepSeek V4.1 Flash |
-| `step-5-preview-free` | Frequently rate-limited upstream |
+| `glm-5.3-flash-free` | GLM 5.3 Flash |
+| `space-bunny-free` | Space Bunny |
 
 Fetch the live list:
 
@@ -432,11 +433,12 @@ A refresh replaces exactly these, and nothing else:
 | `sessionPrefix` | `packages/schema/src/session-id.ts` | `ses_` |
 | `userAgentTemplate` | `packages/core/src/app.ts` | `opencode/${channel}/${version}/${cli}` |
 | header names | `packages/core/src/session/model-request.ts` | the shipped set |
-| `read` / `shell` schemas | `packages/core/src/tool/plugin/{read,shell}.ts` | `DEFAULT_TOOLS` |
+| tool schemas & allowlist | `packages/core/src/tool/plugin/*.ts` + `codemode/tool.ts` | `DEFAULT_TOOLS` |
+| endpoints, free models, aliases, facts | `models.opencode.ai/api.json` | `~/.opencode-free-bridge/cache/catalog.json` |
 
-Six plain TypeScript files, **~45 KB total**, fetched from
-`raw.githubusercontent.com/anomalyco/opencode/<sha>/<path>`. No npm tarball, no
-CLI binary, no local process, no disk cache.
+Plain TypeScript source files fetched from
+`raw.githubusercontent.com/anomalyco/opencode/<sha>/<path>`, plus the provider
+catalog cached at `~/.opencode-free-bridge/cache/catalog.json` for warm starts.
 
 Header names are split into two sets during extraction: headers upstream sends
 unconditionally, and conditional ones (parent-session lineage, written as
@@ -457,8 +459,8 @@ curl -s http://127.0.0.1:20129/health
 {
   "status": "ok",
   "provider": "opencode-free-bridge",
-  "version": "2.0.0",
-  "discoveredModels": 9,
+  "version": "2.3.9",
+  "discoveredModels": 10,
   "identity": {
     "userAgent": "opencode/latest/2.0.32/cli",
     "updateMode": "reactive",
@@ -562,7 +564,7 @@ and `identity.lastError`. A gate rejection is recognised from the error **body**
 decision. To force a fresh derivation:
 
 ```bash
-IDENTITY_TTL_MS=0 node ~/.opencode-free-bridge/server.js
+IDENTITY_TTL_MS=0 bun ~/.opencode-free-bridge/server.js
 ```
 
 **`THINK` (thinking-only response)**
@@ -580,7 +582,7 @@ journalctl -u opencode-free-bridge -n 50
 tail -50 ~/Library/Logs/opencode-free-bridge.log
 
 # manual
-node ~/.opencode-free-bridge/server.js
+bun ~/.opencode-free-bridge/server.js
 ```
 
 ## How it works

@@ -32,26 +32,35 @@ const BASELINE = path.join(__dirname, "transport-baseline.json");
 
 /** Parse a TLS ClientHello record. No TLS library: the bytes are the API. */
 function parseClientHello(buf) {
-  if (buf[0] !== 0x16) throw new Error("not a TLS handshake record");
+  if (!Buffer.isBuffer(buf) || buf.length < 43 || buf[0] !== 0x16) {
+    throw new Error("not a TLS handshake record");
+  }
   let o = 5; // record header: type(1) version(2) length(2)
   if (buf[o] !== 0x01) throw new Error("not a ClientHello");
   o += 4; // handshake type + 3-byte length
   const legacyVersion = buf.readUInt16BE(o);
   o += 2 + 32; // version + random
+  if (o >= buf.length) throw new Error("truncated ClientHello");
   o += 1 + buf[o]; // session id
+  if (o + 2 > buf.length) throw new Error("truncated ClientHello");
   const csLen = buf.readUInt16BE(o);
   o += 2;
+  if (csLen % 2 !== 0 || o + csLen >= buf.length) throw new Error("truncated ClientHello");
   const ciphers = [];
   for (let i = 0; i < csLen; i += 2) ciphers.push(buf.readUInt16BE(o + i).toString(16).padStart(4, "0"));
   o += csLen;
   o += 1 + buf[o]; // compression methods
+  if (o + 2 > buf.length) throw new Error("truncated ClientHello");
   const extLen = buf.readUInt16BE(o);
   o += 2;
+  if (o + extLen > buf.length) throw new Error("truncated ClientHello");
   const extensions = [];
   const end = o + extLen;
   while (o < end) {
+    if (o + 4 > end) throw new Error("truncated ClientHello");
     const type = buf.readUInt16BE(o);
     const len = buf.readUInt16BE(o + 2);
+    if (o + 4 + len > end) throw new Error("truncated ClientHello");
     extensions.push(type.toString(16).padStart(4, "0"));
     o += 4 + len;
   }

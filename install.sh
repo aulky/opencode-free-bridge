@@ -31,6 +31,12 @@ say()  { printf '\033[1;32m[opencode-free-bridge]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[opencode-free-bridge]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[opencode-free-bridge]\033[0m %s\n' "$*" >&2; exit 1; }
 
+[[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "Invalid PORT: $PORT"
+[[ "$HOST" =~ ^[A-Za-z0-9.:_-]+$ ]] || die "Invalid HOST: $HOST"
+case "$BINDIR" in
+  *$'\n'*|*$'\r'*) die "Invalid BINDIR: newline not allowed" ;;
+esac
+
 # ---------------------------------------------------------------- Node.js ---
 # Bun is required, not preferred. Measured from one IP in one minute with
 # identical headers and body: the real CLI and the bridge on Bun both get 200,
@@ -74,7 +80,7 @@ if [ -n "$PREV_VERSION" ]; then
   say "Found existing install: v$PREV_VERSION in $BINDIR"
   BACKUP="$BINDIR/.backup-v$PREV_VERSION-$(date +%Y%m%d%H%M%S)"
   mkdir -p "$BACKUP"
-  for f in server.js identity.js token-budget.js verify.js gate-drill.js package.json; do
+  for f in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json package.json; do
     [ -f "$BINDIR/$f" ] && cp -p "$BINDIR/$f" "$BACKUP/$f" 2>/dev/null || true
   done
   say "Backed up to $BACKUP"
@@ -86,12 +92,14 @@ fi
 # A service unit written by an older installer still points at `node`, which
 # would silently keep failing after the upgrade. Rewrite it if we can.
 migrate_service_runtime() {
-  local unit
+  local unit esc_runtime esc_bindir
+  esc_runtime="$(printf '%s' "$RUNTIME" | sed 's/[\\&|]/\\&/g')"
+  esc_bindir="$(printf '%s' "$BINDIR" | sed 's/[\\&|]/\\&/g')"
   for unit in "/etc/systemd/system/opencode-free-bridge.service" \
               "$HOME/.config/systemd/user/opencode-free-bridge.service"; do
     [ -f "$unit" ] || continue
     if grep -q 'ExecStart=.*node' "$unit" 2>/dev/null; then
-      sed -i.bak -E "s|^ExecStart=.*|ExecStart=\"$RUNTIME\" \"$BINDIR/server.js\"|" "$unit" 2>/dev/null || {
+      sed -i.bak -E "s|^ExecStart=.*|ExecStart=\"$esc_runtime\" \"$esc_bindir/server.js\"|" "$unit" 2>/dev/null || {
         warn "could not rewrite $unit — update ExecStart to: \"$RUNTIME\" \"$BINDIR/server.js\""
         continue
       }
@@ -105,7 +113,7 @@ migrate_service_runtime() {
   done
   local plist="$HOME/Library/LaunchAgents/com.opencode-free-bridge.plist"
   if [ -f "$plist" ] && grep -q '<string>.*node</string>' "$plist" 2>/dev/null; then
-    sed -i.bak -E "s|<string>[^<]*node</string>|<string>$RUNTIME</string>|" "$plist" 2>/dev/null || true
+    sed -i.bak -E "s|<string>[^<]*node</string>|<string>$esc_runtime</string>|" "$plist" 2>/dev/null || true
     say "launchd agent updated to run under $(basename "$RUNTIME")"
   fi
 }
@@ -138,7 +146,7 @@ fetch gate-drill.js
 fetch transport-fingerprint.js
 fetch transport-baseline.json
 chmod +x "$BINDIR/server.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" 2>/dev/null || true
-say "Files installed (v$(node -p 'require(process.argv[1]).version' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
+say "Files installed (v$("$RUNTIME" -e 'try{process.stdout.write(require(process.argv[1]).version||"latest")}catch{process.stdout.write("latest")}' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
 
 # ---------------------------------------------------------------- service ---
 install_service() {

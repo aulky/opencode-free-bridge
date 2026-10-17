@@ -1,5 +1,6 @@
-const { describe, it } = require("node:test");
+const { describe, it, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const identity = require("../identity");
 const {
   MIN_ANSWER_TOKENS,
   THINKING_BUDGET,
@@ -11,7 +12,28 @@ const {
 } = require("../token-budget");
 
 describe("token-budget", () => {
-  it("recognizes all documented reasoning model families including longcat and cat-jam", () => {
+  beforeEach(() => {
+    identity.__reset();
+    identity.applyRecipe({
+      modelFacts: {
+        "muse-spark-1.3-contributor-free": { reasoning: true, maxOutput: 131072 },
+        "muse-spark-1.2-contributor-free": { reasoning: true, maxOutput: 131072 },
+        "mimo-v2.6-flash-free": { reasoning: true, maxOutput: 32000 },
+        "nemotron-3.5-lightning-free": { reasoning: true, maxOutput: 262144 },
+        "longcat-2.5-preview-free": { reasoning: true, maxOutput: 131072 },
+        "cat-jam-free": { reasoning: true, maxOutput: 131072 },
+        "big-pickle": { reasoning: true, maxOutput: 32000 },
+        "step-5-preview-free": { reasoning: true, maxOutput: 65536 },
+        "deepseek-v4.1-flash-free": { reasoning: true, maxOutput: 32000 },
+        "space-bunny-free": { reasoning: false, maxOutput: 131072 },
+      },
+    });
+  });
+  afterEach(() => {
+    identity.__reset();
+  });
+
+  it("recognizes reasoning and non-reasoning models from catalog facts", () => {
     const reasoningModels = [
       "muse-spark-1.3-contributor-free",
       "muse-spark-1.2-contributor-free",
@@ -27,6 +49,7 @@ describe("token-budget", () => {
       assert.equal(isReasoningModel(model), true, `Expected ${model} to be a reasoning model`);
     }
     assert.equal(isReasoningModel("space-bunny-free"), false);
+    assert.equal(isReasoningModel("unlisted-model"), false);
   });
 
   it("applies additive formula max(requested, 1024) + 4096 for reasoning models", () => {

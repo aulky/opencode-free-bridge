@@ -92,9 +92,17 @@ const CATALOG_URL = process.env.OPENCODE_CATALOG_URL || "https://models.opencode
 // ("mimo", "deepseek") resolves to nothing. The cache closes that window with
 // the last real catalog this process saw — not with a table of names written by
 // hand, which is what it replaces.
-const CATALOG_CACHE_DIR =
-  process.env.OPENCODE_CACHE_DIR || require("path").join(require("os").homedir(), ".opencode-free-bridge", "cache");
-const CATALOG_CACHE_FILE = require("path").join(CATALOG_CACHE_DIR, "catalog.json");
+function getCatalogCacheDir() {
+  return (
+    process.env.OPENCODE_CACHE_DIR ||
+    require("path").join(require("os").homedir(), ".opencode-free-bridge", "cache")
+  );
+}
+function getCatalogCacheFile() {
+  return require("path").join(getCatalogCacheDir(), "catalog.json");
+}
+const CATALOG_CACHE_DIR = getCatalogCacheDir();
+const CATALOG_CACHE_FILE = getCatalogCacheFile();
 
 const DEFAULT_RECIPE = Object.freeze({
   channel: "latest",
@@ -228,6 +236,7 @@ let lastRelease = null;
 let lastAvailable = null;
 let lastCheckTime = 0;
 let refreshInFlight = null;
+let refreshInFlightForced = false;
 let versionFloor = null;
 let lastRefreshError = null;
 let lastSourceTag = null;
@@ -1007,7 +1016,7 @@ function extractToolFromSource(source, fallbackName) {
 function readCachedCatalog() {
   try {
     const fs = require("fs");
-    const raw = fs.readFileSync(CATALOG_CACHE_FILE, "utf8");
+    const raw = fs.readFileSync(getCatalogCacheFile(), "utf8");
     const parsed = JSON.parse(raw);
     // A cached catalog is only useful if it is structurally a catalog.
     if (parsed && typeof parsed === "object" && parsed.opencode) return parsed;
@@ -1018,32 +1027,28 @@ function readCachedCatalog() {
 function writeCachedCatalog(json) {
   try {
     const fs = require("fs");
-    fs.mkdirSync(CATALOG_CACHE_DIR, { recursive: true });
-    const tmp = `${CATALOG_CACHE_FILE}.tmp.${process.pid}`;
+    const dir = getCatalogCacheDir();
+    const file = getCatalogCacheFile();
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${file}.tmp.${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify(json));
-    fs.renameSync(tmp, CATALOG_CACHE_FILE);
+    fs.renameSync(tmp, file);
   } catch {
     // A read-only home directory must not break the bridge; the fetch still
     // worked, this process just will not have a warm start next time.
   }
 }
 
-async function extractCatalog() {
+function isTrustedCatalogBaseUrl(url) {
+  return typeof url === "string" && /^https:\/\/([a-z0-9-]+\.)*opencode\.ai(\/|$)/i.test(url);
+}
+
+function parseCatalogData(json) {
   const out = {};
-  let json;
-  try {
-    json = await fetchJson(CATALOG_URL, SOURCE_TIMEOUT_MS);
-    writeCachedCatalog(json);
-  } catch {
-    // Network unavailable: fall back to the last catalog this machine saw, so
-    // aliases and the free list keep working offline instead of going empty.
-    json = readCachedCatalog();
-    if (!json) return out;
-    out.fromCache = true;
-  }
   const oc = json?.opencode;
-  const api = typeof oc?.api === "string" ? oc.api.replace(/\/+$/, "") : null;
-  if (api && /^https:\/\/[a-z0-9.-]+/.test(api)) {
+  if (!oc || typeof oc !== "object") return out;
+  const api = typeof oc.api === "string" ? oc.api.replace(/\/+$/, "") : null;
+  if (api && isTrustedCatalogBaseUrl(api)) {
     out.catalogBase = api;
     out.chatUrl = `${api}/chat/completions`;
     // The Responses lane is the same base with /responses — that is how the
@@ -1057,16 +1062,15 @@ async function extractCatalog() {
   // only when the model's SDK is OpenAI-compatible; an anthropic-only route is
   // left alone rather than silently misrouted.
   const overrides = {};
-  for (const [id, m] of Object.entries(oc?.models || {})) {
+  for (const [id, m] of Object.entries(oc.models || {})) {
     const mp = m?.provider?.api;
-    if (typeof mp !== "string" || !/^https:\/\//.test(mp)) continue;
-    const npm = String(m?.provider?.npm || oc?.npm || "");
+    if (typeof mp !== "string" || !isTrustedCatalogBaseUrl(mp)) continue;
+    const npm = String(m?.provider?.npm || oc.npm || "");
     if (!npm.startsWith("@ai-sdk/openai")) continue;
     const base = mp.replace(/\/+$/, "");
     if (base !== api) overrides[id.toLowerCase()] = base;
   }
   if (Object.keys(overrides).length > 0) out.modelEndpoints = overrides;
-
   // The free-tier list is a catalog fact, not a naming convention. Deriving it
   // from `cost` + `status` is what the CLI itself does (models-dev.ts maps
   // `status ?? "active"` and keeps zero-cost models), so a model that stops
@@ -1105,10 +1109,9 @@ async function extractCatalog() {
   // a hand-maintained table. `family` groups revisions of one model
   // (`nemotron-free`, `deepseek-flash`), so the newest non-deprecated free
   // member answers the family name — and when a revision is retired the alias
-  // follows automatically. An explicit table still wins for names that are not
-  // family-shaped (`mimo`, `pickle`).
+  // follows automatically.
   const families = {};
-  for (const [id, m] of Object.entries(oc?.models || {})) {
+  for (const [id, m] of Object.entries(oc.models || {})) {
     if (verdicts[id.toLowerCase()] !== "free") continue;
     const family = typeof m?.family === "string" ? m.family.trim().toLowerCase() : "";
     if (!family) continue;
@@ -1116,6 +1119,24 @@ async function extractCatalog() {
   }
   if (Object.keys(families).length > 0) out.modelFamilies = families;
 
+  return out;
+}
+
+async function extractCatalog() {
+  let json;
+  let fromCache = false;
+  try {
+    json = await fetchJson(CATALOG_URL, SOURCE_TIMEOUT_MS);
+    writeCachedCatalog(json);
+  } catch {
+    // Network unavailable: fall back to the last catalog this machine saw, so
+    // aliases and the free list keep working offline instead of going empty.
+    json = readCachedCatalog();
+    if (!json) return {};
+    fromCache = true;
+  }
+  const out = parseCatalogData(json);
+  if (fromCache) out.fromCache = true;
   return out;
 }
 
@@ -1647,8 +1668,14 @@ async function refresh({ force = false, recheck = false } = {}) {
   if (!force && !recheck && Date.now() - lastCheckTime < IDENTITY_TTL_MS) {
     return { updated: false, reason: "fresh" };
   }
-  if (refreshInFlight) return refreshInFlight;
+  if (refreshInFlight) {
+    if (!force) return refreshInFlight;
+    refreshInFlightForced = true;
+    const pending = await refreshInFlight;
+    if (pending && (pending.updated || pending.sourceRead)) return pending;
+  }
 
+  refreshInFlightForced = Boolean(force);
   refreshInFlight = (async () => {
     try {
       const release = await resolveRelease(recipe.version);
@@ -1669,9 +1696,16 @@ async function refresh({ force = false, recheck = false } = {}) {
 
       const updateMode = getUpdateMode();
       const forcedByUpstream = release.minimum === true;
-      const shouldAdopt = cmp > 0 && (force || updateMode === "always" || forcedByUpstream);
+      const isForced = force || refreshInFlightForced;
+      const shouldAdopt = cmp > 0 && (isForced || updateMode === "always" || forcedByUpstream);
 
-      if (cmp === 0 && !force) {
+      if (cmp === 0 && !isForced) {
+        // Even when the CLI version has not moved, populate the catalog once if
+        // this process still has no free-model list (cold boot without cache).
+        if (freeModels.length === 0) {
+          const catalog = await extractCatalog();
+          applyRecipe(catalog);
+        }
         return {
           updated: false,
           version: recipe.version,
@@ -1681,6 +1715,10 @@ async function refresh({ force = false, recheck = false } = {}) {
       if (cmp > 0 && !shouldAdopt) {
         // Reactive mode: remember that a release exists without adopting it.
         // The next gate rejection forces a refresh, which flips shouldAdopt.
+        if (freeModels.length === 0) {
+          const catalog = await extractCatalog();
+          applyRecipe(catalog);
+        }
         lastAvailable = latest;
         return {
           updated: false,
@@ -1816,6 +1854,7 @@ async function refresh({ force = false, recheck = false } = {}) {
       return { updated: false, error: lastRefreshError };
     } finally {
       refreshInFlight = null;
+      refreshInFlightForced = false;
     }
   })();
 
@@ -2266,6 +2305,12 @@ function __setToolProfile(tools, source = "test") {
   toolProfileVersion = recipe.version;
 }
 
+// Warm-start from the on-disk catalog cache at module load so shorthand aliases,
+// model verdicts, and token-budget facts work on the very first request.
+{
+  const bootCatalog = readCachedCatalog();
+  if (bootCatalog) applyRecipe(parseCatalogData(bootCatalog));
+}
 module.exports = {
   IDENTITY_TTL_MS,
    get UPDATE_MODE() {
@@ -2281,6 +2326,8 @@ module.exports = {
   parseVersionFloor,
   sourceRef,
   resolveRelease,
+  parseCatalogData,
+  extractCatalog,
   extractToolFromSource,
   extractToolNames,
   extractToolOverrides,
