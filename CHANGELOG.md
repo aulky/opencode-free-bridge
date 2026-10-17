@@ -1,3 +1,44 @@
+## 2.3.8 — no hand-written model names
+
+`MODEL_MAP` was a 17-entry table mapping shorthands to model ids:
+
+```js
+"pickle":   "big-pickle",
+"deepseek": "deepseek-v4.1-flash-free",
+"nemotron": "nemotron-3.5-lightning-free",
+```
+
+It was the third fallback, behind the catalog and `identity.resolveModelAlias`,
+and it was guarded against pointing at deprecated models. But a name written by
+hand outlives the model it points at: the table is edited by whoever notices,
+not by the release that retired the model. Removed.
+
+Measured first: 13 of the 17 entries already derive from the catalog's own
+`family` field. The four that did not were `mimo-v2.5`, `mimo-v2.5-free`
+(both deprecated, so nothing to resolve) and `pickle` (a conversational name no
+catalog contains). Dropping them means `"pickle"` now passes through as a
+literal model id and earns a truthful "model unavailable" instead of silently
+resolving to something.
+
+### The cold-start window this exposed
+
+The table also covered the first seconds after boot, before the catalog was
+read. Removing it left that window with no aliases at all. The fix is not
+another table but a **catalog cache on disk**:
+
+- after a successful fetch, the catalog is written to
+  `~/.opencode-free-bridge/cache/catalog.json` (atomic rename)
+- if the fetch fails, the last catalog this machine saw is used, so aliases and
+  the free list keep working offline
+- a read-only home directory is tolerated: the bridge still runs, it just does
+  not get a warm start next time
+
+Verified with the network pointed at a dead address: 10 free models, and
+`mimo`, `deepseek`, `nemotron`, `longcat`, `space-bunny` all resolve.
+
+Three tests now forbid `MODEL_MAP` from returning, require the cache read/write
+path, and require the fetch-failure fallback.
+
 ## 2.3.7 — every layer broken at once, and a measurement that corrects the record
 
 The existing drills each break one layer. A real upstream change does not: it

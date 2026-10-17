@@ -325,41 +325,6 @@ async function discoverModels() {
   }
 }
 
-// Internal alias normalizer for common shorthand requests.
-//
-// Only shorthands the catalog cannot derive live here: revision numbers
-// ("mimo-v2.5") that are not prefixes of the current id, and conversational
-// names ("pickle"). Family shorthands ("deepseek", "glm", "longcat") come from
-// the catalog instead (`identity.resolveModelAlias`), so a retired revision
-// stops being reachable without editing this table. Entries whose target the
-// catalog marks deprecated have been removed — with them gone the lookup falls
-// through to the derived alias and then to the literal name.
-// Cold-start fallback only. The catalog's `family` field is the live source for
-// these shorthands (`identity.resolveModelAlias`), and it is consulted first —
-// so these entries matter only in the window before the first catalog read,
-// when a client may already be sending requests. They are also filtered at use
-// time: an entry whose target the catalog marks deprecated is ignored, so a
-// stale row cannot resolve to a model that answers 410.
-const MODEL_MAP = {
-  "mimo":                       "mimo-v2.6-flash-free",
-  "mimo-v2.5":                  "mimo-v2.6-flash-free",
-  "mimo-v2.5-free":             "mimo-v2.6-flash-free",
-  "mimo-v2.6":                  "mimo-v2.6-flash-free",
-  "nemotron":                   "nemotron-3.5-lightning-free",
-  "nemotron-3":                 "nemotron-3-ultra-free",
-  "nemotron-3-ultra":           "nemotron-3-ultra-free",
-  "nemotron-3-ultra-free":      "nemotron-3-ultra-free",
-  "nemotron-3.5":               "nemotron-3.5-lightning-free",
-  "deepseek":                   "deepseek-v4.1-flash-free",
-  "deepseek-v4":                "deepseek-v4.1-flash-free",
-  "deepseek-v4.1":              "deepseek-v4.1-flash-free",
-  "big-pickle":                 "big-pickle",
-  "pickle":                     "big-pickle",
-  "space-bunny":                "space-bunny-free",
-  "longcat":                    "longcat-2.5-preview-free",
-  "longcat-2.5":                "longcat-2.5-preview-free",
-};
-
 function normalizeModel(rawModel) {
   if (typeof rawModel !== "string") return "";
   const stripped = rawModel.trim().replace(/^(opencode\/|oc\/|zen\/|9router\/|openai\/)/i, "").trim();
@@ -378,8 +343,10 @@ function normalizeModel(rawModel) {
   if (verdict === "free") return stripped;
   const derived = identity.resolveModelAlias(lower);
   if (derived) return derived;
-  const mapped = MODEL_MAP[lower];
-  if (mapped && identity.getCatalogVerdict(mapped) !== "deprecated") return mapped;
+  // No static table behind this. A shorthand either derives from the catalog's
+  // own `family` field or it is passed through as a literal model id. Anything
+  // else would be a name this bridge invented, and an invented name can outlive
+  // the model it points at.
   return stripped;
 }
 
@@ -2168,7 +2135,6 @@ if (require.main === module) {
 
 module.exports = {
   VERSION,
-  MODEL_MAP,
   // Kept for callers and tests written against the old frozen constants. These
   // are live views of the resolved profile, not snapshots.
   get FINGERPRINT_TOOL_NAMES() {

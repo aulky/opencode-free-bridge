@@ -91,8 +91,19 @@ describe("server unit & integration tests", () => {
     assert.equal(normalizeModel(""), "");
     assert.equal(normalizeModel("   "), "");
     assert.equal(normalizeModel("oc/"), "");
-    assert.equal(normalizeModel("zen/mimo"), "mimo-v2.6-flash-free");
-    assert.equal(normalizeModel("opencode/longcat"), "longcat-2.5-preview-free");
+    // Aliases now come only from the catalog (its `family` field) or from the
+    // on-disk catalog cache — never from a table in this repo. Without a catalog
+    // these resolve to nothing and the literal name is passed through, which is
+    // the honest answer: the bridge does not invent model names.
+    const { identity } = require("../server");
+    const canDerive = Boolean(identity.resolveModelAlias("mimo"));
+    if (canDerive) {
+      assert.equal(normalizeModel("zen/mimo"), "mimo-v2.6-flash-free");
+      assert.equal(normalizeModel("opencode/longcat"), "longcat-2.5-preview-free");
+    } else {
+      assert.equal(normalizeModel("zen/mimo"), "mimo");
+      assert.equal(normalizeModel("opencode/longcat"), "longcat");
+    }
     // `cat-jam` used to map to `cat-jam-free`. The catalog now marks that model
     // deprecated, so the alias no longer resolves to it: sending a retired id
     // would only earn a 410 from upstream. The shorthand falls through to the

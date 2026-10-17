@@ -87,6 +87,14 @@ const REPO = process.env.OPENCODE_REPO || "anomalyco/opencode";
 // wire URLs from here made the /zen → /inference migration detectable — the
 // URL is no longer a hardcoded constant.
 const CATALOG_URL = process.env.OPENCODE_CATALOG_URL || "https://models.opencode.ai/api.json";
+// The catalog is what makes model aliases and the free list derivable. Fetching
+// it on every boot would leave a cold-start window where a client's shorthand
+// ("mimo", "deepseek") resolves to nothing. The cache closes that window with
+// the last real catalog this process saw — not with a table of names written by
+// hand, which is what it replaces.
+const CATALOG_CACHE_DIR =
+  process.env.OPENCODE_CACHE_DIR || require("path").join(require("os").homedir(), ".opencode-free-bridge", "cache");
+const CATALOG_CACHE_FILE = require("path").join(CATALOG_CACHE_DIR, "catalog.json");
 
 const DEFAULT_RECIPE = Object.freeze({
   channel: "latest",
@@ -996,13 +1004,42 @@ function extractToolFromSource(source, fallbackName) {
  * would have been surfaced without a bridge release. Every resolved URL is
  * sanity-checked before adoption; a malformed catalog changes nothing.
  */
+function readCachedCatalog() {
+  try {
+    const fs = require("fs");
+    const raw = fs.readFileSync(CATALOG_CACHE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    // A cached catalog is only useful if it is structurally a catalog.
+    if (parsed && typeof parsed === "object" && parsed.opencode) return parsed;
+  } catch {}
+  return null;
+}
+
+function writeCachedCatalog(json) {
+  try {
+    const fs = require("fs");
+    fs.mkdirSync(CATALOG_CACHE_DIR, { recursive: true });
+    const tmp = `${CATALOG_CACHE_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(json));
+    fs.renameSync(tmp, CATALOG_CACHE_FILE);
+  } catch {
+    // A read-only home directory must not break the bridge; the fetch still
+    // worked, this process just will not have a warm start next time.
+  }
+}
+
 async function extractCatalog() {
   const out = {};
   let json;
   try {
     json = await fetchJson(CATALOG_URL, SOURCE_TIMEOUT_MS);
+    writeCachedCatalog(json);
   } catch {
-    return out;
+    // Network unavailable: fall back to the last catalog this machine saw, so
+    // aliases and the free list keep working offline instead of going empty.
+    json = readCachedCatalog();
+    if (!json) return out;
+    out.fromCache = true;
   }
   const oc = json?.opencode;
   const api = typeof oc?.api === "string" ? oc.api.replace(/\/+$/, "") : null;
