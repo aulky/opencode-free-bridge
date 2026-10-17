@@ -23,7 +23,9 @@ It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible
 
 ## Requirements: Bun >= 1.0
 
-Bun is required to talk to the live OpenCode gateway. Node.js 18+ can run the offline unit test suite, but upstream rejects Node.js requests with `403 FreeTierError` because Node's OpenSSL TLS `ClientHello` differs from the compiled OpenCode CLI (which is built on Bun/BoringSSL).
+Bun is required to talk to the live OpenCode gateway. Node.js 18+ can run the offline unit test suite, but upstream rejects Node.js requests with `403 FreeTierError` because Node's OpenSSL TLS `ClientHello` differs from the compiled OpenCode CLI (which is built on Bun/BoringSSL). The installer installs Bun for you when it is missing.
+
+Supported: Linux (systemd) and macOS (launchd). Windows is not supported; use WSL if you need it there.
 
 Measured against a raw TCP listener and the live gateway from the same IP within one minute, using identical headers and payload:
 
@@ -59,18 +61,26 @@ curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main
 ```
 
 What `install.sh` does:
-1. Checks for `bun` (and installs it via `https://bun.sh/install` if not found).
-2. Backs up any previous installation under `~/.opencode-free-bridge/.backup-*`.
-3. Migrates any existing `systemd` or `launchd` unit from `node` to `bun`.
-4. Downloads the bridge files into `~/.opencode-free-bridge`.
+1. Finds `bun`, or installs it via `https://bun.sh/install` when it is missing.
+2. Downloads every file into a staging directory and validates it (syntax and JSON) before touching anything that is already running.
+3. Retires a pre-2.3 `opencode-bridge.service` that would otherwise hold port 20129, and stops this installer's own running bridge if you are re-running it.
+4. Backs up the previous install under `~/.opencode-free-bridge/.backup-*`, then copies the new files in.
 5. Registers and starts the background service (`systemd` on Linux, `launchd` on macOS) on `127.0.0.1:20129`.
-6. Runs a quick verification check.
+6. Waits for `/health`, runs the quick self-check, and checks the Bun TLS fingerprint against the recorded CLI baseline.
+
+If the bridge does not answer after 20 seconds the installer exits non-zero and tells you where the log is. It only prints `Done` for a bridge that responded.
 
 Installer options:
 
 ```bash
 PORT=3000 BINDIR=/opt/opencode-free-bridge bash install.sh
 NO_SERVICE=1 bash install.sh   # install files only, skip systemd/launchd setup
+```
+
+An occupied port aborts the install before anything is changed. To install alongside an existing service, choose a free port:
+
+```bash
+PORT=20130 bash install.sh
 ```
 
 To update an existing installation, re-run the `curl ... | bash` command above. Running instances outside a git checkout also check for new releases in this repository every 6 hours (`AUTO_UPDATE=0` disables self-update).
