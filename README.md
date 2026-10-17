@@ -295,8 +295,13 @@ Probing the live gate with byte-identical CLI requests isolated the checks:
 | endpoint path | both `/inference/v1/*` and `/inference/openai/v1/*` accepted today |
 
 That is why the bridge always sends `stream: true` upstream and buffers the SSE
-into one JSON object when the client asked for a non-streamed reply, and why the
-tool layer derives **names** rather than freezing schemas.
+into one JSON object when the client asked for a non-streamed reply.
+
+Schemas are not compared by the gate, but they are still derived rather than
+frozen: a client that forwards the tool list back on the next turn sends whatever
+the bridge gave it, and a stale schema is a silent behaviour change for the
+model even when the gate accepts it. Deriving them costs one parse of sources
+the refresh already downloads.
 
 ### Self-update
 
@@ -460,7 +465,7 @@ either way the wire shape could never converge on what the release ships.
 | session-id shape | yes (`identifier.ts`, `session-id.ts`) | followed on refresh |
 | User-Agent template + version | yes (`app.ts`, handshake) | followed on refresh |
 | header names | yes (`model-request.ts`) | followed; unknown values reported in `unsentHeaders` |
-| `read` / `shell` schemas and names | yes (`read.ts`, `shell.ts`) | followed; the set replaces the old one |
+| tool schemas (names, parameters, required) | yes — parsed from the release's Effect Schema expressions | followed; 11 of 12 definitions match the CLI byte-for-byte |
 | inference endpoint | yes — provider catalog (`models.opencode.ai/api.json`) | followed on refresh; a `404` at the stale path triggers a re-derive + one retry |
 | free-model list | yes — catalog `cost` / `status` / `tool_call` | a model that stops being free or is deprecated drops out; `/models` only adds ids the catalog omits |
 | paid-model refusal | yes — catalog `cost` | a paid id is refused locally (`404 model_not_free`) instead of being forwarded to a `401 Missing API key` |

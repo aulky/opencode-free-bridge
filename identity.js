@@ -196,6 +196,8 @@ let modelFamilies = {};
 let modelFacts = {};
 // Model-conditional tool swaps read from the release (see extractToolOverrides).
 let toolOverrides = null;
+// Tool descriptions the CLI extends at request time (see extractDynamicDescriptions).
+let dynamicDescriptions = null;
 // Tool plugin basenames last seen in the release tree. Seeded with the current
 // set so the first refresh works even if the directory listing fails.
 let knownPlugins = [
@@ -394,9 +396,464 @@ async function resolveRelease(currentVersion = recipe.version) {
 function interpolateTemplate(str, vars) {
   return str.replace(/\$\{([^}]+)\}/g, (_, expr) => {
     const key = expr.trim();
-    return vars[key] !== undefined ? String(vars[key]) : `
-${key}`;
+    if (vars[key] !== undefined) return String(vars[key]);
+    // `FileSystem.DEFAULT_SEARCH_LIMIT` and friends: take the last segment and
+    // look it up in the numeric constants harvested from the source. An
+    // expression that still cannot be resolved is left as its own text rather
+    // than being turned into a newline — a description that differs from the
+    // CLI's by a stray line break is a wire mismatch.
+    const tail = key.split(".").pop();
+    if (vars[tail] !== undefined) return String(vars[tail]);
+    // A date expression is evaluated, not emitted: the CLI sends the current
+    // year, so a literal `${new Date().getFullYear()}` would differ from it.
+    if (/new Date\(\)\.getFullYear\(\)/.test(key)) return String(new Date().getFullYear());
+    return `\${${key}}`;
   });
+}
+
+/**
+ * Read a balanced `{...}` / `(...)` / `[...]` region starting at `open`.
+ * Regexes with lazy quantifiers stop at the first `\n})`, which is how a struct
+ * with a multi-line `.annotate({...})` lost the fields after it.
+ */
+function readBalanced(source, openIndex) {
+  const open = source[openIndex];
+  const close = open === "{" ? "}" : open === "(" ? ")" : "]";
+  let depth = 0;
+  let quote = null;
+  for (let i = openIndex; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      if (ch === "\\") { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") { quote = ch; continue; }
+    if (ch === open) depth++;
+    else if (ch === close) {
+      depth--;
+      if (depth === 0) return source.slice(openIndex, i + 1);
+    }
+  }
+  return null;
+}
+
+// Every source file fetched for the current release, joined. Cross-file schema
+// references are resolved against this when a plugin imports a struct or class
+// from a sibling module.
+let schemaCorpus = null;
+// Numeric/constant bindings harvested from the corpus, used to interpolate
+// `${...}` inside descriptions.
+let schemaVars = null;
+// basename → source text, for resolving `Namespace.Struct` references.
+let schemaModules = null;
+
+/** `Schema.Struct({...})` → the full call text, matched by braces. */
+function readStructAt(source, indexOfStruct) {
+  const paren = source.indexOf("(", indexOfStruct);
+  if (paren < 0) return null;
+  const args = readBalanced(source, paren);
+  if (!args) return null;
+  return `Schema.Struct${args}`;
+}
+
+/**
+ * Locate the tool's input schema expression.
+ *
+ * Three forms upstream uses:
+ *   1. `export const Input = Schema.Struct({ ... })`
+ *   2. `input: LocationInput` inside `editor.add({...})`, defined above
+ *   3. an inline `Schema.Struct({...})` passed as `input:`
+ */
+function findInputSchema(source) {
+  const inlineAt = source.search(/input:\s*Schema\.Struct\s*\(/);
+  if (inlineAt >= 0) {
+    const structAt = source.indexOf("Schema.Struct", inlineAt);
+    const full = readStructAt(source, structAt);
+    if (full) return full;
+  }
+
+  const named = source.match(/input:\s*([A-Z][A-Za-z0-9_]*)\b/);
+  if (named) {
+    // Follow aliasing: `export const Input = LocationInput` where
+    // `LocationInput` holds the Struct (read.ts does this).
+    let varName = named[1];
+    for (let hop = 0; hop < 3; hop++) {
+      const decl = source.match(
+        new RegExp(`(?:const|export\\s+const)\\s+${varName}\\s*=\\s*(Schema\\.Struct\\s*\\()`)
+      );
+      if (decl) {
+        const structAt = source.indexOf("Schema.Struct", decl.index);
+        const full = readStructAt(source, structAt);
+        if (full) return full;
+      }
+      const alias = source.match(
+        new RegExp(`(?:const|export\\s+const)\\s+${varName}\\s*=\\s*([A-Z][A-Za-z0-9_]*)\\b`)
+      );
+      if (!alias) break;
+      varName = alias[1];
+    }
+  }
+
+  const exportedAt = source.search(/export\s+const\s+Input\s*=\s*Schema\.Struct\s*\(/);
+  if (exportedAt >= 0) {
+    const structAt = source.indexOf("Schema.Struct", exportedAt);
+    return readStructAt(source, structAt);
+  }
+  return null;
+}
+
+/** Split a `{ a: x, b: y }` body at top-level commas (ignores nested braces,
+ *  brackets, parens, strings, and template literals). */
+function splitTopLevel(body) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  let quote = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote) {
+      if (ch === "\\") { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") { quote = ch; continue; }
+    if (ch === "{" || ch === "[" || ch === "(") depth++;
+    else if (ch === "}" || ch === "]" || ch === ")") depth--;
+    else if (ch === "," && depth === 0) {
+      parts.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (start < body.length) parts.push(body.slice(start));
+  return parts.map((p) => p.trim()).filter(Boolean);
+}
+
+/** Undo the escapes that carry meaning in a description string. */
+function unescapeLiteral(text) {
+  if (typeof text !== "string") return text;
+  // A single left-to-right pass, so each escape is consumed exactly once.
+  // Doing the replacements sequentially mangled `\\n` (an escaped backslash
+  // followed by `n`, i.e. the two characters `\n`) into backslash + newline.
+  return text.replace(/\\(r\\n|n|t|"|'|`|\\)/g, (_, seq) => {
+    switch (seq) {
+      case "r\n":
+      case "n":
+        return "\n";
+      case "t":
+        return "\t";
+      case '"':
+        return '"';
+      case "'":
+        return "'";
+      case "`":
+        return "`";
+      case "\\":
+        return "\\";
+      default:
+        return seq;
+    }
+  });
+}
+
+/** Read a JS string/template literal body and unescape it. */
+function readStringLiteral(raw) {
+  if (typeof raw !== "string") return null;
+  const m = raw.match(/^\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)/s);
+  if (!m) return null;
+  const text = m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : m[3];
+  return unescapeLiteral(text);
+}
+
+/**
+ * Evaluate one field's schema expression into a JSON Schema fragment plus its
+ * requiredness. This understands the constructors upstream uses and nothing
+ * else; anything unrecognised degrades to `{ type: "string" }`.
+ */
+function parseFieldSchema(expr, source) {
+  let required = true;
+  let schema = {};
+
+  // Unwrap modifiers, outermost first.
+  let working = expr.trim();
+  const optional =
+    /Schema\.optionalKey\(/.test(working) ||
+    /Schema\.optional\(/.test(working) ||
+    // A decoding default makes the field omittable on the wire even though the
+    // schema itself is not wrapped in optionalKey (webfetch's `format`).
+    /withDecodingDefault(Key)?\(/.test(working) ||
+    // `.pipe(optional)` / `.pipe(Schema.optional)` — the shared `optional`
+    // helper in packages/schema/src/schema.ts.
+    /\.pipe\(\s*(?:Schema\.)?optional\b/.test(working);
+  if (optional) required = false;
+
+  // Description and constraints are collected first, then applied in the order
+  // the CLI emits them (`type`, bounds, `description`) — the wire body is
+  // compared by upstream, so key order is part of matching it exactly.
+  let description = null;
+  const annotate = working.match(/\.annotate\(\{\s*description:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)/s);
+  if (annotate) {
+    description = readStringLiteral(annotate[1]);
+    if (description && schemaVars) description = interpolateTemplate(description, schemaVars);
+    // Where the annotation sits relative to `.pipe(...)` decides whether it
+    // reaches the wire: `Schema.X.annotate({...}).pipe(...)` keeps it (webfetch's
+    // `format`), while `Schema.X.pipe(...).annotate({...})` does not (question's
+    // `multiple`). Compare positions rather than the mere presence of a pipe.
+    const pipeAt = working.indexOf(".pipe(");
+    const annotateAt = working.indexOf(".annotate(");
+    if (pipeAt >= 0 && annotateAt > pipeAt) description = null;
+  }
+
+  // Base type, from the innermost constructor. A local alias
+  // (`const Timeout = Schema.Finite.check(...)`) is expanded first so both the
+  // type and the constraints can be read from what it actually is.
+  let core = working
+    .replace(/Schema\.optionalKey\(/g, "(")
+    .replace(/Schema\.optional\(/g, "(");
+  let expanded = core;
+  const aliasMatch = core.match(/^\s*\(?\s*([A-Z][A-Za-z0-9_]*)\b/);
+  // Only a *local* alias is expanded: not `Schema` itself, and not a name that
+  // is a struct/class reference (`Question.Prompt`, `FileSystem.GlobInput`).
+  const isLocalAlias =
+    aliasMatch &&
+    aliasMatch[1] !== "Schema" &&
+    !/\./.test(core.slice(aliasMatch.index + aliasMatch[0].length).trim().slice(0, 1)) &&
+    schemaCorpus &&
+    new RegExp(`const\\s+${aliasMatch[1]}\\s*=\\s*Schema\\.`).test(schemaCorpus);
+  if (isLocalAlias) {
+    const decl = schemaCorpus.match(new RegExp(`const\\s+${aliasMatch[1]}\\s*=\\s*([^\\n]+)`));
+    if (decl) {
+      expanded = `${decl[1]} ${core}`;
+      core = expanded;
+    }
+  }
+
+  const constraints = {};
+  const minLength = working.match(/\.check\(\s*Schema\.isMinLength\(\s*(\d+)/);
+  if (minLength) constraints.minLength = Number(minLength[1]);
+  const maxLength = working.match(/\.check\(\s*Schema\.isMaxLength\(\s*(\d+)/);
+  if (maxLength) constraints.maxLength = Number(maxLength[1]);
+  if (/\.check\(\s*Schema\.isNonEmpty\(\)/.test(expanded)) constraints.minItems = 1;
+  if (/\.check\([^)]*Schema\.isGreaterThan\(\s*0\s*\)/.test(expanded)) constraints.exclusiveMinimum = 0;
+  const maxValue = expanded.match(/\.check\(\s*Schema\.isLessThanOrEqualTo\(\s*(\d+)/);
+  if (maxValue) constraints.maximum = Number(maxValue[1]);
+  // `Timeout` carries its ceiling in a named constant.
+  if (/^\s*(?:Schema\.optionalKey\()?\s*Timeout\b/.test(working) && schemaVars && Number.isFinite(schemaVars.MAX_TIMEOUT_SECONDS)) {
+    constraints.maximum = schemaVars.MAX_TIMEOUT_SECONDS;
+  }
+
+  if (/Schema\.Literals\(\s*\[([^\]]*)\]/.test(core)) {
+    const list = core.match(/Schema\.Literals\(\s*\[([^\]]*)\]/)[1];
+    const values = [...list.matchAll(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g)].map((m) =>
+      readStringLiteral(m[1])
+    );
+    schema = { ...schema, type: "string", enum: values };
+  } else if (/Schema\.Array\(/.test(core)) {
+    const inner = core.match(/Schema\.Array\(([\s\S]*)\)/);
+    const itemExpr = inner ? inner[1] : "";
+    // A nested Struct becomes an object schema with its own fields.
+    const struct = itemExpr.match(/Schema\.Struct\(\{([\s\S]*)\n\s*\}\)/);
+    if (struct) {
+      const nested = parseStructBody(struct[1], source);
+      schema = { ...schema, type: "array", items: { type: "object", ...nested } };
+    } else if (/\.fields\.[a-zA-Z]/.test(itemExpr)) {
+      // `SomeClass.fields.x` — a single field, not a struct.
+      const ref = itemExpr.match(/^\s*([A-Za-z][A-Za-z0-9_.]*)/);
+      const resolved = ref ? resolveStructRef(ref[1], source) : null;
+      schema = { ...schema, type: "array", items: resolved || { type: "string" } };
+    } else {
+      // `Schema.Array(Question.Prompt)` — a named struct/class.
+      const ref = itemExpr.match(/^\s*([A-Za-z][A-Za-z0-9_.]*)/);
+      const resolved = ref ? resolveStructRef(ref[1], source) : null;
+      schema = { ...schema, type: "array", items: resolved || { type: "string" } };
+    }
+  } else if (/\bBoolean\b/.test(core)) {
+    schema = { ...schema, type: "boolean" };
+  } else if (/\bPositiveInt\b/.test(core)) {
+    schema = { ...schema, type: "integer", exclusiveMinimum: 0 };
+  } else if (/\bNonNegativeInt\b/.test(core)) {
+    schema = { ...schema, type: "integer", minimum: 0 };
+  } else if (/Schema\.(?:Int|Number|Finite)\b/.test(core)) {
+    schema = { ...schema, type: "number" };
+  } else if (/\bSession[A-Za-z]*\.ID\b/.test(core) || /\bSessionID\b/.test(core)) {
+    schema = { ...schema, type: "string", pattern: "^ses" };
+  } else if (/\.fields\.[A-Za-z0-9_]+/.test(core)) {
+    // A field borrowed from a shared struct: `PageInput.fields.offset`,
+    // `ReadToolFileSystem.PageInput.fields.limit`, `GlobInput.fields.hidden`.
+    // The field's type AND optionality live on the source struct, so resolve it
+    // there rather than inferring from the name. `ReadToolFileSystem` is a
+    // namespace import, so the struct is the segment right before `.fields`.
+    const ref = core.match(/([A-Z][A-Za-z0-9_]*)\.fields\.([A-Za-z0-9_]+)/);
+    const resolved = ref ? resolveStructField(ref[1], ref[2], source) : null;
+    if (resolved) {
+      schema = { ...resolved.schema, ...schema };
+      if (resolved.optional) required = false;
+    } else {
+      // Unresolvable (no corpus for this reference). The page fields are the
+      // common case: offset/limit on read. Guessing their real shape is better
+      // than emitting `string` + required, which would be a worse wire match
+      // than the previous behaviour and would also mark them mandatory.
+      const field = ref ? ref[2] : "";
+      if (/^(offset|limit)$/.test(field)) {
+        schema = { ...schema, type: "integer", minimum: 0 };
+        required = false;
+      } else if (/^(hidden|literal|caseSensitive|background)$/.test(field)) {
+        schema = { ...schema, type: "boolean" };
+      } else {
+        schema = { ...schema, type: "string" };
+      }
+    }
+  } else {
+    schema = { ...schema, type: "string" };
+  }
+
+  // `Timeout` is a branded number with a maximum, used by webfetch. Only apply
+  // it when the expression IS that brand — `NonNegativeInt` also appears in
+  // shell's timeout field, and matching any occurrence changed its type.
+  if (/^\s*(?:Schema\.optionalKey\()?\s*Timeout\b/.test(core)) {
+    schema = { ...schema, type: "number", exclusiveMinimum: 0 };
+  }
+
+  // Assemble in wire order: type → constraints → description. `description`
+  // first would emit a different key order than the CLI's own JSON Schema.
+  const merged = { ...schema, ...constraints };
+  const ordered = {};
+  for (const k of ["type", "minLength", "maxLength", "minimum", "exclusiveMinimum", "maximum", "pattern", "enum", "items", "minItems"]) {
+    if (merged[k] !== undefined) ordered[k] = merged[k];
+  }
+  if (description) ordered.description = description;
+
+  return { required, schema: ordered };
+}
+
+/** `Schema.Struct({...})` body → { properties, required, additionalProperties }. */
+function parseStructBody(body, source) {
+  const properties = {};
+  const required = [];
+  for (const part of splitTopLevel(body)) {
+    const m = part.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([\s\S]+)$/);
+    if (!m) continue;
+    const [, key, expr] = m;
+    const { required: isRequired, schema } = parseFieldSchema(expr, source);
+    properties[key] = schema;
+    if (isRequired) required.push(key);
+  }
+  return { properties, required, additionalProperties: false };
+}
+
+function parseSchemaExpr(expr, source) {
+  const text = String(expr);
+  const structAt = text.indexOf("Schema.Struct");
+  if (structAt < 0) return null;
+  const paren = text.indexOf("(", structAt);
+  const args = readBalanced(text, paren);
+  if (!args) return null;
+
+  // `Schema.Struct({ ... })` — literal fields.
+  const brace = args.indexOf("{");
+  if (brace >= 0) {
+    const body = readBalanced(args, brace);
+    if (body) return parseStructBody(body.slice(1, -1), source);
+  }
+
+  // `Schema.Struct(base)` — the fields live in a named object literal declared
+  // above (`const base = { ... }`), which is how Question.Prompt is written.
+  const ref = args.slice(1, -1).trim().match(/^([A-Za-z_$][\w$]*)$/);
+  if (ref) {
+    const at = source.search(new RegExp(`const\\s+${ref[1]}\\s*=\\s*\\{`));
+    if (at >= 0) {
+      const objBrace = source.indexOf("{", at);
+      const body = readBalanced(source, objBrace);
+      if (body) return parseStructBody(body.slice(1, -1), source);
+    }
+  }
+  return null;
+}
+
+/** Resolve `Question.Prompt` to the `Prompt` struct declared in the same file. */
+function resolveStructRef(name, source) {
+  const parts = String(name).split(".");
+  const short = parts.pop();
+  // For `Question.Prompt`, prefer the file that defines the `Question` module:
+  // the joined corpus contains many unrelated `Prompt` declarations, and taking
+  // the first match resolved to a different struct entirely.
+  if (parts.length > 0 && schemaModules) {
+    const namespace = parts[parts.length - 1];
+    const mod = schemaModules.get(namespace);
+    if (mod) {
+      // Resolve the struct inside that module only. Recursing with `short`
+      // would re-enter this function with no namespace and fall back to the
+      // joined corpus, which is what produced the wrong struct.
+      const at = mod.search(
+        new RegExp(`(?:const|export\\s+const)\\s+${short}\\s*=\\s*Schema\\.Struct\\s*\\(`)
+      );
+      if (at >= 0) {
+        const structAt = mod.indexOf("Schema.Struct", at);
+        const parsed = parseSchemaExpr(mod.slice(structAt, structAt + 6000), mod);
+        if (parsed) return { type: "object", ...parsed };
+      }
+    }
+  }
+  const at = source.search(new RegExp(`(?:const|export\\s+const)\\s+${short}\\s*=\\s*Schema\\.Struct\\s*\\(`));
+  if (at < 0 && typeof schemaCorpus === "string" && schemaCorpus !== source) {
+    return resolveStructRef(short, schemaCorpus);
+  }
+  if (at < 0) return null;
+  const structAt = source.indexOf("Schema.Struct", at);
+  const parsed = parseSchemaExpr(source.slice(structAt, structAt + 4000), source);
+  if (!parsed) return null;
+  return { type: "object", ...parsed };
+}
+
+/**
+ * Resolve `SomeStruct.fields.name` from the struct that declares it.
+ *
+ * The struct may be a `const X = Schema.Struct({...})` or a
+ * `class X extends Schema.Class<X>(...)({...})`, and it may live in a module the
+ * plugin imports rather than in the plugin itself — `read.ts` refers to
+ * `ReadToolFileSystem.PageInput`, declared in `read-filesystem.ts`.
+ */
+function resolveStructField(structName, field, source) {
+  for (const corpus of [source, typeof schemaCorpus === "string" ? schemaCorpus : null]) {
+    if (!corpus) continue;
+    for (const part of structFields(structName, corpus)) {
+      const m = part.match(new RegExp(`^${field}\\s*:\\s*([\\s\\S]+)$`));
+      if (!m) continue;
+      const parsed = parseFieldSchema(m[1], corpus);
+      return { schema: parsed.schema, optional: !parsed.required };
+    }
+  }
+  return null;
+}
+
+/** The field list of a struct/class declaration, wherever it appears. */
+function structFields(structName, corpus) {
+  const out = [];
+  // const X = Schema.Struct({ ... })
+  const constAt = corpus.search(
+    new RegExp(`(?:const|export\\s+const)\\s+${structName}\\s*=\\s*Schema\\.Struct\\s*\\(`)
+  );
+  if (constAt >= 0) {
+    const structAt = corpus.indexOf("Schema.Struct", constAt);
+    const args = readBalanced(corpus, corpus.indexOf("(", structAt));
+    const brace = args ? args.indexOf("{") : -1;
+    const body = brace >= 0 ? readBalanced(args, brace) : null;
+    if (body) out.push(...splitTopLevel(body.slice(1, -1)));
+  }
+  // class X extends Schema.Class<X>("...")({ ... })
+  const classAt = corpus.search(new RegExp(`class\\s+${structName}\\b`));
+  if (classAt >= 0) {
+    const paren = corpus.indexOf("(", classAt);
+    const first = paren >= 0 ? readBalanced(corpus, paren) : null;
+    if (first) {
+      const after = corpus.indexOf("(", paren + first.length);
+      const second = after >= 0 ? readBalanced(corpus, after) : null;
+      const brace = second ? second.indexOf("{") : -1;
+      const body = brace >= 0 ? readBalanced(second, brace) : null;
+      if (body) out.push(...splitTopLevel(body.slice(1, -1)));
+    }
+  }
+  return out;
 }
 
 /**
@@ -411,7 +868,10 @@ function extractToolFromSource(source, fallbackName) {
   if (!name) return null;
 
   const vars = { OS: "Linux", shell: "bash" };
-  for (const m of source.matchAll(/const\s+([A-Z][A-Z0-9_]*)\s*=\s*([0-9][0-9_*\s+]*)/g)) {
+  // Constants declared in the corpus (including imported modules) so template
+  // interpolation can resolve `FileSystem.DEFAULT_SEARCH_LIMIT`.
+  const corpusForVars = typeof schemaCorpus === "string" ? `${source}\n${schemaCorpus}` : source;
+  for (const m of corpusForVars.matchAll(/const\s+([A-Z][A-Z0-9_]*)\s*=\s*([0-9][0-9_*\s+]*)/g)) {
     const clean = m[2].replace(/_/g, "").trim();
     if (/^[0-9*\s+]+$/.test(clean)) {
       const val = clean
@@ -443,19 +903,27 @@ function extractToolFromSource(source, fallbackName) {
     const parts = [];
     let lm;
     while ((lm = litRe.exec(builderMatch[1])) !== null) {
-      const raw = lm[1] !== undefined ? lm[1] : interpolateTemplate(lm[2] !== undefined ? lm[2] : (lm[3] || ""), vars);
-      if (raw) parts.push(raw);
+      const raw =
+        lm[1] !== undefined
+          ? unescapeLiteral(lm[1])
+          : interpolateTemplate(unescapeLiteral(lm[2] !== undefined ? lm[2] : lm[3] || ""), vars);
+      // An empty literal is a deliberate blank line in the joined description
+      // (`skill` separates its paragraphs that way); dropping it shortened the
+      // text by one newline against the CLI's.
+      parts.push(raw);
     }
     if (parts.length > 0) description = parts.join(joiner);
   } else {
-    // multi-line template literal — match lazily from the first backtick
-    const tpl = source.match(/export\s+const\s+description\s*=\s*`([\s\S]*?)`/m);
-    if (tpl) description = interpolateTemplate(tpl[1], vars);
+    // Multi-line template literal. The closing backtick must be an *unescaped*
+    // one: a description that quotes code (`` \`multiple: true\` ``) contains
+    // escaped backticks, and a lazy match stopped at the first of those.
+    const tpl = source.match(/export\s+const\s+description\s*=\s*`((?:[^`\\]|\\.)*)`/s);
+    if (tpl) description = interpolateTemplate(unescapeLiteral(tpl[1]), vars);
     else {
       const dq = source.match(/export\s+const\s+description\s*=\s*"((?:[^"\\]|\\.)*)"/m);
       const sq = source.match(/export\s+const\s+description\s*=\s*'((?:[^'\\]|\\.)*)'/m);
-      if (dq) description = dq[1];
-      else if (sq) description = interpolateTemplate(sq[1], vars);
+      if (dq) description = unescapeLiteral(dq[1]);
+      else if (sq) description = interpolateTemplate(unescapeLiteral(sq[1]), vars);
     }
   }
   if (!description || description.length < 20) {
@@ -467,8 +935,11 @@ function extractToolFromSource(source, fallbackName) {
       if (descMatch0) {
         description =
           descMatch0[1] !== undefined
-            ? descMatch0[1]
-            : interpolateTemplate(descMatch0[2] !== undefined ? descMatch0[2] : (descMatch0[3] || ""), vars);
+            ? unescapeLiteral(descMatch0[1])
+            : interpolateTemplate(
+                unescapeLiteral(descMatch0[2] !== undefined ? descMatch0[2] : descMatch0[3] || ""),
+                vars
+              );
       }
     }
   }
@@ -489,47 +960,20 @@ function extractToolFromSource(source, fallbackName) {
   }
   if (!description || description.length < 20) return null;
 
-  // 2. Input Schema.Struct({ ... }) before Output definition.
-  const beforeOutput = source.split(/const\s+(?:Structured)?Output\b/)[0] || source;
-  const structMatch = beforeOutput.match(/Schema\.Struct\(\{([\s\S]*?)\}\)\s*(?:\n|;|$)/);
-  if (!structMatch) return null;
-
-  const properties = {};
-  const required = [];
-  const fieldRe =
-    /([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([\s\S]*?\.annotate\(\{\s*description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)\s*,?\s*\}\))/g;
-  let fm;
-  while ((fm = fieldRe.exec(structMatch[1])) !== null) {
-    const key = fm[1];
-    const expr = fm[2];
-    const fieldDesc = fm[3] !== undefined ? fm[3] : interpolateTemplate(fm[4] !== undefined ? fm[4] : (fm[5] || ""), vars);
-
-    const isOptional =
-      expr.includes("Schema.optionalKey") ||
-      expr.includes(".fields.offset") ||
-      expr.includes(".fields.limit");
-
-    const prop = {};
-    if (/Boolean/.test(expr)) {
-      prop.type = "boolean";
-    } else if (/NonNegativeInt|\.fields\.(?:offset|limit)/.test(expr)) {
-      prop.type = "integer";
-      prop.minimum = 0;
-    } else if (/PositiveInt/.test(expr)) {
-      prop.type = "integer";
-      prop.minimum = 1;
-    } else if (/Schema\.(?:Int|Number)/.test(expr)) {
-      prop.type = "integer";
-    } else {
-      prop.type = "string";
-    }
-    if (fieldDesc) prop.description = fieldDesc;
-
-    properties[key] = prop;
-    if (!isOptional) required.push(key);
-  }
-
-  if (Object.keys(properties).length === 0) return null;
+  // 2. The input schema. Upstream writes these as Effect Schema expressions,
+  //    and the shape that reaches the wire is the JSON Schema derived from
+  //    them. Rather than pattern-match each form, this parses the field list and
+  //    evaluates the small, closed set of constructors upstream actually uses:
+  //    Schema.String / Number / Int / Boolean / Array / Literals / Struct,
+  //    optionalKey, annotate (description), check (minLength), and the shared
+  //    class fields (`FileSystem.GlobInput.fields.hidden`). A construct it does
+  //    not recognise becomes a plain string — the previous behaviour — but the
+  //    recognised ones now carry their real type, enum, bounds, and requiredness.
+  const inputExpr = findInputSchema(source);
+  if (!inputExpr) return null;
+  const parsed = parseSchemaExpr(inputExpr, source);
+  if (!parsed || Object.keys(parsed.properties).length === 0) return null;
+  const { properties, required } = parsed;
 
   return {
     name,
@@ -712,6 +1156,36 @@ function registrationBlocks(source) {
  * a GPT model carries `patch` instead of `edit`+`write`. A fixed list cannot
  * express this, so the rule is read from the release and applied per request.
  */
+/**
+ * Descriptions upstream extends at request time.
+ *
+ * `subagent.ts` rewrites its description on every request to append the agents
+ * the caller may use. The list itself is session state, not something a release
+ * source can supply, but the *shape* is: a blank line, a heading, and one
+ * `- <id>: <description>` line per agent. Extracting the shape keeps the static
+ * prefix identical to the CLI's and marks the dynamic tail so it is not silently
+ * missing.
+ */
+function extractDynamicDescriptions(files = {}) {
+  const out = {};
+  for (const key of Object.keys(files)) {
+    if (!key.startsWith("tool:")) continue;
+    const source = files[key];
+    if (typeof source !== "string") continue;
+    if (!/tool\.description\s*=\s*\[/.test(source)) continue;
+    const exported = source.match(/export\s+const\s+name\s*=\s*"([a-z][a-z0-9_-]*)"/i);
+    const block = source.match(/tool\.description\s*=\s*\[([\s\S]*?)\]\.join\(\s*"([^"]*)"\s*\)/);
+    if (!exported || !block) continue;
+    const literals = [...block[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => unescapeLiteral(m[1]));
+    out[exported[1]] = {
+      appendPrefix: literals,
+      joiner: block[2] === "\n" ? "\n" : block[2],
+      itemTemplate: (block[1].match(/`([^`]*\$\{[^}]*\}[^`]*)`/) || [])[1] || null,
+    };
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 function extractToolOverrides(files = {}) {
   for (const key of Object.keys(files)) {
     if (!key.startsWith("tool:")) continue;
@@ -808,6 +1282,48 @@ function extractRecipe(files = {}) {
   }
 
   const extractedTools = {};
+  // Build the cross-file corpus once per extraction so `PageInput`-style
+  // references resolve regardless of which file declares them.
+  const corpusParts = Object.entries(files)
+    .filter(([k]) => k.startsWith("tool:") || k.startsWith("ref:"))
+    .map(([, v]) => (typeof v === "string" ? v : ""))
+    .filter(Boolean);
+  schemaCorpus = corpusParts.length > 0 ? corpusParts.join("\n\n") : null;
+  schemaVars = null;
+  schemaModules = new Map();
+  for (const [k, v] of Object.entries(files)) {
+    if ((k.startsWith("ref:") || k.startsWith("tool:")) && typeof v === "string") {
+      const stripped = k.replace(/^(ref:|tool:)/, "");
+      const base = stripped.split("-").pop();
+      // Namespace lookups use the capitalised module name (`Question`), while
+      // the file basename is lowercase (`question`).
+      schemaModules.set(base, v);
+      schemaModules.set(base.charAt(0).toUpperCase() + base.slice(1), v);
+      schemaModules.set(stripped, v);
+    }
+  }
+
+  // Harvest constants from the whole corpus once, so a field description that
+  // interpolates an imported constant can be resolved.
+  {
+    const parts = Object.entries(files)
+      .filter(([k]) => k.startsWith("tool:") || k.startsWith("ref:"))
+      .map(([, v]) => (typeof v === "string" ? v : ""));
+    const all = parts.join("\n");
+    const vars = { OS: "Linux", shell: "bash" };
+    for (const m of all.matchAll(/const\s+([A-Z][A-Z0-9_]*)\s*=\s*([0-9][0-9_*\s+]*)/g)) {
+      const clean = m[2].replace(/_/g, "").trim();
+      if (/^[0-9*\s+]+$/.test(clean)) {
+        const val = clean
+          .split("+")
+          .map((part) => part.split("*").reduce((acc, n) => acc * Number(n.trim()), 1))
+          .reduce((a, b) => a + b, 0);
+        if (Number.isFinite(val)) vars[m[1]] = val;
+      }
+    }
+    schemaVars = vars;
+  }
+
   const toolKeys = Object.keys(files).filter((k) => k.startsWith("tool:"));
   // Code mode's `execute` is registered in its own file with an inline object,
   // so the plugin parser would miss it. Read it here.
@@ -817,16 +1333,22 @@ function extractRecipe(files = {}) {
       const cmDesc = files.codemode.match(/const\s+description\s*=\s*\[([\s\S]*?)\]\.join\(\s*"([^"]*)"\s*\)/);
       let description = "Call tools through `tools` using exact paths and signatures from the catalog.";
       if (cmDesc) {
-        const parts = [...cmDesc[1].matchAll(/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g)]
-          .map((m) => (m[1] !== undefined ? m[1] : m[2]))
-          .filter(Boolean);
-        if (parts.length > 0) description = parts.join(cmDesc[2] === "\n" ? "\n" : " ");
+        const parts = [];
+        for (const m of cmDesc[1].matchAll(/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g)) {
+          parts.push(unescapeLiteral(m[1] !== undefined ? m[1] : m[2]));
+        }
+        // `cmDesc[2]` is the join argument's contents, already without the
+        // surrounding quotes (`[^"]*`), so it is unescaped as-is.
+        const joiner = unescapeLiteral(cmDesc[2]);
+        if (parts.length > 0) description = parts.join(joiner);
       }
+      // `{ code: string }` with no field description: the guidance lives in the
+      // tool description, and the CLI does not annotate the field.
       extractedTools.execute = {
         description,
         parameters: {
           type: "object",
-          properties: { code: { type: "string", description: "Code to execute" } },
+          properties: { code: { type: "string" } },
           required: ["code"],
           additionalProperties: false,
         },
@@ -860,6 +1382,10 @@ function extractRecipe(files = {}) {
   const overrides = extractToolOverrides(files);
   if (overrides) {
     out.toolOverrides = overrides;
+  }
+  const dynamicDescriptions = extractDynamicDescriptions(files);
+  if (dynamicDescriptions) {
+    out.dynamicDescriptions = dynamicDescriptions;
   }
 
   return out;
@@ -957,6 +1483,13 @@ function applyRecipe(update = {}, tag = null) {
     if (incoming.length > 0 && stableStringify(incoming) !== stableStringify(freeModels)) {
       freeModels = incoming;
       changed.push("freeModels");
+    }
+  }
+
+  if (update.dynamicDescriptions && typeof update.dynamicDescriptions === "object") {
+    if (stableStringify(update.dynamicDescriptions) !== stableStringify(dynamicDescriptions)) {
+      dynamicDescriptions = update.dynamicDescriptions;
+      changed.push("dynamicDescriptions");
     }
   }
 
@@ -1149,6 +1682,40 @@ async function refresh({ force = false, recheck = false } = {}) {
           sourceRead = true;
         }
       }
+      // Cross-file schema references. `read.ts` writes
+      // `ReadToolFileSystem.PageInput.fields.offset`, and `PageInput` lives in
+      // `../read-filesystem.ts`. Fetch the local modules each plugin imports so
+      // the field's real optionality/type can be resolved instead of guessed.
+      const refFiles = new Map();
+      for (const [key, source] of Object.entries(fetchedFiles)) {
+        if (!key.startsWith("tool:") || typeof source !== "string") continue;
+        // Relative imports: `../read-filesystem.js` → packages/core/src/read-filesystem.ts
+        for (const m of source.matchAll(/import\s+\{([^}]+)\}\s+from\s+"(\.\.?\/[^"]+)\.js"/g)) {
+          const rel = m[2].replace(/^\.\.?\//, "");
+          const resolved = new URL(m[2] + ".ts", `https://x/${PLUGIN_DIR}/`).pathname.replace(/^\//, "");
+          refFiles.set(`ref:${rel.replace(/\//g, "-")}`, resolved);
+        }
+        // Workspace imports: `@opencode/schema/question` → packages/schema/src/question.ts.
+        // This is how a plugin refers to a struct it does not declare itself
+        // (`Question.Prompt`).
+        for (const m of source.matchAll(/from\s+"@opencode\/([a-z-]+)\/([a-z0-9-]+)"/g)) {
+          const pkg = m[1];
+          const mod = m[2];
+          refFiles.set(`ref:${pkg}-${mod}`, `packages/${pkg}/src/${mod}.ts`);
+        }
+      }
+      if (refFiles.size > 0) {
+        const refSettled = await Promise.allSettled(
+          [...refFiles.entries()].map(async ([key, filePath]) => [
+            key,
+            await fetchText(`${SOURCE_BASE}/${ref}/${filePath}`, SOURCE_TIMEOUT_MS),
+          ])
+        );
+        for (const item of refSettled) {
+          if (item.status === "fulfilled") fetchedFiles[item.value[0]] = item.value[1];
+        }
+      }
+
       // Some tools keep their description in a sibling `.txt` (patch.ts). Fetch
       // those too: the description is part of the wire schema, and a tool whose
       // schema cannot be built is dropped from the profile.
@@ -1458,6 +2025,26 @@ function getHeaderNames() {
   return Array.isArray(recipe.headers) ? recipe.headers.slice() : DEFAULT_RECIPE.headers.slice();
 }
 
+/**
+ * Append the part of a tool's description that upstream builds at request time.
+ *
+ * The static prefix and the heading come from the release source; the entries
+ * under it are the caller's available agents, which this bridge does not have.
+ * Emitting the heading with no entries is the truthful rendering of "none
+ * available" and keeps the static text byte-identical to the CLI's.
+ */
+function withDynamicDescription(name, description) {
+  const spec = dynamicDescriptions && dynamicDescriptions[name];
+  if (!spec || !Array.isArray(spec.appendPrefix) || spec.appendPrefix.length === 0) return description;
+  const joiner = spec.joiner || "\n";
+  // The extracted literals are [separator, heading, fallbackText]. Only the
+  // heading belongs in the static description: `fallbackText` is what upstream
+  // prints for an agent that has no description, not a heading of its own.
+  const heading = spec.appendPrefix.filter((p) => p !== "").slice(0, 1);
+  if (heading.length === 0) return description;
+  return [description, "", ...heading].join(joiner);
+}
+
 function getToolList(flat = false, scope = null, modelId = null) {
   const profile = getTools();
   const available = Object.keys(profile);
@@ -1478,11 +2065,12 @@ function getToolList(flat = false, scope = null, modelId = null) {
 
   return ordered.map((name) => {
     const def = profile[name];
+    const description = withDynamicDescription(name, def.description);
     return flat
       ? {
           type: "function",
           name,
-          description: def.description,
+          description,
           parameters: def.parameters,
           strict: false,
         }
@@ -1490,7 +2078,7 @@ function getToolList(flat = false, scope = null, modelId = null) {
           type: "function",
           function: {
             name,
-            description: def.description,
+            description,
             parameters: def.parameters,
           },
         };
@@ -1587,6 +2175,7 @@ function getState() {
     modelFamilies: { ...modelFamilies },
     modelFacts: { ...modelFacts },
     toolOverrides: toolOverrides ? { ...toolOverrides } : null,
+    dynamicDescriptions: dynamicDescriptions ? { ...dynamicDescriptions } : null,
     endpoints: getEndpoints(),
     inFlight: Boolean(refreshInFlight),
     tools: {
@@ -1609,6 +2198,7 @@ function __reset() {
   modelFamilies = {};
   modelFacts = {};
   toolOverrides = null;
+  dynamicDescriptions = null;
   lastRelease = null;
   lastAvailable = null;
   lastCheckTime = 0;
@@ -1654,6 +2244,8 @@ module.exports = {
   extractToolFromSource,
   extractToolNames,
   extractToolOverrides,
+  parseSchemaExpr,
+  parseFieldSchema,
   extractRecipe,
   buildUserAgent,
   applyRecipe,

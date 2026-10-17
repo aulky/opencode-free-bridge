@@ -135,6 +135,42 @@ twelve tool names as the real CLI — `edit, glob, grep, question, read, shell,
 skill, subagent, webfetch, websearch, write, execute` — and for a GPT model it
 swaps in `patch` the same way the CLI does.
 
+### Tool schemas parsed from the release's Effect Schema expressions
+
+The schema extractor was a set of per-field regexes. It produced the right shape
+for the two tools it was written for and silently degraded everywhere else: the
+required list was wrong for `glob`/`grep`, `question`'s nested struct became
+`string`, `webfetch` lost two of its three fields, and every description that
+contained an escaped newline gained an extra character.
+
+It is now a small expression evaluator. It reads the field list by matching
+braces (not a lazy `\n})`, which used to truncate any struct containing a
+multi-line `.annotate({...})`), then evaluates the constructors upstream
+actually uses — `String`, `Number`, `Int`, `Boolean`, `Array`, `Literals`,
+`Struct`, `optionalKey`, `annotate`, `check`, `withDecodingDefaultKey`,
+`.pipe(optional)` — plus cross-file references (`PageInput.fields.offset`,
+`Question.Prompt`, `SessionSchema.ID`), resolved from the modules each plugin
+imports.
+
+Measured against a real CLI capture for a non-GPT model: **11 of 12 tool
+definitions are now byte-identical** (name, description, parameters, required,
+key order) and the 12th is `subagent`, whose description the CLI extends at
+request time with the caller's agent list — data this bridge does not have.
+
+Fixes this covered, each of which was a silent wire mismatch:
+
+| Symptom | Cause |
+|---|---|
+| `required` listed every field | `Schema.optionalKey(...)` was matched as a substring, but `.fields.X` references were not resolved |
+| `glob`/`grep` marked `hidden`, `literal`, … required | same |
+| `question.questions` was `array<string>` | `Schema.Array(Question.Prompt)` — a struct from another package |
+| `webfetch` had only `url` | the struct was truncated at the first `\n})` |
+| descriptions gained `\` + newline | escape sequences were unescaped in the wrong order, so `\\n` (literal backslash-n) became backslash + newline |
+| `skill` lost a blank line | empty literals were filtered out of a joined description |
+| `websearch` said `${new Date().getFullYear()}` | the expression was emitted instead of evaluated |
+| `execute` description had no paragraph breaks | the join separator was read without unescaping |
+| `question` description cut at 416 chars | a lazy backtick match stopped at an escaped backtick |
+
 ### Reasoning and output limits derived from the catalog
 
 `token-budget.js` guessed which models think before answering from a substring
