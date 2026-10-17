@@ -340,6 +340,20 @@ Upstream is throttling the specific model or current IP due to capacity. Try ano
 
 The model was marked `status: "deprecated"` in `models.opencode.ai/api.json` (for example `cat-jam-free`, `muse-spark-1.3-contributor-free`, or `step-5-preview-free`). Query `curl -s http://127.0.0.1:20129/v1/models` and switch your client to one of the active models.
 
+### `bun: command not found` in a fresh SSH session
+
+The service runs fine, but `curl https://bun.sh/install | bash` only adds
+`~/.bun/bin` to an *interactive* shell's PATH. A new non-login SSH session, or a
+`sh -c` command, does not see it:
+
+```bash
+export PATH="$HOME/.bun/bin:$PATH"     # or use the absolute path
+/root/.bun/bin/bun transport-fingerprint.js --check
+```
+
+The installer prints the absolute path in its closing summary for this reason.
+The service itself is unaffected: its unit file records the full path.
+
 ### Checking service logs
 
 ```bash
