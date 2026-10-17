@@ -11,19 +11,23 @@ Exposes a local `/v1/chat/completions` endpoint that any OpenAI-compatible clien
 - **Dual-protocol routing** — Meta Muse models are routed to the Responses API, everything else to Chat Completions.
 - **Reasoning-aware token budgeting** — reasoning tokens count against the output budget. The bridge enforces a floor so short requests still return content instead of an empty response.
 - **Reasoning content support** — thinking models preserve their reasoning in `reasoning_content` for both streaming and non-streaming clients.
-- **Zero dependencies** — Node.js standard library only.
+- **Zero dependencies** — standard library only, no npm install.
 
 ## Requirements
 
-- Node.js >= 18
+- **Bun >= 1.0** — required, not optional.
+
+Node.js 18+ runs the code but is refused by the free-tier gate (403). The
+reason is measurable: the CLI ships as a Bun binary, and the gate inspects the
+TLS transport fingerprint. See [Runtime](#runtime-use-bun).
 
 ## Runtime: use Bun
 
-The bridge runs on Node 18+ and on Bun, unchanged. Bun is recommended, and the
-reason is measurable rather than stylistic: **the TLS ClientHello is part of the
-fingerprint a gate can inspect, and only Bun reproduces the CLI's structure** —
-same cipher list, same extension set, same order. (The `random` and `key_share`
-fields differ on every connection, as they do between two CLI runs.)
+Bun is required, and the reason is measured rather than stylistic: **the TLS
+ClientHello is part of the fingerprint the gate inspects, and only Bun
+reproduces the CLI's** — same cipher list, same extension set, same order. (The
+`random` and `key_share` fields differ on every connection, as they do between
+two CLI runs.)
 
 Measured with a raw TCP listener against the same endpoint:
 
@@ -58,9 +62,23 @@ the transport fingerprint. Bun is therefore required, not merely recommended —
 which runtime is in use.
 
 ```bash
-bun server.js          # identical transport to the CLI
-node server.js         # works; prints a note about the TLS difference
+bun server.js          # required: same transport as the CLI
+node server.js         # refused by the free-tier gate (403); see the table above
 ```
+
+The bridge depends on Bun's TLS stack continuing to match the CLI's. Bun 1.4.2
+(the version bundled inside CLI 2.0.32) and 1.4.3 produce identical
+ClientHellos today, but that is not guaranteed for 1.5. A baseline is recorded
+in `transport-baseline.json`, and CI fails if it drifts:
+
+```bash
+bun transport-fingerprint.js --check   # exit 1 on drift
+bun transport-fingerprint.js           # print this runtime's fingerprint
+bun transport-fingerprint.js --write-baseline   # after verifying a new Bun
+```
+
+If the check fails, do not bump the baseline blindly — confirm the live gate
+still answers 200 on the new Bun first.
 
 ## Install & Update
 

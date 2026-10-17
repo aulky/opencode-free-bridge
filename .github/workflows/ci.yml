@@ -8,14 +8,29 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Unit tests (Bun)
+        run: bun test test/*.test.js
+      - name: Offline drills (Bun)
+        run: bun gate-drill.js
+      - name: Transport fingerprint matches the CLI baseline
+        run: bun transport-fingerprint.js --check
+
+  # The bridge still runs on Node, but Node is refused by the live gate, so it is
+  # tested for compatibility only — never as the supported runtime.
+  compat:
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         node-version: [18.x, 20.x, 22.x]
     steps:
       - uses: actions/checkout@v4
-      - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      - name: Run unit tests
-        run: npm test
+      - name: Unit tests (Node compatibility)
+        run: npm run test:node

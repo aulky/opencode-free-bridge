@@ -4,9 +4,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main/install.sh | bash
 #
 # What it does:
-#   1. picks a runtime: Bun if present, otherwise Node >= 18. The CLI ships as a
-#      Bun binary, so Bun reproduces its TLS ClientHello exactly; Node differs in
-#      cipher count and extension order (see README). Both pass every gate.
+#   1. requires Bun. The CLI ships as a Bun binary and the free-tier gate checks
+#      the transport fingerprint: measured 200 on Bun, 403 on Node and curl.
 #   2. copies server.js, token-budget.js and verify.js into an install dir
 #   3. registers a service so the bridge starts on boot and restarts on crash
 #      (systemd on Linux, launchd on macOS, a logon task on Windows Git Bash)
@@ -31,17 +30,24 @@ warn() { printf '\033[1;33m[opencode-free-bridge]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[opencode-free-bridge]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- Node.js ---
-# Prefer Bun: it reproduces the CLI's transport fingerprint byte for byte.
+# Bun is required, not preferred. Measured from one IP in one minute with
+# identical headers and body: the real CLI and the bridge on Bun both get 200,
+# while Node and curl get 403. The CLI ships as a Bun binary, and the free-tier
+# gate inspects the transport fingerprint, so only Bun reproduces it.
 if command -v bun >/dev/null 2>&1; then
   RUNTIME="$(command -v bun)"
-  say "runtime: bun ($("$RUNTIME" --version)) — matches the CLI's TLS fingerprint"
-elif command -v node >/dev/null 2>&1; then
+  say "runtime: bun ($("$RUNTIME" --version)) — matches the CLI's transport"
+elif [ -n "${ALLOW_NODE:-}" ] && command -v node >/dev/null 2>&1; then
   RUNTIME="$(command -v node)"
-  warn "runtime: node ($("$RUNTIME" --version)) — works, but the TLS ClientHello differs from the CLI's; install Bun to match it: https://bun.sh"
+  warn "runtime: node — NOT supported for live use. The free-tier gate refuses Node's"
+  warn "transport fingerprint with 403. Proceeding because ALLOW_NODE is set."
 else
-  die "No runtime found. Install Bun (https://bun.sh) or Node.js >= 18 (https://nodejs.org)"
+  die "Bun is required but not found. Install it: https://bun.sh
+     (Node does not work: the free-tier gate returns 403 for its TLS fingerprint.
+      Set ALLOW_NODE=1 to install anyway for offline work.)"
 fi
-# Bun needs no version gate here (the bridge uses only long-stable APIs); Node does.
+# Bun has no version gate here: the bridge uses only long-stable APIs, and Bun
+# 1.4.2 (the CLI's own bundled version) and 1.4.3 were both verified. Node does.
 if [ "$(basename "$RUNTIME")" = "node" ]; then
   NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
   [ "$NODE_MAJOR" -ge 18 ] || die "Node.js >= 18 required (found $(node -v))"

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 const dns = require("dns");
 dns.setDefaultResultOrder("ipv4first");
 const http = require("http");
@@ -2117,8 +2117,9 @@ if (require.main === module) {
     // Warn rather than refuse: Node still passes every gate measured so far.
     if (typeof Bun === "undefined") {
       console.log(
-        "[opencode-free-bridge] note: running on Node. The TLS ClientHello differs from the CLI's " +
-          "(52 vs 17 ciphers, different extension order). Bun reproduces it exactly; see README."
+        "[opencode-free-bridge] WARNING: running on Node. The free-tier gate inspects the transport " +
+          "fingerprint and refuses Node with 403 — measured 0/6 on Node vs 6/6 on Bun from the same IP " +
+          "with identical requests. Live requests will fail. Run `bun server.js` instead."
       );
     }
   });

@@ -1,3 +1,41 @@
+## 2.3.3 — Bun is required, and drift is now detectable
+
+The measurement in 2.3.2 made Bun the only runtime the live gate accepts. That
+left three things pointing the wrong way:
+
+- `npm start` still ran `node server.js`, so the documented entry point produced
+  100% 403s.
+- `install.sh` fell back to Node with a warning, producing an install that could
+  not work.
+- Nothing noticed if a future Bun changed its TLS stack.
+
+All three are fixed.
+
+**Scripts and packaging.** `start`, `test`, `drill` and `verify` now use Bun.
+`start:node`, `test:node` and `drill:node` remain so the Node compatibility path
+stays tested rather than assumed. `server.js` is the published `bin`, so its
+shebang is `#!/usr/bin/env bun`. CI runs the suite on Bun and keeps a separate
+Node compatibility matrix.
+
+**Installer.** Refuses to continue without Bun and explains why. `ALLOW_NODE=1`
+overrides it for offline use, with a warning that live requests will fail.
+
+**Drift detection.** New `transport-fingerprint.js` opens a TCP listener,
+captures this runtime's ClientHello, and parses it without a TLS library — the
+bytes are the API. `--write-baseline` records it; `--check` exits 1 on any
+change to the cipher list or the extension set and order. CI runs `--check`, and
+a baseline is committed.
+
+Verified: Bun 1.4.2 (the version bundled inside CLI 2.0.32) and Bun 1.4.3
+produce identical fingerprints and both answer 200 live. Node is correctly
+reported as drifted (17 → 52 ciphers, 12 → 11 extensions).
+
+**The baseline is not a rubber stamp.** If `--check` fails after a Bun upgrade,
+the gate must be re-measured against the new runtime before the baseline is
+rewritten; the file records which runtime produced it for exactly that reason.
+
+Tests: 87/87 on both runtimes. Drills: 9/9 on Bun.
+
 ## 2.3.1 — Transport parity: run on Bun
 
 Everything up to this point compared the bridge to the CLI at the HTTP layer.
