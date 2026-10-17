@@ -838,13 +838,18 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
     return { upstreamBody, aliasToOriginal };
   }
 
+  // Field names and order match the CLI's own request: `max_completion_tokens`
+  // (not the legacy `max_tokens`), `store: false`, and `tools` before `stream`.
+  // Upstream accepts both spellings today, but sending the CLI's exact shape
+  // removes a difference that costs nothing to erase.
   const upstreamBody = {
     model: targetModel,
     messages: transformChatMessages(body.messages, originalToAlias, placeholderNote),
+    tools,
     stream: true,
     stream_options: { include_usage: true },
-    max_tokens: maxTokens,
-    tools,
+    max_completion_tokens: maxTokens,
+    store: false,
   };
   if (typeof body.temperature === "number") upstreamBody.temperature = body.temperature;
   if (typeof body.top_p === "number") upstreamBody.top_p = body.top_p;
@@ -890,11 +895,76 @@ function regenerateSessionId(req, body, staleId) {
   return getPersistentSessionId(req, body);
 }
 
+/**
+ * The project id the CLI would send from this checkout.
+ *
+ * Measured against a real CLI capture: the header equals
+ * `sha1("git-remote:github.com/<owner>/<repo>")` — the remote URL with scheme
+ * and `.git` stripped. With no remote the CLI hashes the directory path
+ * (`sha1("directory:<abs path>")`), and an `opencode` file in the directory
+ * overrides both. Derived once and cached: a checkout does not move.
+ */
+let cachedProjectId = null;
+function getProjectId() {
+  if (cachedProjectId) return cachedProjectId;
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    const crypto = require("crypto");
+    const cwd = process.cwd();
+
+    // An `opencode` file wins, exactly as it does in the CLI.
+    const marker = path.join(cwd, "opencode");
+    if (fs.existsSync(marker)) {
+      const value = fs.readFileSync(marker, "utf8").trim();
+      if (value) return (cachedProjectId = value);
+    }
+
+    // Git remote, normalised the way the CLI's `url()` helper does it.
+    let remote = "";
+    try {
+      const { execFileSync } = require("child_process");
+      remote = execFileSync("git", ["remote", "get-url", "origin"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 2000,
+      }).trim();
+    } catch {}
+    if (remote) {
+      const normalized = remote
+        .replace(/^[a-z]+:\/\//i, "")   // drop scheme
+        .replace(/^git@([^:]+):/i, "$1/") // scp-style
+        .replace(/\.git$/i, "")
+        .replace(/\/+$/, "");
+      if (normalized) {
+        return (cachedProjectId = crypto
+          .createHash("sha1")
+          .update(`git-remote:${normalized}`)
+          .digest("hex"));
+      }
+    }
+
+    return (cachedProjectId = crypto
+      .createHash("sha1")
+      .update(`directory:${cwd}`)
+      .digest("hex"));
+  } catch {
+    return (cachedProjectId = "global");
+  }
+}
+
 function buildUpstreamHeaders(req, sessionId) {
   const downstreamUa = req?.headers?.["user-agent"] || "";
   const ua = isValidV2UserAgent(downstreamUa) ? downstreamUa : currentUserAgent;
   const client = req?.headers?.["x-opencode-client"];
-  const project = req?.headers?.["x-opencode-project"] || "global";
+  // `x-opencode-project` is not a constant: the CLI derives it as
+  // `sha1("git-remote:" + host + path)` for a repo, `sha1("directory:" + path)`
+  // otherwise, or the contents of an `opencode` file in the directory. Sending
+  // the literal "global" is a shape the CLI never emits, so it is derived here
+  // the same way — from this bridge's own checkout. A client that supplies the
+  // header still wins.
+  const project = req?.headers?.["x-opencode-project"] || getProjectId();
   // The gate header set is derived by identity.js from upstream's own request
   // builder, so a header added upstream starts being sent on the next request
   // after a refresh. Values this bridge cannot derive are reported, not sent
@@ -908,8 +978,28 @@ function buildUpstreamHeaders(req, sessionId) {
   return {
     "Authorization": "Bearer public",
     "Content-Type": "application/json",
-    "Accept": "text/event-stream",
+    // The CLI sends `*/*` here (it always streams via the body, not the Accept
+    // header). Matching it costs nothing and removes a difference the gate
+    // could one day start looking at.
+    "Accept": "*/*",
+    // W3C trace context, which the CLI emits on every request. The values are
+    // random per request — measured: they carry no relation to the session id —
+    // so this generates them the same way rather than deriving them. Both
+    // headers describe one 128-bit trace with a 64-bit span; `b3` adds the
+    // parent span id.
+    ...buildTraceHeaders(),
     ...gateHeaders,
+  };
+}
+
+/** A fresh W3C trace context, shaped like the CLI's. */
+function buildTraceHeaders() {
+  const traceId = crypto.randomBytes(16).toString("hex");
+  const spanId = crypto.randomBytes(8).toString("hex");
+  const parentSpanId = crypto.randomBytes(8).toString("hex");
+  return {
+    b3: `${traceId}-${spanId}-1-${parentSpanId}`,
+    traceparent: `00-${traceId}-${spanId}-01`,
   };
 }
 
@@ -2059,6 +2149,7 @@ module.exports = {
   checkAndApplyUpdate,
   resolveEndpoints,
   buildUpstreamHeaders,
+  getProjectId,
   extractResponsesFinishReason,
   extractStreamError,
   getPersistentSessionId,

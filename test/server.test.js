@@ -169,8 +169,11 @@ describe("server unit & integration tests", () => {
       false
     );
 
-    // Additive budget: max(50, 1024) + 4096 = 5120
-    assert.equal(upstreamBody.max_tokens, 5120);
+    // Additive budget: max(50, 1024) + 4096 = 5120. The field is spelled the way
+    // the CLI spells it (`max_completion_tokens`), and `store: false` is sent.
+    assert.equal(upstreamBody.max_completion_tokens, 5120);
+    assert.equal(upstreamBody.store, false);
+    assert.equal("max_tokens" in upstreamBody, false, "the legacy field must not be sent");
     assert.deepEqual(upstreamBody.stream_options, { include_usage: true });
     assert.equal("tool_choice" in upstreamBody, false, "tool_choice: 'none' must be omitted");
 
@@ -354,7 +357,7 @@ describe("server unit & integration tests", () => {
       });
 
       assert.equal(res.status, 200);
-      assert.equal(capturedBody.max_tokens, 5120);
+      assert.equal(capturedBody.max_completion_tokens, 5120);
       assert.deepEqual(capturedBody.stream_options, { include_usage: true });
       assert.equal(res.body.choices[0].message.content, "partial answer");
       assert.equal(res.body.choices[0].message.reasoning_content, "thinking...");

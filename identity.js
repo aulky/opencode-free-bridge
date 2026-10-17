@@ -2080,6 +2080,9 @@ function getToolList(flat = false, scope = null, modelId = null) {
             name,
             description,
             parameters: def.parameters,
+            // The CLI includes `strict: false` on every tool it sends. It is a
+            // no-op today, but it is part of the shape the wire carries.
+            strict: false,
           },
         };
   });

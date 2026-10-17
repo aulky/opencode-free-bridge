@@ -135,6 +135,32 @@ twelve tool names as the real CLI — `edit, glob, grep, question, read, shell,
 skill, subagent, webfetch, websearch, write, execute` — and for a GPT model it
 swaps in `patch` the same way the CLI does.
 
+### Header values and body fields now match the CLI
+
+Two layers were still "close enough" rather than derived. Both are now measured
+against a real capture and matched.
+
+- **`x-opencode-project` is computed, not the string `"global"`.** The CLI sends
+  `sha1("git-remote:" + host + path)` for a checkout with a remote,
+  `sha1("directory:" + path)` without one, or the contents of an `opencode` file
+  in the directory. The bridge derives it the same way from its own checkout and
+  reproduces the captured value exactly.
+- **`b3` and `traceparent` are sent.** They were missing entirely. Measured: the
+  ids are random per request and unrelated to the session id, so they are
+  generated rather than derived — one 128-bit trace, one 64-bit span, plus the
+  parent span in `b3`. The `traceparent` trace/span match the `b3` fields, as
+  they do in the CLI.
+- **`Accept: */*`** instead of `text/event-stream`: the CLI streams by body, not
+  by header.
+- **Body fields renamed and reordered** to the CLI's own shape:
+  `max_completion_tokens` (not `max_tokens`), `store: false`, and `tools` before
+  `stream`.
+- **`strict: false` on every tool**, which the CLI includes and the bridge did not.
+
+Result against the capture: 5/5 non-session headers identical, body key order
+identical, 11/12 tool definitions byte-identical (the twelfth is `subagent`,
+whose description the CLI extends with a runtime agent list).
+
 ### Tool schemas parsed from the release's Effect Schema expressions
 
 The schema extractor was a set of per-field regexes. It produced the right shape
