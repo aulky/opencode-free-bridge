@@ -21,7 +21,9 @@ Exposes a local `/v1/chat/completions` endpoint that any OpenAI-compatible clien
 
 The bridge runs on Node 18+ and on Bun, unchanged. Bun is recommended, and the
 reason is measurable rather than stylistic: **the TLS ClientHello is part of the
-fingerprint a gate can inspect, and only Bun reproduces the CLI's.**
+fingerprint a gate can inspect, and only Bun reproduces the CLI's structure** —
+same cipher list, same extension set, same order. (The `random` and `key_share`
+fields differ on every connection, as they do between two CLI runs.)
 
 Measured with a raw TCP listener against the same endpoint:
 

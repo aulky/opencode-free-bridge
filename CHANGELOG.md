@@ -16,7 +16,7 @@ Captured both ClientHellos with a raw TCP listener:
 
 The bridge was already runnable on Bun without modification — no API used here
 is Node-specific. Verified under Bun 1.4.2: **84/84 tests**, **9/9 drills**,
-and the outbound ClientHello byte-identical to the CLI's.
+and the outbound ClientHello structurally identical to the CLI's — same 17 ciphers, same 12 extensions, same order. (The random and key_share fields differ on every connection, as they must.)
 
 Node stays supported. Every gate measured so far passes on it, and no failure
 has ever been traced to the transport. But the transport is the one layer where
