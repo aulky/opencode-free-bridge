@@ -328,6 +328,12 @@ async function discoverModels() {
 // stops being reachable without editing this table. Entries whose target the
 // catalog marks deprecated have been removed — with them gone the lookup falls
 // through to the derived alias and then to the literal name.
+// Cold-start fallback only. The catalog's `family` field is the live source for
+// these shorthands (`identity.resolveModelAlias`), and it is consulted first —
+// so these entries matter only in the window before the first catalog read,
+// when a client may already be sending requests. They are also filtered at use
+// time: an entry whose target the catalog marks deprecated is ignored, so a
+// stale row cannot resolve to a model that answers 410.
 const MODEL_MAP = {
   "mimo":                       "mimo-v2.6-flash-free",
   "mimo-v2.5":                  "mimo-v2.6-flash-free",
@@ -371,11 +377,18 @@ function normalizeModel(rawModel) {
   return stripped;
 }
 
-// Protocol routing: tracks which models require /inference/v1/responses vs
-// /inference/v1/chat/completions, and dynamically learns from upstream
-// ModelProtocolUnsupported errors if new Responses models are added.
+// Protocol routing: which models want /responses instead of /chat/completions.
+//
+// The shipped default is empty on purpose. It used to seed two `muse-spark`
+// ids, both of which the catalog now marks deprecated, plus a `includes("muse")`
+// fallback — a name rule for a model family that no longer exists. Every live
+// free model speaks the chat lane (catalog: `@ai-sdk/openai-compatible`), and a
+// model that needs the other lane is learned from upstream's own
+// `ModelProtocolUnsupported` reply, which is a fact rather than a guess.
+// `RESPONSES_MODELS` still seeds the set when upstream ships a Responses-only
+// model before the bridge has met it.
 const responsesModelSet = new Set(
-  (process.env.RESPONSES_MODELS || "muse-spark-1.2-contributor-free,muse-spark-1.3-contributor-free")
+  (process.env.RESPONSES_MODELS || "")
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
@@ -387,7 +400,17 @@ function isResponsesModel(modelId) {
   if (!lower) return false;
   if (chatModelSet.has(lower)) return false;
   if (responsesModelSet.has(lower)) return true;
-  return lower.includes("muse");
+  return false;
+}
+
+/** Test hook: forget learned lane assignments (they persist by design). */
+function __resetProtocolLanes() {
+  chatModelSet.clear();
+  responsesModelSet.clear();
+  for (const m of (process.env.RESPONSES_MODELS || "").split(",")) {
+    const id = m.trim().toLowerCase();
+    if (id) responsesModelSet.add(id);
+  }
 }
 
 function markProtocolSupport(modelId, useResponses) {
@@ -416,20 +439,21 @@ function markProtocolSupport(modelId, useResponses) {
 //
 // The names below are kept for the call sites and tests that predate the
 // change; they are read from the live profile, not frozen at load time.
-function getFingerprintNames(scope = null) {
+function getFingerprintNames(scope = null, modelId = null) {
   // Only the names actually sent upstream. A capture carries ~10 tools but
   // `TOOL_PROFILE_SCOPE=core` sends a subset; treating the unsent ones as
   // fingerprints would alias an unrelated client tool (`glob` → `glob_client`)
-  // for no reason.
-  return identity.getToolList(false, scope).map((t) => t.function.name);
+  // for no reason. The model matters too: the release swaps `edit`+`write` for
+  // `patch` on GPT models, so the fingerprint set follows the same rule.
+  return identity.getToolList(false, scope, modelId).map((t) => t.function.name);
 }
 
 function getFingerprintDefinitions() {
   return identity.getTools();
 }
 
-function getCanonicalTools(flat, scope = null) {
-  return identity.getToolList(flat, scope);
+function getCanonicalTools(flat, scope = null, modelId = null) {
+  return identity.getToolList(flat, scope, modelId);
 }
 
 /**
@@ -486,9 +510,9 @@ function getToolName(tool) {
  * The definitions are resolved per call from identity.js, so a profile update
  * takes effect on the next request without a restart.
  */
-function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = null) {
-  const fingerprintNames = getFingerprintNames(scope);
-  const canonical = getCanonicalTools(flat, scope);
+function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = null, modelId = null) {
+  const fingerprintNames = getFingerprintNames(scope, modelId);
+  const canonical = getCanonicalTools(flat, scope, modelId);
   const canonicalByName = new Map(
     canonical.map((t) => [flat ? t.name : t.function.name, t])
   );
@@ -573,12 +597,12 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
   };
 }
 
-function prepareResponsesTools(clientTools = []) {
-  return prepareToolsWithFingerprint(clientTools, true).tools;
+function prepareResponsesTools(clientTools = [], modelId = null) {
+  return prepareToolsWithFingerprint(clientTools, true, null, modelId).tools;
 }
 
-function prepareChatTools(clientTools = []) {
-  return prepareToolsWithFingerprint(clientTools, false).tools;
+function prepareChatTools(clientTools = [], modelId = null) {
+  return prepareToolsWithFingerprint(clientTools, false, null, modelId).tools;
 }
 
 function restoreClientToolName(name, aliasToOriginal) {
@@ -783,7 +807,8 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
   const { tools, placeholderNote, aliasToOriginal, originalToAlias } = prepareToolsWithFingerprint(
     body.tools,
     useResponses,
-    scope
+    scope,
+    targetModel
   );
   if (useResponses) {
     const upstreamBody = {
@@ -2015,6 +2040,7 @@ module.exports = {
   normalizeModel,
   isResponsesModel,
   markProtocolSupport,
+  __resetProtocolLanes,
   extractContent,
   transformToResponsesInput,
   transformChatMessages,

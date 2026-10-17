@@ -59,23 +59,27 @@ function getUpdateMode() {
   return mode === "always" ? "always" : "reactive";
 }
 
+// Non-tool sources. These are individual files with a stable role, so they are
+// named. The *tool* sources are not: see PLUGIN_DIR below.
 const SOURCE_FILES = Object.freeze({
   identifier: "packages/schema/src/identifier.ts",
   sessionId: "packages/schema/src/session-id.ts",
   app: "packages/core/src/app.ts",
   modelRequest: "packages/core/src/session/model-request.ts",
-  readTool: "packages/core/src/tool/plugin/read.ts",
-  shellTool: "packages/core/src/tool/plugin/shell.ts",
-  globTool: "packages/core/src/tool/plugin/glob.ts",
-  editTool: "packages/core/src/tool/plugin/edit.ts",
-  writeTool: "packages/core/src/tool/plugin/write.ts",
-  grepTool: "packages/core/src/tool/plugin/grep.ts",
-  questionTool: "packages/core/src/tool/plugin/question.ts",
-  skillTool: "packages/core/src/tool/plugin/skill.ts",
-  subagentTool: "packages/core/src/tool/plugin/subagent.ts",
-  webfetchTool: "packages/core/src/tool/plugin/webfetch.ts",
-  websearchTool: "packages/core/src/tool/plugin/websearch.ts",
 });
+
+// Every tool the CLI ships is a file in this directory. The list is discovered
+// from the release tree rather than enumerated here: when upstream added
+// `patch.ts`, `mcp-resource.ts`, and `opencode.ts`, a hardcoded list would have
+// kept reading the eleven names it already knew and silently missed the new
+// ones — which is the failure mode this bridge exists to avoid.
+const PLUGIN_DIR = "packages/core/src/tool/plugin";
+// The one wire tool that is not a plugin file: code mode's dispatcher. It is
+// always present when code mode is enabled, and it is the tool the other
+// (codemode: true) tools are reached through.
+const CODEMODE_TOOL_FILE = "packages/core/src/codemode/tool.ts";
+const GITHUB_API = process.env.OPENCODE_GITHUB_API || "https://api.github.com";
+const REPO = process.env.OPENCODE_REPO || "anomalyco/opencode";
 
 // The provider/model catalog the real CLI consumes at boot. The `opencode`
 // provider entry carries the inference endpoints (`api` field): today
@@ -188,6 +192,28 @@ let freeModels = [];
 let catalogVerdicts = {};
 // catalog family → a free model id in that family (e.g. "nemotron-free").
 let modelFamilies = {};
+// id → { reasoning: boolean, maxOutput: number|null } from the catalog.
+let modelFacts = {};
+// Model-conditional tool swaps read from the release (see extractToolOverrides).
+let toolOverrides = null;
+// Tool plugin basenames last seen in the release tree. Seeded with the current
+// set so the first refresh works even if the directory listing fails.
+let knownPlugins = [
+  "edit",
+  "glob",
+  "grep",
+  "mcp-resource",
+  "opencode",
+  "patch",
+  "question",
+  "read",
+  "shell",
+  "skill",
+  "subagent",
+  "webfetch",
+  "websearch",
+  "write",
+];
 let lastRelease = null;
 let lastAvailable = null;
 let lastCheckTime = 0;
@@ -271,6 +297,32 @@ async function fetchText(url, timeoutMs = SOURCE_TIMEOUT_MS) {
   const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.text();
+}
+
+/**
+ * List the `.ts` files in a release directory.
+ *
+ * The tool plugins are discovered, not enumerated: a hardcoded list keeps
+ * working after upstream adds a tool, which means it silently stops covering
+ * the release. `raw.githubusercontent.com` cannot list a directory, so this
+ * uses the contents API once per refresh; a failure returns an empty list and
+ * the caller falls back to the previously known set.
+ */
+async function listSourceDir(dir, ref, timeoutMs = SOURCE_TIMEOUT_MS) {
+  try {
+    const res = await fetch(
+      `${GITHUB_API}/repos/${REPO}/contents/${dir}?ref=${encodeURIComponent(ref)}`,
+      { signal: AbortSignal.timeout(timeoutMs), headers: { accept: "application/vnd.github+json" } }
+    );
+    if (!res.ok) return [];
+    const json = await res.json();
+    if (!Array.isArray(json)) return [];
+    return json
+      .filter((e) => e && e.type === "file" && /^[a-z0-9-]+\.ts$/i.test(e.name))
+      .map((e) => e.name.replace(/\.ts$/, ""));
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -370,6 +422,11 @@ function extractToolFromSource(source, fallbackName) {
     }
   }
 
+  // A description can live in a sibling `.txt` file (`patch.ts` does this:
+  // `import DESCRIPTION from "../patch.txt"`). The extractor cannot read a file
+  // it was not given, so it reports the reference and the refresh fetches it.
+  const txtImport = source.match(/import\s+([A-Za-z_$][\w$]*)\s+from\s+"(\.\.?\/[^"]+\.txt)"/);
+
   // 1. Tool description. Three upstream forms:
   //    (a) array literal (optionally inside an arrow fn) joined with " " or "\n"
   //    (b) exported template/string literal
@@ -414,6 +471,21 @@ function extractToolFromSource(source, fallbackName) {
             : interpolateTemplate(descMatch0[2] !== undefined ? descMatch0[2] : (descMatch0[3] || ""), vars);
       }
     }
+  }
+  if ((!description || description.length < 20) && txtImport) {
+    return {
+      name,
+      description: null,
+      descriptionFile: txtImport[2],
+      descriptionVar: txtImport[1],
+      parameters: null,
+    };
+  }
+  if (!description || description.length < 20) {
+    // A substituted literal from the sibling `.txt` is a plain string, not an
+    // `export const description = ...`, so read it from the add block.
+    const fromAdd = source.match(/description\s*:\s*"((?:[^"\\]|\\.){20,})"/);
+    if (fromAdd) description = fromAdd[1].replace(/\\n/g, "\n");
   }
   if (!description || description.length < 20) return null;
 
@@ -526,6 +598,7 @@ async function extractCatalog() {
   // models the catalog omits).
   const freeModels = [];
   const verdicts = {};
+  const modelFacts = {};
   for (const [id, m] of Object.entries(oc?.models || {})) {
     const zeroCost = Number(m?.cost?.input) === 0 && Number(m?.cost?.output) === 0;
     const deprecated = m?.status === "deprecated";
@@ -533,9 +606,19 @@ async function extractCatalog() {
     const key = id.toLowerCase();
     verdicts[key] = deprecated ? "deprecated" : zeroCost && usable ? "free" : "paid";
     if (verdicts[key] === "free") freeModels.push(id);
+    // Model facts the wire depends on. `reasoning` decides whether the client's
+    // token budget needs thinking headroom (token-budget.js used to guess this
+    // from substrings of the name), and `limit.output` caps a request.
+    if (typeof m?.reasoning === "boolean") {
+      modelFacts[key] = {
+        reasoning: m.reasoning,
+        maxOutput: Number(m?.limit?.output) > 0 ? Number(m.limit.output) : null,
+      };
+    }
   }
   if (freeModels.length > 0) out.freeModels = freeModels;
   if (Object.keys(verdicts).length > 0) out.catalogVerdicts = verdicts;
+  if (Object.keys(modelFacts).length > 0) out.modelFacts = modelFacts;
 
   // Shorthand aliases, derived from the catalog's own `family` field instead of
   // a hand-maintained table. `family` groups revisions of one model
@@ -561,20 +644,101 @@ async function extractCatalog() {
  * tool name against its list (schema content is not fingerprinted), so the
  * wire needs correct names, not byte-identical schemas.
  */
+/**
+ * Which tools appear in the model's tool list.
+ *
+ * Upstream decides this per tool with `options: { codemode: false }` in the
+ * registration block: those are sent on the wire, while everything else is
+ * reached through the `execute` tool. Measured against the real CLI's request,
+ * the wire carries exactly the `codemode: false` set (plus `execute`). Deriving
+ * the list from that flag means a tool that moves into code mode drops out and
+ * a new direct tool appears, without either being named here.
+ */
 function extractToolNames(files = {}) {
   const names = [];
   const seen = new Set();
-  for (const [key] of Object.entries(SOURCE_FILES)) {
-    if (!key.endsWith("Tool")) continue;
+  for (const key of Object.keys(files)) {
+    if (!key.startsWith("tool:")) continue;
     const source = files[key];
     if (typeof source !== "string" || !source.trim()) continue;
-    const nameMatch = source.match(/export\s+const\s+name\s*=\s*"([a-z][a-z0-9_-]*)"/i);
-    const name = nameMatch ? nameMatch[1] : null;
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    names.push(name);
+
+    const exported = (source.match(/export\s+const\s+name\s*=\s*"([a-z][a-z0-9_-]*)"/i) || [])[1];
+    const fallback = key.replace(/^tool:/, "").replace(/[^a-z0-9_-]/gi, "");
+
+    for (const block of registrationBlocks(source)) {
+      if (!/codemode:\s*false/.test(block.body)) continue;
+      const literal = (block.body.match(/name:\s*"([a-z][a-z0-9_-]*)"/i) || [])[1];
+      // `name,` (shorthand for the exported constant) or `name:` with no literal.
+      const shorthand = /^\s*name\s*,/m.test(block.body) || /name:\s*name\b/.test(block.body);
+      const name = literal || (shorthand ? exported || fallback : null);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+    }
   }
   return names;
+}
+
+/**
+ * Every `editor.add({ ... })` / `draft.add({ ... })` registration in a source
+ * file, with its argument text. Braces are matched by counting, so a nested
+ * `execute:` closure does not truncate the block the way a regex would.
+ */
+function registrationBlocks(source) {
+  const blocks = [];
+  const re = /(?:editor|draft)\.add\(/g;
+  let m;
+  while ((m = re.exec(source))) {
+    let i = m.index + m[0].length;
+    let depth = 1;
+    const start = i;
+    for (; i < source.length && depth > 0; i++) {
+      const ch = source[i];
+      if (ch === "{") depth++;
+      else if (ch === "}") depth--;
+    }
+    if (depth === 0) blocks.push({ body: source.slice(start, i), index: m.index });
+  }
+  return blocks;
+}
+
+/**
+ * Tool-set overrides that depend on the model, extracted from the sources.
+ *
+ * `patch.ts` installs a session hook that swaps the editing tools per model:
+ * GPT models (excluding `oss` and `gpt-4`) get `patch` and lose `edit`/`write`;
+ * everything else keeps `edit`/`write` and loses `patch`. That is why the real
+ * CLI's request for a non-GPT model carries eleven tools and no `patch`, while
+ * a GPT model carries `patch` instead of `edit`+`write`. A fixed list cannot
+ * express this, so the rule is read from the release and applied per request.
+ */
+function extractToolOverrides(files = {}) {
+  for (const key of Object.keys(files)) {
+    if (!key.startsWith("tool:")) continue;
+    const source = files[key];
+    if (typeof source !== "string") continue;
+    const usesPatch = source.match(
+      /const\s+usePatch\s*=\s*([^\n]+)\n([\s\S]{0,400}?)(?=\n\s*\}\s*\n)/
+    );
+    if (!usesPatch) continue;
+    const condition = usesPatch[1].trim();
+    const body = usesPatch[2];
+    const removedForPatch = [...body.matchAll(/delete\s+event\.tools\.([a-z_]+)/g)].map((m) => m[1]);
+    // The `else` branch removes the other side; read the second delete block.
+    const allRemoved = [...source.matchAll(/delete\s+event\.tools\.([a-z_]+)/g)].map((m) => m[1]);
+    const addedForPatch = allRemoved.filter((n) => !removedForPatch.includes(n));
+    if (removedForPatch.length === 0) continue;
+    return {
+      // The condition is kept verbatim and evaluated by the bridge against the
+      // model id, so a change of the rule upstream travels with the release.
+      condition,
+      whenTrueRemove: removedForPatch,
+      whenTrueAdd: addedForPatch,
+      whenFalseRemove: addedForPatch,
+      whenFalseAdd: removedForPatch,
+    };
+  }
+  return null;
 }
 
 /**
@@ -644,10 +808,36 @@ function extractRecipe(files = {}) {
   }
 
   const extractedTools = {};
-  const toolKeys = Object.keys(SOURCE_FILES).filter((k) => k.endsWith("Tool"));
+  const toolKeys = Object.keys(files).filter((k) => k.startsWith("tool:"));
+  // Code mode's `execute` is registered in its own file with an inline object,
+  // so the plugin parser would miss it. Read it here.
+  if (typeof files.codemode === "string") {
+    const cm = files.codemode.match(/name:\s*"(execute)"[\s\S]{0,200}?input:\s*([A-Za-z0-9_.]+)/);
+    if (cm) {
+      const cmDesc = files.codemode.match(/const\s+description\s*=\s*\[([\s\S]*?)\]\.join\(\s*"([^"]*)"\s*\)/);
+      let description = "Call tools through `tools` using exact paths and signatures from the catalog.";
+      if (cmDesc) {
+        const parts = [...cmDesc[1].matchAll(/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g)]
+          .map((m) => (m[1] !== undefined ? m[1] : m[2]))
+          .filter(Boolean);
+        if (parts.length > 0) description = parts.join(cmDesc[2] === "\n" ? "\n" : " ");
+      }
+      extractedTools.execute = {
+        description,
+        parameters: {
+          type: "object",
+          properties: { code: { type: "string", description: "Code to execute" } },
+          required: ["code"],
+          additionalProperties: false,
+        },
+      };
+    }
+  }
   for (const key of toolKeys) {
-    const fallbackName = key.replace(/Tool$/, "").toLowerCase();
-    const def = extractToolFromSource(files[key], fallbackName);
+    // No filename fallback: a file that registers its tools by literal (or that
+    // exposes none at all) must not be recorded under its own filename. That is
+    // how `mcp-resource` used to end up in the profile as a tool name.
+    const def = extractToolFromSource(files[key], null);
     if (def) {
       extractedTools[def.name] = {
         description: def.description,
@@ -659,8 +849,17 @@ function extractRecipe(files = {}) {
     out.tools = extractedTools;
   }
   const toolNames = extractToolNames(files);
+  // `execute` is the code-mode dispatcher itself: always on the wire when code
+  // mode is enabled, even though it carries no `codemode: false` flag.
+  if (Object.keys(extractedTools).includes("execute") && !toolNames.includes("execute")) {
+    toolNames.push("execute");
+  }
   if (toolNames.length > 0) {
     out.toolNames = toolNames;
+  }
+  const overrides = extractToolOverrides(files);
+  if (overrides) {
+    out.toolOverrides = overrides;
   }
 
   return out;
@@ -758,6 +957,28 @@ function applyRecipe(update = {}, tag = null) {
     if (incoming.length > 0 && stableStringify(incoming) !== stableStringify(freeModels)) {
       freeModels = incoming;
       changed.push("freeModels");
+    }
+  }
+
+  if (update.toolOverrides && typeof update.toolOverrides === "object") {
+    if (stableStringify(update.toolOverrides) !== stableStringify(toolOverrides)) {
+      toolOverrides = update.toolOverrides;
+      changed.push("toolOverrides");
+    }
+  }
+
+  if (update.modelFacts && typeof update.modelFacts === "object") {
+    const next = {};
+    for (const [id, f] of Object.entries(update.modelFacts)) {
+      if (typeof f?.reasoning !== "boolean") continue;
+      next[String(id).toLowerCase()] = {
+        reasoning: f.reasoning,
+        maxOutput: Number(f.maxOutput) > 0 ? Number(f.maxOutput) : null,
+      };
+    }
+    if (Object.keys(next).length > 0 && stableStringify(next) !== stableStringify(modelFacts)) {
+      modelFacts = next;
+      changed.push("modelFacts");
     }
   }
 
@@ -904,8 +1125,19 @@ async function refresh({ force = false, recheck = false } = {}) {
       const update = { version: latest };
       let sourceRead = false;
 
+      // Discover the release's tool plugins, falling back to the ones already
+      // known when the directory listing is unavailable (API outage / rate
+      // limit). The known set is kept in `knownPlugins`, so a transient failure
+      // narrows coverage for one refresh instead of erasing it.
+      const discovered = await listSourceDir(PLUGIN_DIR, ref);
+      if (discovered.length > 0) knownPlugins = discovered;
+      const pluginFiles = { codemode: CODEMODE_TOOL_FILE };
+      for (const name of knownPlugins) {
+        pluginFiles[`tool:${name}`] = `${PLUGIN_DIR}/${name}.ts`;
+      }
+
       const settled = await Promise.allSettled(
-        Object.entries(SOURCE_FILES).map(async ([key, filePath]) => [
+        Object.entries({ ...SOURCE_FILES, ...pluginFiles }).map(async ([key, filePath]) => [
           key,
           await fetchText(`${SOURCE_BASE}/${ref}/${filePath}`, SOURCE_TIMEOUT_MS),
         ])
@@ -917,6 +1149,40 @@ async function refresh({ force = false, recheck = false } = {}) {
           sourceRead = true;
         }
       }
+      // Some tools keep their description in a sibling `.txt` (patch.ts). Fetch
+      // those too: the description is part of the wire schema, and a tool whose
+      // schema cannot be built is dropped from the profile.
+      const txtRefs = [];
+      for (const [key, source] of Object.entries(fetchedFiles)) {
+        if (!key.startsWith("tool:")) continue;
+        const probe = extractToolFromSource(source, key.replace(/^tool:/, ""));
+        if (probe && probe.descriptionFile) {
+          txtRefs.push({ key, file: probe.descriptionFile, varName: probe.descriptionVar });
+        }
+      }
+      if (txtRefs.length > 0) {
+        const txtSettled = await Promise.allSettled(
+          txtRefs.map(async (t) => {
+            const dir = PLUGIN_DIR;
+            // `../patch.txt` is relative to the plugin directory.
+            const resolved = new URL(t.file, `https://x/${dir}/`).pathname.replace(/^\//, "");
+            return [t, await fetchText(`${SOURCE_BASE}/${ref}/${resolved}`, SOURCE_TIMEOUT_MS)];
+          })
+        );
+        for (const item of txtSettled) {
+          if (item.status !== "fulfilled") continue;
+          const [t, text] = item.value;
+          const src = fetchedFiles[t.key];
+          if (typeof src !== "string") continue;
+          // Replace the identifier with a string literal so the existing
+          // description parser can read it.
+          fetchedFiles[t.key] = src.replace(
+            new RegExp(`\\b${t.varName}\\b(?!\\s+from)`),
+            JSON.stringify(text.trim())
+          );
+        }
+      }
+
       if (sourceRead) {
         Object.assign(update, extractRecipe(fetchedFiles));
       }
@@ -1110,6 +1376,40 @@ function resolveModelAlias(name) {
   return candidates[0];
 }
 
+/**
+ * Apply the release's model-conditional tool rule to a name list.
+ *
+ * The rule is stored as its upstream condition plus the names it removes and
+ * restores on each branch. The condition is evaluated here against the model id
+ * (only the `event.model.id.includes(...)` form upstream uses is supported; an
+ * unrecognised condition leaves the list untouched rather than guessing).
+ */
+function applyToolOverrides(names, modelId) {
+  const rule = toolOverrides;
+  if (!rule || !Array.isArray(names)) return names.slice();
+  const id = String(modelId || "");
+  const cond = String(rule.condition || "");
+  const tests = [...cond.matchAll(/(!?)\s*event\.model\.id\.includes\(\s*"([^"]+)"\s*\)/g)];
+  if (tests.length === 0) return names.slice();
+  let matches = true;
+  for (const [, negated, needle] of tests) {
+    const hit = id.includes(needle);
+    if (negated && hit) matches = false;
+    if (!negated && !hit) matches = false;
+  }
+  const remove = matches ? rule.whenTrueRemove || [] : rule.whenFalseRemove || [];
+  const add = matches ? rule.whenTrueAdd || [] : rule.whenFalseAdd || [];
+  const out = names.filter((n) => !remove.includes(n));
+  for (const n of add) if (!out.includes(n)) out.push(n);
+  return out;
+}
+
+/** Catalog facts for one model id: `{ reasoning, maxOutput }`, or undefined
+ *  when the catalog does not describe it. */
+function getModelFacts(modelId) {
+  return modelFacts[String(modelId || "").toLowerCase()];
+}
+
 /** The catalog's verdict for one model id: "free", "paid", "deprecated", or
  *  undefined when the catalog does not describe it. */
 function getCatalogVerdict(modelId) {
@@ -1158,7 +1458,7 @@ function getHeaderNames() {
   return Array.isArray(recipe.headers) ? recipe.headers.slice() : DEFAULT_RECIPE.headers.slice();
 }
 
-function getToolList(flat = false, scope = null) {
+function getToolList(flat = false, scope = null, modelId = null) {
   const profile = getTools();
   const available = Object.keys(profile);
   const mode = scope || process.env.TOOL_PROFILE_SCOPE || "core";
@@ -1169,7 +1469,7 @@ function getToolList(flat = false, scope = null) {
   // picked up without a bridge release.
   let ordered;
   if (mode === "full") {
-    ordered = getToolNames().filter((n) => profile[n]);
+    ordered = applyToolOverrides(getToolNames(), modelId).filter((n) => profile[n]);
     if (ordered.length === 0) ordered = available;
   } else {
     const coreNames = CORE_TOOL_NAMES.filter((n) => profile[n]);
@@ -1285,6 +1585,8 @@ function getState() {
     freeModels: freeModels.slice(),
     catalogVerdicts: { ...catalogVerdicts },
     modelFamilies: { ...modelFamilies },
+    modelFacts: { ...modelFacts },
+    toolOverrides: toolOverrides ? { ...toolOverrides } : null,
     endpoints: getEndpoints(),
     inFlight: Boolean(refreshInFlight),
     tools: {
@@ -1305,6 +1607,8 @@ function __reset() {
   freeModels = [];
   catalogVerdicts = {};
   modelFamilies = {};
+  modelFacts = {};
+  toolOverrides = null;
   lastRelease = null;
   lastAvailable = null;
   lastCheckTime = 0;
@@ -1348,6 +1652,8 @@ module.exports = {
   sourceRef,
   resolveRelease,
   extractToolFromSource,
+  extractToolNames,
+  extractToolOverrides,
   extractRecipe,
   buildUserAgent,
   applyRecipe,
@@ -1363,6 +1669,8 @@ module.exports = {
   getToolNames,
   getFreeModels,
   getCatalogVerdict,
+  getModelFacts,
+  applyToolOverrides,
   resolveModelAlias,
   getEndpoints,
   buildGateHeaders,

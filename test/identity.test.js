@@ -53,7 +53,7 @@ export function useragent(app: Info) {
         },
       })
 `,
-  readTool: `
+  "tool:read": `
 export const name = "read"
 const LocationInput = Schema.Struct({
   path: Schema.String.annotate({ description: "File or directory to read" }),
@@ -67,12 +67,13 @@ const LocationInput = Schema.Struct({
 const StructuredOutput = Schema.Struct({ content: Schema.String })
 export const ReadTool = Tool.define(name, async (editor) => {
   editor.add({
+    options: { codemode: false },
     description: "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
     input: LocationInput,
   })
 })
 `,
-  shellTool: `
+  "tool:shell": `
 export const name = "shell"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
 const Input = Schema.Struct({
@@ -98,6 +99,14 @@ const description = (shell?: string) => [
   "Commands accept an optional timeout, background commands have no timeout by default.",
   "Background commands return immediately, and you will be notified when they complete.",
 ].join(" ")
+export const ShellTool = Tool.define(name, async (editor) => {
+  editor.add({
+    name,
+    options: { codemode: false },
+    description: description(),
+    input: Input,
+  })
+})
 `,
 };
 
@@ -246,15 +255,58 @@ describe("identity: recipe & tool extraction", () => {
     assert.equal(r.sessionLength, undefined);
   });
 
-  it("extracts the tool allowlist from every tool source, not just read/shell", () => {
+  it("extracts the wire allowlist from the codemode flag, not from the file list", () => {
+    // A tool is on the wire when its registration says `codemode: false`;
+    // everything else is reached through `execute`. So a file whose add block
+    // omits the flag (or sets it true) must NOT be sent, even though the file
+    // exists — measured: the real CLI's request carries exactly this set.
+    const src = (name, flag) =>
+      [
+        `export const name = "${name}"`,
+        "export const X = Tool.define(name, async (editor) => {",
+        "  editor.add({",
+        `    name,`,
+        flag === null ? "    description: \"d\"," : `    options: { codemode: ${flag} },`,
+        "    input: Input,",
+        "  })",
+        "})",
+      ].join("\n");
+
     const r = identity.extractRecipe({
-      globTool: 'export const name = "glob"\n',
-      editTool: 'export const name = "edit"\n',
-      writeTool: 'export const name = "write"\n',
-      readTool: 'export const name = "read"\n',
-      shellTool: 'export const name = "shell"\n',
+      "tool:read": src("read", "false"),
+      "tool:shell": src("shell", "false"),
+      "tool:glob": src("glob", "false"),
+      "tool:patch": src("patch", "true"),
+      "tool:opencode": src("opencode", null),
     });
-    assert.deepEqual(r.toolNames, ["read", "shell", "glob", "edit", "write"]);
+
+    assert.deepEqual(r.toolNames, ["read", "shell", "glob"]);
+    assert.ok(!r.toolNames.includes("patch"), "a code-mode tool must not be sent on the wire");
+    assert.ok(!r.toolNames.includes("opencode"), "a tool with no flag is code-mode by default");
+  });
+
+  it("reads a plugin that registers its tools with editor.add literals", () => {
+    // `mcp-resource.ts` registers by literal name rather than an exported
+    // constant, and nests an execute closure inside the argument — the scanner
+    // must follow the braces rather than stop at the first `})`.
+    const src = [
+      "export const Plugin = {",
+      "  effect: Effect.fn(function* (ctx) {",
+      "    yield* ctx.tool.transform((editor) =>",
+      "      editor.add({",
+      '        name: "list_mcp_resources",',
+      "        options: { codemode: false },",
+      "        execute: (input) => Effect.gen(function* () {",
+      "          const x = { nested: { deep: 1 } }",
+      "          return x",
+      "        }),",
+      "      })",
+      "    )",
+      "  }),",
+      "}",
+    ].join("\n");
+    const r = identity.extractRecipe({ "tool:mcp-resource": src });
+    assert.deepEqual(r.toolNames, ["list_mcp_resources"]);
   });
 
   it("extracts a tool whose description is an exported template literal", () => {

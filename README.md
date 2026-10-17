@@ -465,6 +465,10 @@ either way the wire shape could never converge on what the release ships.
 | free-model list | yes — catalog `cost` / `status` / `tool_call` | a model that stops being free or is deprecated drops out; `/models` only adds ids the catalog omits |
 | paid-model refusal | yes — catalog `cost` | a paid id is refused locally (`404 model_not_free`) instead of being forwarded to a `401 Missing API key` |
 | shorthand aliases (`deepseek`, `glm`, …) | yes — catalog `family` | follows the family to a live free model; a retired revision stops being reachable |
+| tool *files* | yes — release tree listing | a new plugin is discovered; the last-known set is kept if the listing fails |
+| which tools go on the wire | yes — `codemode: false` in each registration | a tool that moves into code mode drops out; a new direct tool appears |
+| `edit`/`write` vs `patch` | yes — the model rule in `patch.ts` | follows the same condition the CLI evaluates per model |
+| reasoning / output ceiling | yes — catalog `reasoning` + `limit.output` | budget headroom and cap follow the model |
 | header *values* | **no** — mapping in `buildGateHeaders` | must be added in code |
 | tool *parameter* semantics | partly — types/minimums/descriptions derived | a brand-new field type falls back to `string` |
 

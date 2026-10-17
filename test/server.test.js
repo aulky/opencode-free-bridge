@@ -22,6 +22,7 @@ const {
   discoverModels,
   __getDiscoveryState,
 } = require("../server");
+const srv_markProtocolSupport = require("../server").markProtocolSupport;
 function sseStreamFromLines(lines) {
   const encoder = new TextEncoder();
   return new ReadableStream({
@@ -300,6 +301,9 @@ describe("server unit & integration tests", () => {
     beforeEach(() => {
       identity.__reset();
       identity.__setLastCheckTime(Date.now());
+      // Lane assignments are learned and kept on purpose (upstream told us), so
+      // a case that seeds one must not leak into the next.
+      require("../server").__resetProtocolLanes();
     });
 
     after(async () => {
@@ -373,8 +377,14 @@ describe("server unit & integration tests", () => {
         ]),
       });
 
+      // The lane is stated explicitly now: it used to be inferred from the
+      // model name (`includes("muse")`), which is exactly the kind of name rule
+      // that broke when that family was retired. A model needs the Responses
+      // lane because upstream said so (ModelProtocolUnsupported), or because
+      // RESPONSES_MODELS seeds it.
+      srv_markProtocolSupport("big-pickle", true);
       const toolRes = await httpRequest(port, "POST", "/v1/chat/completions", {
-        model: "muse-spark-1.3-contributor-free",
+        model: "big-pickle",
         stream: false,
         messages: [{ role: "user", content: "read a.txt" }],
         tools: [
@@ -413,7 +423,7 @@ describe("server unit & integration tests", () => {
       });
 
       const truncRes = await httpRequest(port, "POST", "/v1/chat/completions", {
-        model: "muse-spark-1.3-contributor-free",
+        model: "big-pickle",
         stream: false,
         messages: [{ role: "user", content: "long text" }],
       });

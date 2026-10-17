@@ -104,6 +104,45 @@ were proving — the *order* of the heal (stale shape → refresh → re-minted 
 full tool set → retry → 200) — against a deterministic fake gate, so the
 self-heal keeps a proof that does not depend on upstream's mood.
 
+### Tool list derived from the release, not enumerated
+
+The tool sources were a hardcoded list of eleven filenames. Upstream ships
+fifteen plugins, and the ones missing from the list (`patch`, `mcp-resource`,
+`opencode`) register tools of their own — so a tool that became required would
+never have been seen.
+
+- **Plugin files are discovered from the release tree** (contents API at the
+  release SHA, with the last-known set kept as a fallback if the listing fails).
+- **Wire membership is derived from the registration, not the filename.** A tool
+  appears on the wire when its `editor.add({...})` carries
+  `options: { codemode: false }`; everything else is reached through `execute`.
+  Measured against a real CLI capture, that rule reproduces the wire set exactly.
+- **The model-conditional swap is extracted too.** `patch.ts` installs a session
+  hook: GPT models (excluding `oss` and `gpt-4`) get `patch` and lose
+  `edit`+`write`; everything else keeps `edit`+`write` and loses `patch`. The
+  condition is read from the source and evaluated against the model id, so the
+  bridge sends `patch` for GPT and `edit`+`write` for everything else, exactly
+  like the CLI.
+- **`execute` is derived from its own source** (`packages/core/src/codemode/tool.ts`),
+  the one wire tool that is not a plugin file.
+- **Descriptions in sibling `.txt` files are fetched** (`patch.ts` keeps its
+  description in `../patch.txt`), so the tool's schema can be built.
+- **No filename fallback.** A plugin that registers by literal name no longer
+  produces a phantom profile entry named after its file (`mcp-resource`).
+
+Result: for a non-GPT free model the bridge's `full` scope now emits the same
+twelve tool names as the real CLI — `edit, glob, grep, question, read, shell,
+skill, subagent, webfetch, websearch, write, execute` — and for a GPT model it
+swaps in `patch` the same way the CLI does.
+
+### Reasoning and output limits derived from the catalog
+
+`token-budget.js` guessed which models think before answering from a substring
+list (`muse`, `mimo`, `nemotron`, …). The catalog states it outright
+(`reasoning: true` on 122 of 127 models) and gives each model's output ceiling
+(`limit.output`). Both are now read from the catalog, with the substring list
+kept only for the cold-start window before the first read.
+
 ### Free-tier only, enforced instead of assumed
 
 The bridge sends `Authorization: Bearer public` and has no login, so a paid
