@@ -28,6 +28,7 @@
     "verify.js",
     "gate-drill.js",
     "README.md",
+    "AGENTS.md",
     "install.sh",
     "transport-fingerprint.js",
     "transport-baseline.json"
