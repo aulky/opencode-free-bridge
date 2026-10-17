@@ -95,6 +95,20 @@ test("installer finds bun installed outside PATH", () => {
   assert.match(src, /\.bun\/bin\/bun/, "installer must look in ~/.bun/bin");
 });
 
+test("installer stages and validates downloads before stopping the old bridge", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  const stageAt = src.indexOf("ofb-stage");
+  const retireCall = src.indexOf("\nretire_legacy_service\n");
+  const syntaxAt = src.indexOf("failed a syntax check");
+  assert.ok(stageAt > 0, "installer must stage downloads");
+  assert.ok(retireCall > 0, "installer must retire the legacy unit");
+  assert.ok(syntaxAt > 0, "installer must syntax-check the staged files");
+  // Order matters: a failed download must leave the running bridge untouched.
+  assert.ok(stageAt < retireCall, "staging must happen before the old bridge is stopped");
+  assert.ok(syntaxAt < retireCall, "validation must happen before the old bridge is stopped");
+});
+
 test("installer retires the pre-2.3 unit that owns the same port", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");

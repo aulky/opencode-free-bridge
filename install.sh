@@ -202,6 +202,54 @@ retire_legacy_service() {
   # tries to bind it.
   if [ "$retired" = "1" ]; then sleep 1; fi
 }
+
+# ------------------------------------------------------------------ fetch ---
+# Everything is downloaded and syntax-checked in a staging directory *before*
+# the running bridge is touched. A network failure halfway through an upgrade
+# therefore leaves the old bridge serving traffic instead of leaving the user
+# with a stopped service and a half-written install.
+RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+mkdir -p "$BINDIR"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ofb-stage.XXXXXX")"
+cleanup_stage() { rm -rf "$STAGE" 2>/dev/null || true; }
+trap cleanup_stage EXIT
+say "Installing into $BINDIR"
+
+fetch() {
+  local file="$1"
+  local tmp="$STAGE/$file"
+  # raw.githubusercontent.com sits behind a CDN that can serve the previous
+  # commit for a while after a push. A stale install.sh is harmless (it already
+  # ran) but a stale server.js next to a fresh identity.js is not. The query
+  # string is ignored by the server and defeats the cache.
+  local url="$RAW/$file?cb=$(date +%s)"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 3 -H 'Cache-Control: no-cache' -o "$tmp" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$tmp" "$url"
+  else
+    die "neither curl nor wget is available"
+  fi
+  [ -s "$tmp" ] || die "downloaded $file is empty"
+}
+
+fetch package.json
+fetch server.js
+fetch identity.js
+fetch token-budget.js
+fetch verify.js
+fetch gate-drill.js
+fetch transport-fingerprint.js
+fetch transport-baseline.json
+
+# A syntactically broken release must never replace a working install.
+for js in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js; do
+  "$RUNTIME" --check "$STAGE/$js" >/dev/null 2>&1 || die "$js failed a syntax check; the running bridge was left untouched"
+done
+"$RUNTIME" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$STAGE/package.json" \
+  || die "package.json is not valid JSON; the running bridge was left untouched"
+
+# Staged and validated. Only now is it safe to stop the old bridge.
 retire_legacy_service
 
 # The old process releases the socket asynchronously after SIGTERM. Wait for it
@@ -216,37 +264,9 @@ if [ -n "$(port_holder)" ]; then
   die "cannot bind port $PORT"
 fi
 
-# ------------------------------------------------------------------ fetch ---
-RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-mkdir -p "$BINDIR"
-say "Installing into $BINDIR"
-
-fetch() {
-  local file="$1"
-  local tmp="$BINDIR/.$file.tmp.$$"
-  # raw.githubusercontent.com sits behind a CDN that can serve the previous
-  # commit for a while after a push. A stale install.sh is harmless (it already
-  # ran) but a stale server.js next to a fresh identity.js is not. The query
-  # string is ignored by the server and defeats the cache.
-  local url="$RAW/$file?cb=$(date +%s)"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 -H 'Cache-Control: no-cache' -o "$tmp" "$url"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp" "$url"
-  else
-    die "neither curl nor wget is available"
-  fi
-  mv -f "$tmp" "$BINDIR/$file"
-}
-
-fetch package.json
-fetch server.js
-fetch identity.js
-fetch token-budget.js
-fetch verify.js
-fetch gate-drill.js
-fetch transport-fingerprint.js
-fetch transport-baseline.json
+for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json; do
+  mv -f "$STAGE/$file" "$BINDIR/$file"
+done
 chmod +x "$BINDIR/server.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" 2>/dev/null || true
 say "Files installed (v$("$RUNTIME" -e 'try{process.stdout.write(require(process.argv[1]).version||"latest")}catch{process.stdout.write("latest")}' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
 
