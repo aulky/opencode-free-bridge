@@ -161,9 +161,38 @@ legacy_unit_active() {
   return 1
 }
 
+# Is the port held by the bridge this installer is about to replace? Re-running
+# the installer on an existing install must work, so the bridge's own process
+# is not a conflict. Anything else is.
+port_held_by_own_bridge() {
+  local holder pid
+  holder="$(port_holder)"
+  [ -n "$holder" ] || return 1
+  pid="$(printf '%s' "$holder" | grep -oP 'pid=\K[0-9]+' | head -1)"
+  [ -n "$pid" ] || return 1
+  case "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" in
+    "$(readlink -f "$BINDIR" 2>/dev/null)") return 0 ;;
+  esac
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$BINDIR/server.js" && return 0
+  return 1
+}
+
+stop_own_bridge() {
+  local pid
+  pid="$(port_holder | grep -oP 'pid=\K[0-9]+' | head -1)"
+  [ -n "$pid" ] || return 0
+  say "Stopping the running bridge (pid $pid) to replace it"
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.25
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
 # Decide before touching anything. If a stranger owns the port, stopping the
 # user's working bridge first would leave them with nothing at all.
-if [ -n "$(port_holder)" ] && ! legacy_unit_active; then
+if [ -n "$(port_holder)" ] && ! legacy_unit_active && ! port_held_by_own_bridge; then
   warn "port $PORT is already in use:"
   warn "  $(port_holder)"
   warn "Nothing was changed. Either stop that process, or install on another port:"
@@ -264,6 +293,7 @@ done
 
 # Staged and validated. Only now is it safe to stop the old bridge.
 retire_legacy_service
+stop_own_bridge
 
 # The old process releases the socket asynchronously after SIGTERM. Wait for it
 # instead of racing the bind, and report clearly if it never happens.

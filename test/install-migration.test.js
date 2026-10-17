@@ -95,6 +95,16 @@ test("installer finds bun installed outside PATH", () => {
   assert.match(src, /\.bun\/bin\/bun/, "installer must look in ~/.bun/bin");
 });
 
+test("installer can replace its own running bridge", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // Re-running the installer is the documented update path, so a bridge this
+  // installer started is not a port conflict. Only a foreign process is.
+  assert.match(src, /port_held_by_own_bridge/);
+  assert.match(src, /stop_own_bridge/);
+  assert.match(src, /! port_held_by_own_bridge/);
+});
+
 test("installer parses staged files instead of running bun --check", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");
