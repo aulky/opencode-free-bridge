@@ -2108,18 +2108,48 @@ const server = http.createServer(handleRequest);
 
 // Only auto-start when executed directly (`node server.js`), so unit tests can
 // require("./server") without binding the default port or starting timers.
+// The transport fingerprint is a property of the HTTP runtime, not of this code.
+// Measured from one IP in one minute with identical headers and body: the real
+// CLI and this bridge on Bun both answer 200, while this bridge on Node and curl
+// answer 403. The CLI ships as a Bun binary, and the gate inspects its
+// ClientHello. Node therefore cannot serve live traffic, so it is refused at
+// startup rather than left running and failing every request.
+const ON_BUN = typeof Bun !== "undefined";
+const ALLOW_NODE = process.env.ALLOW_NODE === "1";
+
+function refuseNodeRuntime() {
+  const lines = [
+    "",
+    "  opencode-free-bridge requires Bun.",
+    "",
+    "  This process is Node, whose TLS transport the free-tier gate refuses:",
+    "  measured 0/6 requests answered on Node vs 6/6 on Bun, from the same IP,",
+    "  in the same minute, with byte-identical headers and body.",
+    "",
+    "  The CLI ships as a Bun binary, so only Bun reproduces its transport.",
+    "",
+    "  Install Bun:   curl -fsSL https://bun.sh/install | bash",
+    "  Then run:      bun server.js",
+    "",
+    "  For offline work (tests, drills, inspecting /v1/models) set ALLOW_NODE=1.",
+    "  Live chat requests will still be refused with 403 by upstream.",
+    "",
+  ];
+  console.error(lines.join("\n"));
+}
+
 if (require.main === module) {
+  if (!ON_BUN && !ALLOW_NODE) {
+    refuseNodeRuntime();
+    process.exit(1);
+  }
   server.listen(PORT, HOST, () => {
     console.log(`[opencode-free-bridge] v${VERSION} listening on http://${HOST}:${PORT}`);
-    // The wire fingerprint (TLS ClientHello: cipher list, extension set and order)
-    // is a property of the HTTP runtime, not of this code. Under Node it differs
-    // from the CLI in every one of those fields; under Bun it is byte-identical.
-    // Warn rather than refuse: Node still passes every gate measured so far.
-    if (typeof Bun === "undefined") {
+    if (!ON_BUN) {
       console.log(
-        "[opencode-free-bridge] WARNING: running on Node. The free-tier gate inspects the transport " +
-          "fingerprint and refuses Node with 403 — measured 0/6 on Node vs 6/6 on Bun from the same IP " +
-          "with identical requests. Live requests will fail. Run `bun server.js` instead."
+        "[opencode-free-bridge] WARNING: ALLOW_NODE=1 — running on Node. Real chat requests will " +
+          "be refused by the free-tier gate with 403. This mode is for offline work against a " +
+          "mocked upstream, not for live traffic."
       );
     }
   });

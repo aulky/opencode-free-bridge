@@ -1,3 +1,40 @@
+## 2.3.4 — Node refuses to start, and upgrades from 1.x are handled
+
+Two things were still wrong for a release people upgrade into.
+
+**Node refuses to start.** A running Node process could only ever fail every
+request, so it no longer starts:
+
+```
+  opencode-free-bridge requires Bun.
+
+  This process is Node, whose TLS transport the free-tier gate refuses:
+  measured 0/6 requests answered on Node vs 6/6 on Bun, from the same IP,
+  in the same minute, with byte-identical headers and body.
+```
+
+Exit code 1, nothing listening. `ALLOW_NODE=1` overrides it for offline work
+(tests, drills, inspecting `/v1/models` against a mocked upstream) and prints a
+warning that live chat will still be refused upstream. The unit suite passes on
+both runtimes; only the startup path is gated.
+
+**Upgrading from 1.x / early 2.x.** Tested against a real v1.5.0 install found on
+this machine, which had no `identity.js` and no service unit:
+
+- Existing install is detected and the old files are copied to
+  `.backup-v<old>-<timestamp>` before anything is overwritten.
+- A service unit still pointing at `node` is rewritten to the selected runtime,
+  with a `.bak` beside it. Verified: `ExecStart="/usr/bin/node" …` became
+  `ExecStart="…/bun" …`.
+- The file set is now complete: the installer fetches `gate-drill.js`,
+  `transport-fingerprint.js` and `transport-baseline.json`, which it previously
+  skipped — an install could come up unable to run its own tools.
+- Two hardcoded `node` invocations in the no-service start path and the
+  self-check are gone.
+
+Migration result on that v1.5.0 install: 2.3.4, seven models answering, old cache
+preserved, backup intact.
+
 ## 2.3.3 — Bun is required, and drift is now detectable
 
 The measurement in 2.3.2 made Bun the only runtime the live gate accepts. That

@@ -62,9 +62,15 @@ the transport fingerprint. Bun is therefore required, not merely recommended —
 which runtime is in use.
 
 ```bash
-bun server.js          # required: same transport as the CLI
-node server.js         # refused by the free-tier gate (403); see the table above
+bun server.js              # required: same transport as the CLI
+node server.js             # refuses to start, with an explanation
+ALLOW_NODE=1 node server.js  # starts anyway, for offline work; live chat still 403s
 ```
+
+Node does not start by default. The gate refuses its transport, so a running
+Node process could only fail every request; refusing at startup makes that
+impossible to miss. `ALLOW_NODE=1` exists for tests, drills and inspecting
+`/v1/models` against a mocked upstream — not for serving traffic.
 
 The bridge depends on Bun's TLS stack continuing to match the CLI's. Bun 1.4.2
 (the version bundled inside CLI 2.0.32) and 1.4.3 produce identical

@@ -53,6 +53,62 @@ if [ "$(basename "$RUNTIME")" = "node" ]; then
   [ "$NODE_MAJOR" -ge 18 ] || die "Node.js >= 18 required (found $(node -v))"
 fi
 
+# -------------------------------------------------------------- migration ---
+# Upgrading from 1.x or early 2.x means three things change underneath:
+#
+#   * the runtime (node -> bun), so any service unit still says `node`
+#   * the file set (identity.js and the transport tools are new), so a partial
+#     copy from an older installer leaves a bridge that cannot start
+#   * the transport itself, so an old install that "worked" now needs Bun to
+#     get anything but 403
+#
+# The old files are moved aside rather than deleted, so a failed upgrade can be
+# undone by hand.
+PREV_VERSION=""
+if [ -f "$BINDIR/package.json" ]; then
+  PREV_VERSION="$("$RUNTIME" -e 'try{process.stdout.write(require(process.argv[1]).version||"")}catch{}' "$BINDIR/package.json" 2>/dev/null || true)"
+fi
+if [ -n "$PREV_VERSION" ]; then
+  say "Found existing install: v$PREV_VERSION in $BINDIR"
+  BACKUP="$BINDIR/.backup-v$PREV_VERSION-$(date +%Y%m%d%H%M%S)"
+  mkdir -p "$BACKUP"
+  for f in server.js identity.js token-budget.js verify.js gate-drill.js package.json; do
+    [ -f "$BINDIR/$f" ] && cp -p "$BINDIR/$f" "$BACKUP/$f" 2>/dev/null || true
+  done
+  say "Backed up to $BACKUP"
+  if [ -f "$BINDIR/server.js" ] && ! grep -q '#!/usr/bin/env bun' "$BINDIR/server.js" 2>/dev/null; then
+    say "Old install ran on Node; this version requires Bun for the live gate"
+  fi
+fi
+
+# A service unit written by an older installer still points at `node`, which
+# would silently keep failing after the upgrade. Rewrite it if we can.
+migrate_service_runtime() {
+  local unit
+  for unit in "/etc/systemd/system/opencode-free-bridge.service" \
+              "$HOME/.config/systemd/user/opencode-free-bridge.service"; do
+    [ -f "$unit" ] || continue
+    if grep -q 'ExecStart=.*node' "$unit" 2>/dev/null; then
+      sed -i.bak -E "s|^ExecStart=.*|ExecStart=\"$RUNTIME\" \"$BINDIR/server.js\"|" "$unit" 2>/dev/null || {
+        warn "could not rewrite $unit — update ExecStart to: \"$RUNTIME\" \"$BINDIR/server.js\""
+        continue
+      }
+      say "Service unit updated to run under $(basename "$RUNTIME"): $unit"
+      if [ "${unit#/etc}" != "$unit" ]; then
+        systemctl daemon-reload 2>/dev/null || true
+      else
+        systemctl --user daemon-reload 2>/dev/null || true
+      fi
+    fi
+  done
+  local plist="$HOME/Library/LaunchAgents/com.opencode-free-bridge.plist"
+  if [ -f "$plist" ] && grep -q '<string>.*node</string>' "$plist" 2>/dev/null; then
+    sed -i.bak -E "s|<string>[^<]*node</string>|<string>$RUNTIME</string>|" "$plist" 2>/dev/null || true
+    say "launchd agent updated to run under $(basename "$RUNTIME")"
+  fi
+}
+migrate_service_runtime
+
 # ------------------------------------------------------------------ fetch ---
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 mkdir -p "$BINDIR"
@@ -76,7 +132,10 @@ fetch server.js
 fetch identity.js
 fetch token-budget.js
 fetch verify.js
-chmod +x "$BINDIR/server.js" "$BINDIR/verify.js" 2>/dev/null || true
+fetch gate-drill.js
+fetch transport-fingerprint.js
+fetch transport-baseline.json
+chmod +x "$BINDIR/server.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" 2>/dev/null || true
 say "Files installed (v$(node -p 'require(process.argv[1]).version' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
 
 # ---------------------------------------------------------------- service ---
@@ -186,7 +245,7 @@ if [ "$SERVICE_OK" != "1" ]; then
   say "Starting in the background (no service manager)"
   pkill -f -- "$BINDIR/server.js" 2>/dev/null || true
   sleep 0.5
-  (cd "$BINDIR" && PORT="$PORT" HOST="$HOST" nohup node server.js >"$BINDIR/bridge.log" 2>&1 &)
+  (cd "$BINDIR" && PORT="$PORT" HOST="$HOST" nohup "$RUNTIME" server.js >"$BINDIR/bridge.log" 2>&1 &)
 fi
 
 say "Waiting for the bridge to come up..."
@@ -198,7 +257,7 @@ done
 echo
 say "Running self-check (quick — full check: $RUNTIME $BINDIR/verify.js)"
 echo
-PORT="$PORT" HOST="$HOST" node "$BINDIR/verify.js" --quick || true
+PORT="$PORT" HOST="$HOST" "$RUNTIME" "$BINDIR/verify.js" --quick || true
 
 echo
 say "Done."
