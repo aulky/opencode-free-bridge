@@ -4,13 +4,13 @@ OpenAI-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier
 
 It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
 
-## What's New in v2.3 (v2.3.9)
+## What's New in v2.3 (v2.3.10)
 
 - **Bun transport parity (`v2.3.6+`):** The OpenCode CLI ships as a compiled Bun binary, and upstream's free-tier gate inspects the TLS `ClientHello` fingerprint (17 cipher suites, 12 TLS extensions in a fixed order). The bridge now runs on Bun (`bun server.js`), refuses accidental Node.js startups unless `ALLOW_NODE=1` is set for offline tests, and ships `transport-fingerprint.js` to verify TLS parity against `transport-baseline.json`.
-- **Automatic installer migration (`v2.3.6` to `v2.3.9`):** `install.sh` installs Bun automatically if missing and rewrites existing `systemd` or `launchd` service units from `node` to `bun` during upgrades.
-- **Full source and catalog derivation (`v2.2` to `v2.3.9`):** All hardcoded model tables (`MODEL_MAP`) and model-name substring heuristics have been removed. The bridge derives its client version, commit SHA, session ID format (`ses_` + 12 hex + 14 base62), 7 gate headers, 13 tool plugins (parsed from upstream's Effect Schema AST in GitHub source), inference endpoints (`chatUrl` and `responsesUrl`), active free models, shorthand family aliases, and reasoning token limits directly from OpenCode's update API, GitHub repository, and `models.opencode.ai/api.json`.
-- **On-disk catalog cache for instant cold starts (`v2.3.8` to `v2.3.9`):** After fetching `models.opencode.ai/api.json`, the bridge caches the catalog at `~/.opencode-free-bridge/cache/catalog.json` and loads it at module boot. Model aliases (`mimo`, `longcat`, `beam`), deprecated/paid model checks, and reasoning token budgets work on the very first request after startup and when offline.
-- **Multi-layer reactive self-healing (`v2.3.7` to `v2.3.9`):** When upstream rejects a request with `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a moved endpoint path, the bridge refreshes its recipe and catalog from upstream, evicts stale session IDs from cache, mints a new session ID, escalates to the full 12-tool profile, and retries once transparently before returning to the client.
+- **Automatic installer migration (`v2.3.6` to `v2.3.10`):** `install.sh` installs Bun automatically if missing and rewrites existing `systemd` or `launchd` service units from `node` to `bun` during upgrades.
+- **Full source and catalog derivation (`v2.2` to `v2.3.10`):** All hardcoded model tables (`MODEL_MAP`) and model-name substring heuristics have been removed. The bridge derives its client version, commit SHA, session ID format (`ses_` + 12 hex + 14 base62), 7 gate headers, 13 tool plugins (parsed from upstream's Effect Schema AST in GitHub source), inference endpoints (`chatUrl` and `responsesUrl`), active free models, shorthand family aliases, and reasoning token limits directly from OpenCode's update API, GitHub repository, and `models.opencode.ai/api.json`.
+- **On-disk catalog cache for instant cold starts (`v2.3.8` to `v2.3.10`):** After fetching `models.opencode.ai/api.json`, the bridge caches the catalog at `~/.opencode-free-bridge/cache/catalog.json` and loads it at module boot. Model aliases (`mimo`, `longcat`, `beam`), deprecated/paid model checks, and reasoning token budgets work on the very first request after startup and when offline.
+- **Multi-layer reactive self-healing (`v2.3.7` to `v2.3.10`):** When upstream rejects a request with `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a moved endpoint path, the bridge refreshes its recipe and catalog from upstream, evicts stale session IDs from cache, mints a new session ID, escalates to the full 12-tool profile, and retries once transparently before returning to the client.
 
 ## Features
 
@@ -230,7 +230,7 @@ curl -s http://127.0.0.1:20129/health
 {
   "status": "ok",
   "provider": "opencode-free-bridge",
-  "version": "2.3.9",
+  "version": "2.3.10",
   "discoveredModels": 10,
   "identity": {
     "userAgent": "opencode/latest/2.0.32/cli",

@@ -1,3 +1,34 @@
+## 2.3.10 — onboarding hardened by deploying to three real hosts
+
+This release came out of installing v2.3.9 the way a stranger would: a clean
+machine, an old v1.5.3 install, a re-run over a live bridge, and two VPS boxes
+that already had a bridge on port 20129. Every item below was a real failure
+observed during that run, not a hypothetical.
+
+| Symptom a user would hit | Cause | Fix |
+|---|---|---|
+| `Bun is required but not found` on a box where bun is installed | `curl bun.sh/install` only edits an interactive shell's PATH; SSH sessions and `curl \| bash` do not see `~/.bun/bin` | installer probes `$BUN_INSTALL/bin`, `~/.bun/bin`, `/usr/local/bin`, `/opt/bun/bin` |
+| new service restart-loops on `EADDRINUSE` | pre-2.3 releases shipped `opencode-bridge.service`, which keeps port 20129 | installer stops, disables and renames the legacy unit before installing |
+| `Unit has a bad unit file setting` | `WorkingDirectory=` was quoted; systemd treats the quotes as part of the path | directory is written bare, and a failed `systemctl restart` is reported instead of swallowed |
+| every upgrade aborted with `server.js failed a syntax check` | `bun --check` is not a flag; Bun ran the file as an entrypoint | staged files are parsed with `new Function`, which compiles without executing |
+| upgrade died mid-download and took the bridge with it | files were fetched after the old service was already stopped | everything is downloaded, syntax-checked and JSON-checked in a staging dir first |
+| installer exited silently with no error | `set -euo pipefail` plus a `grep` that matched nothing | probes go through a `\|\| true` helper |
+| re-running the installer failed with "port already in use" | the port check did not recognise the bridge's own process | the running bridge is identified by cwd/cmdline, stopped through systemd when supervised, then replaced |
+| a correct install reported `FAIL` and "No model answered" | `403 FreeTierError` from a throttled IP was counted as a broken model | `verify.js` reports `GATE`, exits `2`, and says the official CLI gets the same answer |
+| installer said "self-check did not finish in 120s" after 3 seconds | every non-zero exit was reported as a timeout | the actual exit code is inspected; `124` is the only timeout |
+
+Measured on the same network, at the same moment, after the fixes:
+
+- bridge on the laptop: `403 FreeTierError`
+- official `/home/azrnld/.opencode/bin/opencode run --standalone`: `403 FreeTierError`
+
+The bridge is correct; the IP was outside its allowance. That distinction is now
+reported honestly instead of being blamed on the install.
+
+Also in this release: fresh `git clone && bun server.js` was verified end to end
+(10 models discovered, `/health` 200), and all three hosts (laptop, petafora, m1)
+now run the same version with a matching TLS fingerprint.
+
 ## 2.3.9 — full audit remediation
 
 - **Catalog warm-start & reactive refresh (`HIGH-1`):** `identity.js` now loads

@@ -79,7 +79,7 @@ Use these connection details in any OpenAI-compatible tool:
 
 ### Current active free models (also supports family shorthands)
 
-Always verify via `GET /v1/models`. As of catalog sync `v2.3.9`:
+Always verify via `GET /v1/models`. As of catalog sync `v2.3.10`:
 - `mimo-v2.6-flash-free` (shorthand: `mimo`)
 - `big-pickle` (shorthand: `big-pickle`)
 - `beam-free` (shorthand: `beam`)
