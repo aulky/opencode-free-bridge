@@ -155,8 +155,8 @@ const identity = require("./identity");
  * to the shipped defaults until the first successful refresh. Resolved per
  * call, so a catalog change applies on the next request.
  */
-function resolveEndpoints() {
-  const derived = identity.getEndpoints();
+function resolveEndpoints(modelId = null) {
+  const derived = identity.getEndpoints(modelId);
   return {
     responsesUrl: process.env.OPENCODE_RESPONSES_URL || derived.responsesUrl || OPENCODE_RESPONSES_URL,
     chatUrl: process.env.OPENCODE_CHAT_URL || derived.chatUrl || OPENCODE_CHAT_URL,
@@ -1186,7 +1186,7 @@ function handleRequest(req, res) {
       let reader = null;
       try {
         let { upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses);
-        const liveEndpoints = resolveEndpoints();
+        let liveEndpoints = resolveEndpoints(targetModel);
         let upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
 
         let upstreamRes = await fetch(upstreamUrl, {
@@ -1303,6 +1303,11 @@ function handleRequest(req, res) {
           // send the same rejected shape and fail identically. The cached
           // entry is dropped so the next request also gets a correct id.
           const retrySessionId = regenerateSessionId(req, body, sessionId);
+          // Re-resolve the endpoint *after* the refresh: a catalog change is one
+          // of the things the refresh can learn, and the retry must go to the
+          // new URL — reusing the pre-refresh value would defeat the derivation.
+          liveEndpoints = resolveEndpoints(targetModel);
+          upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
           upstreamRes = await fetch(upstreamUrl, {
             method: "POST",
             headers: buildUpstreamHeaders(req, retrySessionId),

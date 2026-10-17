@@ -52,6 +52,7 @@ const DRILLS = [
   "session-shape",
   "routing",
   "allowlist",
+  "retry-endpoint",
 ];
 
 function ask(port, body) {
@@ -354,6 +355,88 @@ async function drillAllowlist({ identity }) {
   return full.includes("run") && core.length > 0;
 }
 
+/**
+ * retry-endpoint — the gate-rejection retry re-resolves the endpoint.
+ *
+ * A refresh can learn a new endpoint from the catalog. If the retry reused the
+ * URL captured before the refresh, the healed request would still go to the
+ * stale path. This drill stages a rejecting upstream at the boot-time URL and a
+ * healthy fake at the catalog-derived URL, then checks the retry lands on the
+ * latter.
+ */
+async function drillRetryEndpoint({ identity }) {
+  console.log("\nretry-endpoint — the self-heal retry uses the refreshed endpoint");
+
+  const hits = [];
+  const rejecting = http.createServer((req, res) => {
+    hits.push("old");
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        type: "error",
+        error: { type: "FreeTierError", message: "OpenCode's free tier can only be used from within OpenCode." },
+      })
+    );
+  });
+  const healthy = http.createServer((req, res) => {
+    hits.push("new");
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-fake",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { content: "OK" }, finish_reason: null }],
+      })}\n\n`
+    );
+    res.write(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-fake",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      })}\n\n`
+    );
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise((r) => rejecting.listen(0, "127.0.0.1", r));
+  await new Promise((r) => healthy.listen(0, "127.0.0.1", r));
+  const oldPort = rejecting.address().port;
+  const newPort = healthy.address().port;
+
+  const before = identity.getEndpoints().chatUrl;
+  identity.applyRecipe({ chatUrl: `http://127.0.0.1:${oldPort}/chat/completions` });
+
+  // A refresh that "learns" the new endpoint: the drill calls applyRecipe the
+  // way refresh() does when the catalog moved.
+  const realOnGate = identity.onGateRejection;
+  identity.onGateRejection = async () => {
+    identity.applyRecipe({ chatUrl: `http://127.0.0.1:${newPort}/chat/completions` });
+    return { retry: true, reason: "drill-catalog-move" };
+  };
+
+  let res;
+  try {
+    res = await ask(port(), {
+      model: "big-pickle",
+      messages: [{ role: "user", content: "Reply with exactly: OK" }],
+    });
+  } finally {
+    identity.onGateRejection = realOnGate;
+    identity.applyRecipe({ chatUrl: before });
+    await new Promise((r) => rejecting.close(r));
+    await new Promise((r) => healthy.close(r));
+  }
+
+  console.log(`  attempts        : ${JSON.stringify(hits)}`);
+  console.log(`  client saw      : HTTP ${res.status} ${JSON.stringify(content(res))}`);
+
+  line(hits[0] === "old", "first attempt used the pre-refresh endpoint");
+  line(hits[1] === "new", "retry used the endpoint learned by the refresh");
+  line(res.status === 200, "client received 200");
+
+  return hits[0] === "old" && hits[1] === "new" && res.status === 200;
+}
+
 async function main() {
   const wanted = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const drills = wanted.length > 0 ? wanted : DRILLS;
@@ -386,6 +469,7 @@ async function main() {
       "session-shape": drillSessionShape,
       routing: drillRouting,
       allowlist: drillAllowlist,
+      "retry-endpoint": drillRetryEndpoint,
     };
     const fn = DRILL_FNS[name];
     // A cached session id from a previous drill would be reused for an

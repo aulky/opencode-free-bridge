@@ -545,6 +545,19 @@ describe("identity: adaptive endpoints", () => {
     assert.equal(identity.getEndpoints().chatUrl, identity.DEFAULT_RECIPE.chatUrl);
   });
 
+  it("routes a model to its catalog-pinned base when the SDK is OpenAI-compatible", () => {
+    identity.applyRecipe({
+      modelEndpoints: { "some-openai-model": "https://opencode.ai/inference/openai/v1" },
+    });
+    const e = identity.getEndpoints("some-openai-model");
+    assert.equal(e.chatUrl, "https://opencode.ai/inference/openai/v1/chat/completions");
+    // unknown models keep the provider-wide base
+    assert.equal(
+      identity.getEndpoints("unlisted-model").chatUrl,
+      identity.DEFAULT_RECIPE.chatUrl
+    );
+  });
+
   it("reports endpoints and the tool allowlist in state", () => {
     identity.applyRecipe({ toolNames: ["read", "shell", "glob"] });
     const st = identity.getState();

@@ -179,6 +179,8 @@ let toolProfileVersion = DEFAULT_RECIPE.version;
 // sources at the release SHA; the wire sends these names (schema is not
 // fingerprinted). Empty = fall back to the tool profile's own key order.
 let toolNames = [];
+// Per-model route overrides from the provider catalog (model id -> base URL).
+let modelEndpoints = {};
 let lastRelease = null;
 let lastAvailable = null;
 let lastCheckTime = 0;
@@ -489,14 +491,21 @@ async function extractCatalog() {
     // derived URL would be identical to the chat URL (malformed catalog).
     if (api.endsWith("/v1")) out.responsesUrl = `${api}/responses`;
   }
-  for (const m of Object.values(oc?.models || {})) {
+  // Per-model route overrides. The catalog lets a single model pin a different
+  // base (e.g. the anthropic-protocol models under /inference/anthropic/v1).
+  // This bridge speaks the OpenAI protocols only, so an override is adopted
+  // only when the model's SDK is OpenAI-compatible; an anthropic-only route is
+  // left alone rather than silently misrouted.
+  const overrides = {};
+  for (const [id, m] of Object.entries(oc?.models || {})) {
     const mp = m?.provider?.api;
-    if (typeof mp === "string" && mp !== api && /^https:\/\//.test(mp)) {
-      // per-model override exists — record the distinct bases so the caller can
-      // route anthropic-protocol models correctly.
-      break;
-    }
+    if (typeof mp !== "string" || !/^https:\/\//.test(mp)) continue;
+    const npm = String(m?.provider?.npm || oc?.npm || "");
+    if (!npm.startsWith("@ai-sdk/openai")) continue;
+    const base = mp.replace(/\/+$/, "");
+    if (base !== api) overrides[id.toLowerCase()] = base;
   }
+  if (Object.keys(overrides).length > 0) out.modelEndpoints = overrides;
   return out;
 }
 
@@ -696,6 +705,21 @@ function applyRecipe(update = {}, tag = null) {
 
   if (Array.isArray(update.optionalHeaders)) {
     optionalHeaders = update.optionalHeaders.map(String);
+  }
+
+  if (update.modelEndpoints && typeof update.modelEndpoints === "object") {
+    const nextMap = {};
+    for (const [id, base] of Object.entries(update.modelEndpoints)) {
+      if (typeof base === "string" && /^https:\/\/[a-z0-9.-]+/i.test(base)) {
+        nextMap[String(id).toLowerCase()] = base;
+      }
+    }
+    if (Object.keys(nextMap).length > 0) {
+      if (stableStringify(nextMap) !== stableStringify(modelEndpoints)) {
+        modelEndpoints = nextMap;
+        changed.push("modelEndpoints");
+      }
+    }
   }
 
   if (Array.isArray(update.toolNames) && update.toolNames.length > 0) {
@@ -968,13 +992,24 @@ function getToolNames() {
  * upstream provider catalog at refresh time; `server.js` reads these per
  * request, so an endpoint migration applies without a restart.
  */
-function getEndpoints() {
-  return {
+function getEndpoints(modelId = null) {
+  const base = {
     chatUrl: recipe.chatUrl,
     responsesUrl: recipe.responsesUrl,
     modelsUrl: recipe.modelsUrl,
     catalogBase: recipe.catalogBase,
   };
+  // A model can pin its own base in the catalog (anthropic-protocol models).
+  // The wire path is derived the same way: <base>/chat/completions.
+  if (modelId) {
+    const override = modelEndpoints[String(modelId).toLowerCase()];
+    if (override) {
+      base.catalogBase = override;
+      base.chatUrl = `${override}/chat/completions`;
+      base.responsesUrl = `${override}/responses`;
+    }
+  }
+  return base;
 }
 
 function getRecipe() {
@@ -1139,6 +1174,7 @@ function __reset() {
   toolProfileSource = "default";
   toolProfileVersion = DEFAULT_RECIPE.version;
   toolNames = [];
+  modelEndpoints = {};
   lastRelease = null;
   lastAvailable = null;
   lastCheckTime = 0;

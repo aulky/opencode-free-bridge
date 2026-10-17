@@ -34,9 +34,26 @@ upstream no longer needs a bridge release.
   them, then renames them into place and exits for the service manager to
   restart. `AUTO_UPDATE=0` disables it. A failed check or partial download
   leaves the running install untouched.
+- **The retry re-resolves the endpoint after refreshing**: A refresh can learn a
+  new endpoint from the catalog. Reusing the URL captured before the refresh
+  would send the healed request to the stale path, defeating the derivation.
+- **Per-model endpoint overrides**: The catalog can pin a model to its own base.
+  OpenAI-SDK models are routed to their pinned base; anthropic-only routes are
+  left alone rather than silently misrouted (this bridge speaks the OpenAI
+  protocols only).
 - **Drills**: `routing` proves the endpoint is read per request (a fake server
   started *after* boot receives the request); `allowlist` proves a renamed tool
-  reaches the wire in `full` scope. `npm run drill` is now 6/6.
+  reaches the wire in `full` scope; `retry-endpoint` proves the self-heal retry
+  lands on the endpoint learned by the refresh. `npm run drill` is now 7/7.
+
+### What is still not self-healing
+
+| Layer | Why |
+|---|---|
+| Gate *semantics* | If upstream adds a check that is not expressed in the endpoint, headers, session shape, or tool names, nothing in the release source reveals it. The bridge fails honestly: it forwards the real `403` with an update hint rather than looping. |
+| Header *values* | Names are derived; values are mapped by hand (`buildGateHeaders`). A new header whose value is not derivable shows up in `identity.unsentHeaders` instead of being sent empty. |
+| Non-OpenAI protocols | A model routed through the anthropic protocol needs a translation layer this bridge does not have. |
+| Rate limits | The per-IP free-tier budget is upstream policy, not an identity problem. |
 
 ### Measured: what the gate does and does not check
 
