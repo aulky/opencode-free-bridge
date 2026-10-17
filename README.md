@@ -272,12 +272,18 @@ curl -s http://127.0.0.1:20129/health
 ## Testing, Verification & Gate Drills
 
 ```bash
-bun test                        # 104 unit, contract, and security regression tests (offline)
-npm run verify                  # live check: probes every discovered free model
-npm run verify:quick            # live check: stops at the first model that answers
-npm run drill                   # runs live + offline self-healing gate drills
-npm run fingerprint:check       # checks Bun TLS ClientHello against transport-baseline.json
+bun test                        # 107 offline unit, contract, and regression tests
+bun run verify                  # live check: probes every discovered free model
+bun run verify:quick            # live check: stops at the first model that answers
+bun run drill                   # runs live + offline self-healing gate drills
+bun run fingerprint:check       # checks Bun TLS ClientHello against transport-baseline.json
 ```
+
+`verify.js` exits `0` when a model answers, `2` when the bridge is healthy but
+upstream refuses this IP's free-tier allowance, and `1` for a real failure. The
+`2` case is what a throttled network looks like: the official OpenCode CLI gets
+the same `403 FreeTierError` from the same IP at the same moment, so it is not a
+reason to reinstall or edit headers.
 
 `gate-drill.js` deliberately corrupts the bridge's state and verifies that a single client request triggers self-healing and still returns `HTTP 200`:
 

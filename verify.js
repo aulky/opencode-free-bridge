@@ -94,6 +94,20 @@ async function probe(model) {
   const ms = Date.now() - started;
 
   if (res.status === 429) return { state: "ratelimited", ms };
+  if (res.status === 403) {
+    const msg = String(res.body?.error?.message || res.error || "");
+    // The gateway refuses a perfectly healthy request with the same
+    // `403 FreeTierError` when this IP's allowance is spent. Reporting that as
+    // "FAIL / not answering" tells a new user their install is broken when it
+    // is not, so it gets its own state and its own exit code.
+    if (/free tier can only be used|FreeTierError/i.test(msg)) {
+      return { state: "gate-closed", ms, detail: String(msg).slice(0, 90) };
+    }
+  }
+  if (res.status === 426) {
+    const msg = res.body?.error?.message || res.error || "HTTP 426";
+    return { state: "upgrade-required", ms, detail: String(msg).slice(0, 90) };
+  }
   if (res.status !== 200) {
     const msg = res.body?.error?.message || res.error || `HTTP ${res.status}`;
     return { state: "failed", ms, detail: String(msg).slice(0, 70) };
@@ -149,6 +163,10 @@ async function probe(model) {
       console.log(`  ${ok("OK")}   ${model.padEnd(36)} ${time}  ${C.dim}${r.chars} chars, ${r.outTokens} tokens${C.reset}`);
     } else if (r.state === "ratelimited") {
       console.log(`  ${warn("BUSY")} ${model.padEnd(36)} ${time}  ${C.dim}upstream rate limit, retry later${C.reset}`);
+    } else if (r.state === "gate-closed") {
+      console.log(`  ${warn("GATE")} ${model.padEnd(36)} ${time}  ${C.dim}this IP is outside the free-tier allowance${C.reset}`);
+    } else if (r.state === "upgrade-required") {
+      console.log(`  ${bad("UPGR")} ${model.padEnd(36)} ${time}  ${C.dim}${r.detail}${C.reset}`);
     } else if (r.state === "thinking-only") {
       console.log(`  ${bad("THINK")} ${model.padEnd(36)} ${time}  ${C.dim}${r.detail}${C.reset}`);
     } else if (r.state === "empty") {
@@ -160,18 +178,29 @@ async function probe(model) {
 
   const counts = results.reduce((acc, r) => ((acc[r.state] = (acc[r.state] || 0) + 1), acc), {});
   const usable = counts.ok || 0;
+  const blocked = (counts["gate-closed"] || 0) + (counts.ratelimited || 0);
+  const broken = (counts["thinking-only"] || 0) + (counts.empty || 0) + (counts.failed || 0) + (counts["upgrade-required"] || 0);
 
   console.log(`\n${C.bold}Summary${C.reset}`);
-  console.log(`  ${ok(String(usable))} usable, ${counts.ratelimited || 0} rate-limited, ` +
-              `${(counts["thinking-only"] || 0) + (counts.empty || 0) + (counts.failed || 0)} not answering`);
+  console.log(`  ${ok(String(usable))} usable, ${blocked} blocked by upstream (${counts["gate-closed"] || 0} gate-closed, ${counts.ratelimited || 0} rate-limited), ${broken} broken`);
 
-  if (usable === 0) {
-    console.log(`\n  ${bad("No model answered.")}`);
-    console.log(`  ${C.dim}If every line says BUSY, the upstream free tier is throttling this IP.${C.reset}`);
-    console.log(`  ${C.dim}Running the bridge from another host (a VPS, a laptop) changes the IP seen upstream.${C.reset}\n`);
-    process.exit(1);
+  if (usable > 0) {
+    console.log(`\n  ${ok("Bridge is working.")} Point any OpenAI-compatible client at ${C.cyan}${BASE}/v1${C.reset}\n`);
+    process.exit(0);
   }
 
-  console.log(`\n  ${ok("Bridge is working.")} Point any OpenAI-compatible client at ${C.cyan}${BASE}/v1${C.reset}\n`);
-  process.exit(0);
+  if (blocked > 0 && broken === 0) {
+    // Exit 2 is deliberately distinct from 1: the install is correct, the IP
+    // is not currently allowed. The installer and CI can tell these apart.
+    console.log(`\n  ${warn("Bridge is healthy, but upstream refused this IP.")}`);
+    console.log(`  ${C.dim}The gateway answered every probe with its own free-tier refusal, not a bridge error.${C.reset}`);
+    console.log(`  ${C.dim}The official OpenCode CLI gets the same answer from this network right now.${C.reset}`);
+    console.log(`  ${C.dim}Wait for the allowance window to reset, or run the bridge on another host.${C.reset}`);
+    console.log(`  ${C.dim}Re-check later: ${C.reset}${C.cyan}bun verify.js --quick${C.reset}\n`);
+    process.exit(2);
+  }
+
+  console.log(`\n  ${bad("No model answered.")}`);
+  console.log(`  ${C.dim}Check the bridge log for the upstream error, then retry.${C.reset}\n`);
+  process.exit(1);
 })();

@@ -150,6 +150,27 @@ migrate_service_runtime
 # unit enabled makes the new service fail with EADDRINUSE and restart-loop
 # forever. A user who finds this repo and re-runs the installer on a machine
 # that still has the old bridge should get an upgrade, not a port fight.
+port_holder() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -tlnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print; exit}'
+}
+
+legacy_unit_active() {
+  systemctl is-active --quiet opencode-bridge 2>/dev/null && return 0
+  systemctl --user is-active --quiet opencode-bridge 2>/dev/null && return 0
+  return 1
+}
+
+# Decide before touching anything. If a stranger owns the port, stopping the
+# user's working bridge first would leave them with nothing at all.
+if [ -n "$(port_holder)" ] && ! legacy_unit_active; then
+  warn "port $PORT is already in use:"
+  warn "  $(port_holder)"
+  warn "Nothing was changed. Either stop that process, or install on another port:"
+  warn "  PORT=20130 bash install.sh"
+  die "port $PORT is occupied by another process"
+fi
+
 retire_legacy_service() {
   local name="opencode-bridge.service"
   local stamp retired=0
@@ -183,14 +204,16 @@ retire_legacy_service() {
 }
 retire_legacy_service
 
-# If something else still owns the port, say so now. Otherwise the new service
-# restart-loops on a bind error and the cause is invisible in the installer.
-if command -v ss >/dev/null 2>&1; then
-  PORT_HOLDER="$(ss -tlnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print; exit}')"
-  if [ -n "$PORT_HOLDER" ]; then
-    warn "port $PORT is still in use: $PORT_HOLDER"
-    warn "stop that process, or install with PORT=<free port>, before the service can bind."
-  fi
+# The old process releases the socket asynchronously after SIGTERM. Wait for it
+# instead of racing the bind, and report clearly if it never happens.
+for _ in $(seq 1 10); do
+  [ -z "$(port_holder)" ] && break
+  sleep 0.5
+done
+if [ -n "$(port_holder)" ]; then
+  warn "port $PORT is still held after stopping the old bridge:"
+  warn "  $(port_holder)"
+  die "cannot bind port $PORT"
 fi
 
 # ------------------------------------------------------------------ fetch ---
@@ -201,10 +224,15 @@ say "Installing into $BINDIR"
 fetch() {
   local file="$1"
   local tmp="$BINDIR/.$file.tmp.$$"
+  # raw.githubusercontent.com sits behind a CDN that can serve the previous
+  # commit for a while after a push. A stale install.sh is harmless (it already
+  # ran) but a stale server.js next to a fresh identity.js is not. The query
+  # string is ignored by the server and defeats the cache.
+  local url="$RAW/$file?cb=$(date +%s)"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 -o "$tmp" "$RAW/$file"
+    curl -fsSL --retry 3 -H 'Cache-Control: no-cache' -o "$tmp" "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp" "$RAW/$file"
+    wget -qO "$tmp" "$url"
   else
     die "neither curl nor wget is available"
   fi
@@ -367,11 +395,23 @@ echo
 # Without a hard cap, a slow upstream makes the installer look hung, and the user
 # kills it before the service is registered.
 if command -v timeout >/dev/null 2>&1; then
-  PORT="$PORT" HOST="$HOST" timeout 120 "$RUNTIME" "$BINDIR/verify.js" --quick || \
-    warn "self-check did not finish in 120s — the bridge is installed; run the check manually when upstream is responsive"
+  set +e
+  PORT="$PORT" HOST="$HOST" timeout 120 "$RUNTIME" "$BINDIR/verify.js" --quick
+  CHECK_RC=$?
+  set -e
 else
-  PORT="$PORT" HOST="$HOST" "$RUNTIME" "$BINDIR/verify.js" --quick || true
+  set +e
+  PORT="$PORT" HOST="$HOST" "$RUNTIME" "$BINDIR/verify.js" --quick
+  CHECK_RC=$?
+  set -e
 fi
+case "$CHECK_RC" in
+  0) ;;
+  2) warn "the bridge is installed and healthy, but upstream refused this IP's free-tier allowance"
+     warn "the official OpenCode CLI gets the same refusal from this network; re-check later with the command below" ;;
+  124) warn "self-check hit the 120s cap; the bridge is installed, run the check again when upstream is responsive" ;;
+  *) warn "self-check reported a problem; inspect the log with the command below" ;;
+esac
 
 echo
 say "Done."

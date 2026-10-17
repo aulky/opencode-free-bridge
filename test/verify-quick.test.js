@@ -23,7 +23,16 @@ test("--quick uses a shorter per-request timeout", () => {
 test("installer bounds its self-check with a timeout", () => {
   const src = fs.readFileSync(INSTALLER, "utf8");
   assert.match(src, /timeout 120/, "installer must not wait forever on a throttled upstream");
-  assert.match(src, /self-check did not finish/, "installer must explain a timed-out self-check");
+  // The installer used to print "did not finish in 120s" for every non-zero
+  // exit, including a fast, correct "this IP is throttled". It now reports the
+  // actual outcome and only names a timeout for exit 124.
+  assert.match(src, /124\)/, "installer must explain a genuinely timed-out self-check");
+  assert.match(src, /CHECK_RC/, "installer must inspect the self-check exit code");
+  assert.doesNotMatch(
+    src,
+    /verify\.js" --quick \|\| \\\n\s+warn "self-check did not finish/,
+    "installer must not report every failure as a timeout"
+  );
 });
 
 test("installer detaches the bridge without a subshell", () => {

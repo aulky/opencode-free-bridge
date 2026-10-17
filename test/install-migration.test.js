@@ -69,6 +69,22 @@ test("installer writes a systemd unit systemd actually accepts", () => {
   assert.match(src, /if ! systemctl restart opencode-free-bridge/);
 });
 
+test("verify.js separates an IP throttle from a broken bridge", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "verify.js"), "utf8");
+  // A 403 FreeTierError is upstream refusing the network, not a bridge fault.
+  // Reporting it as FAIL made a correct install look broken on a throttled VPS.
+  assert.match(src, /gate-closed/, "verify.js must have a distinct gate-closed state");
+  assert.match(src, /process\.exit\(2\)/, "verify.js must exit 2 when only the IP is refused");
+  assert.match(src, /free tier can only be used/i, "verify.js must recognise the upstream refusal body");
+});
+
+test("installer reports the self-check outcome instead of always claiming a timeout", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  assert.match(src, /CHECK_RC/, "installer must capture the self-check exit code");
+  assert.match(src, /124\)/, "installer must distinguish a real timeout");
+});
+
 test("installer finds bun installed outside PATH", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");
@@ -87,7 +103,8 @@ test("installer retires the pre-2.3 unit that owns the same port", () => {
   // disable it instead of assuming a clean machine.
   assert.match(src, /retire_legacy_service/);
   assert.match(src, /opencode-bridge\.service/);
-  assert.match(src, /still in use/, "installer must report a port still held by another process");
+  assert.match(src, /already in use/, "installer must report a port held by another process");
+  assert.match(src, /port \$PORT is occupied/, "an occupied port must abort before anything is changed");
 });
 
 test("server refuses to start on Node without ALLOW_NODE", () => {
