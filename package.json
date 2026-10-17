@@ -1,6 +1,6 @@
 {
   "name": "opencode-free-bridge",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes",
   "main": "server.js",
   "bin": {
@@ -11,10 +11,12 @@
     "test": "node --test test/*.test.js",
     "verify": "node verify.js",
     "verify:quick": "node verify.js --quick",
-    "drill": "node gate-drill.js"
+    "drill": "node gate-drill.js",
+    "bun": "bun server.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "bun": ">=1.0.0"
   },
   "files": [
     "server.js",

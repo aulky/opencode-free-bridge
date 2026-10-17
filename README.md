@@ -17,6 +17,37 @@ Exposes a local `/v1/chat/completions` endpoint that any OpenAI-compatible clien
 
 - Node.js >= 18
 
+## Runtime: use Bun
+
+The bridge runs on Node 18+ and on Bun, unchanged. Bun is recommended, and the
+reason is measurable rather than stylistic: **the TLS ClientHello is part of the
+fingerprint a gate can inspect, and only Bun reproduces the CLI's.**
+
+Measured with a raw TCP listener against the same endpoint:
+
+| | CLI (Bun) | Bridge on Bun | Bridge on Node |
+|---|---|---|---|
+| TLS ciphers offered | 17 | **17** | 52 |
+| TLS extensions | 12 | **12** | 11 |
+| Extension order | — | **identical** | different |
+| `Accept-Encoding` | `gzip, deflate, br, zstd` | **same** | `gzip, deflate` |
+| Header name casing | `Accept`, `User-Agent`, … | **same** | lowercased |
+
+Everything above is invisible to a test that only inspects headers at the
+application layer, which is why it went unnoticed until the two runtimes were
+compared byte for byte. The CLI ships as a Bun binary, so its HTTP stack is
+Bun's; running the bridge on Bun makes the transport identical instead of
+merely similar.
+
+Node remains fully supported — every gate measured so far passes on it, and the
+startup banner says so. But if upstream ever fingerprints the transport, Bun is
+the runtime that already matches.
+
+```bash
+bun server.js          # identical transport to the CLI
+node server.js         # works; prints a note about the TLS difference
+```
+
 ## Install & Update
 
 ```bash

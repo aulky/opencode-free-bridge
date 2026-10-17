@@ -1,3 +1,32 @@
+## 2.3.1 — Transport parity: run on Bun
+
+Everything up to this point compared the bridge to the CLI at the HTTP layer.
+That comparison cannot see the transport, and the transport is where the two
+differed completely.
+
+Captured both ClientHellos with a raw TCP listener:
+
+| | CLI (Bun) | Bridge on Bun | Bridge on Node |
+|---|---|---|---|
+| TLS ciphers offered | 17 | 17 | 52 |
+| TLS extensions | 12 | 12 | 11 |
+| Extension order | — | identical | different |
+| `Accept-Encoding` | `gzip, deflate, br, zstd` | same | `gzip, deflate` |
+| Header casing | `Accept`, `User-Agent`, … | same | lowercased |
+
+The bridge was already runnable on Bun without modification — no API used here
+is Node-specific. Verified under Bun 1.4.2: **84/84 tests**, **9/9 drills**,
+and the outbound ClientHello byte-identical to the CLI's.
+
+Node stays supported. Every gate measured so far passes on it, and no failure
+has ever been traced to the transport. But the transport is the one layer where
+a gate could distinguish the two without any application-layer tell, so Bun is
+now the recommended runtime and the Node startup prints the measured difference.
+
+- Startup banner reports the runtime and, on Node, the exact TLS delta. It warns
+  rather than refuses: refusing would break every existing Node install over a
+  difference that has never actually caused a rejection.
+
 # Changelog
 
 ## [2.1.0] — 2026-10-17

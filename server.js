@@ -2101,6 +2101,16 @@ const server = http.createServer(handleRequest);
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
     console.log(`[opencode-free-bridge] v${VERSION} listening on http://${HOST}:${PORT}`);
+    // The wire fingerprint (TLS ClientHello: cipher list, extension set and order)
+    // is a property of the HTTP runtime, not of this code. Under Node it differs
+    // from the CLI in every one of those fields; under Bun it is byte-identical.
+    // Warn rather than refuse: Node still passes every gate measured so far.
+    if (typeof Bun === "undefined") {
+      console.log(
+        "[opencode-free-bridge] note: running on Node. The TLS ClientHello differs from the CLI's " +
+          "(52 vs 17 ciphers, different extension order). Bun reproduces it exactly; see README."
+      );
+    }
   });
   // Discovery runs in background: /v1/models is live as soon as upstream
   // answers. Boot never blocks on network.
