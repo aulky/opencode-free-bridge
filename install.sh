@@ -257,7 +257,15 @@ done
 echo
 say "Running self-check (quick — full check: $RUNTIME $BINDIR/verify.js)"
 echo
-PORT="$PORT" HOST="$HOST" "$RUNTIME" "$BINDIR/verify.js" --quick || true
+# Bounded on purpose: the self-check talks to a live upstream that can throttle.
+# Without a hard cap, a slow upstream makes the installer look hung, and the user
+# kills it before the service is registered.
+if command -v timeout >/dev/null 2>&1; then
+  PORT="$PORT" HOST="$HOST" timeout 120 "$RUNTIME" "$BINDIR/verify.js" --quick || \
+    warn "self-check did not finish in 120s — the bridge is installed; run the check manually when upstream is responsive"
+else
+  PORT="$PORT" HOST="$HOST" "$RUNTIME" "$BINDIR/verify.js" --quick || true
+fi
 
 echo
 say "Done."

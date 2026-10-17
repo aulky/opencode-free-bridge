@@ -31,7 +31,7 @@ const ok = (s) => `${C.green}${s}${C.reset}`;
 const warn = (s) => `${C.yellow}${s}${C.reset}`;
 const bad = (s) => `${C.red}${s}${C.reset}`;
 
-function request(method, path, body, timeoutMs = 120000) {
+function request(method, path, body, timeoutMs = QUICK ? 25000 : 120000) {
   return new Promise((resolve) => {
     const payload = body ? JSON.stringify(body) : null;
     const req = http.request(
@@ -130,11 +130,20 @@ async function probe(model) {
     process.exit(1);
   }
 
-  console.log(`  Probing ${models.length} models${QUICK ? " (quick)" : ""}...\n`);
+  // --quick answers one question: does this bridge work right now? The first
+  // model that answers settles it. Probing all nine costs up to 120s each when
+  // upstream is throttling, which made `install.sh` look hung for minutes.
+  const toProbe = QUICK ? models.slice(0, 3) : models;
+  console.log(
+    `  Probing ${toProbe.length}${QUICK && models.length > toProbe.length ? " of " + models.length : ""} models${
+      QUICK ? " (quick — stops at the first success)" : ""
+    }...\n`
+  );
   const results = [];
-  for (const model of models) {
+  for (const model of toProbe) {
     const r = await probe(model);
     results.push({ model, ...r });
+    if (QUICK && r.state === "ok") break;
     const time = `${(r.ms / 1000).toFixed(1)}s`.padStart(6);
     if (r.state === "ok") {
       console.log(`  ${ok("OK")}   ${model.padEnd(36)} ${time}  ${C.dim}${r.chars} chars, ${r.outTokens} tokens${C.reset}`);

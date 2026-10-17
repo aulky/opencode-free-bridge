@@ -1,3 +1,25 @@
+## 2.3.5 — the installer no longer looks hung
+
+Found by leaving the migration test running: it hit a 300s cap. The installer was
+not stuck on the network — it was doing exactly what it was told, for far too
+long.
+
+`verify.js --quick` probed **all nine models** with a **120s timeout each**. When
+upstream throttles, that is up to eighteen minutes of a terminal showing nothing,
+and users kill it before the service is registered. The "quick" check answered
+"does this work at all", so it only ever needed one success.
+
+- `--quick` now probes at most three models, stops at the first success, and uses
+  a 25s per-request timeout.
+- `install.sh` wraps its self-check in `timeout 120` and says so when it expires,
+  instead of waiting indefinitely on a throttled upstream.
+
+Measured on the same v1.5.0 migration that timed out: **300s → 5s**, exit 0,
+bridge answering.
+
+Three regression tests cover the quick-mode cap, the shortened timeout, and the
+installer's bound.
+
 ## 2.3.4 — Node refuses to start, and upgrades from 1.x are handled
 
 Two things were still wrong for a release people upgrade into.
