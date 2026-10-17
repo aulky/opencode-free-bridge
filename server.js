@@ -1575,17 +1575,9 @@ function handleRequest(req, res) {
             //
             // Only the runtime can be checked locally, so report that and name
             // both possibilities instead of asserting the wrong one.
-            const freeTierMsg = /freetiererror|free tier|only available in opencode/i.test(rawMsg);
-            const onNode = typeof Bun === "undefined";
-            console.warn(
-              `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${gateStatus}): ${rawMsg} — ${
-                freeTierMsg
-                  ? onNode
-                    ? "request shape already matches upstream, but this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before suspecting an allowance limit"
-                    : "transport and request shape both match upstream. Either the per-IP free-tier allowance is spent, or upstream is refusing this network; the real CLI returns the same 403 from the same IP when it is (verified). A 429 would mean transport passed and only quota is left"
-                  : `no further identity change to apply; ${UPDATE_HINT}`
-              }`
-            );
+            // Read the retry's own body before logging. The first attempt's
+            // message describes a shape this bridge has already replaced, so
+            // reporting it here would describe a request nobody sent.
             let retryText = "";
             try {
               retryText = await upstreamRes.text();
@@ -1597,6 +1589,31 @@ function handleRequest(req, res) {
             const retryType = retryJson?.error?.type || retryJson?.type || errType || "upstream_error";
             const retryMsg =
               retryJson?.error?.message || retryJson?.message || retryText || rawMsg;
+
+            // Report the *retry* status, not the first attempt's: they differ
+            // whenever upstream answers the refreshed shape differently (a 426
+            // floor handshake followed by a 429 capacity answer is common), and
+            // logging the old status misattributes the final verdict.
+            const retryStatus = upstreamRes.status;
+            const retryFreeTierMsg = /freetiererror|free tier|only available in opencode/i.test(retryMsg);
+            const onNode = typeof Bun === "undefined";
+            // A 429 means transport and shape both passed and only capacity is
+            // exhausted. Calling that a gate rejection would send the user to
+            // re-check headers that upstream already accepted.
+            const capacity = retryStatus === 429;
+            console.warn(
+              `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${retryStatus}${
+                retryStatus !== gateStatus ? `, first attempt ${gateStatus}` : ""
+              }): ${retryMsg} — ${
+                capacity
+                  ? "upstream accepted the transport and the request shape and answered with capacity pressure; the free-tier allowance or the model's capacity is exhausted. Retry later or switch model"
+                  : retryFreeTierMsg
+                    ? onNode
+                      ? "request shape already matches upstream, but this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before suspecting an allowance limit"
+                      : "transport and request shape both match upstream. Either the per-IP free-tier allowance is spent, or upstream is refusing this network; the real CLI returns the same 403 from the same IP when it is (verified). A 429 would mean transport passed and only quota is left"
+                    : `no further identity change to apply; ${UPDATE_HINT}`
+              }`
+            );
             res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
             return res.end(
               JSON.stringify({
@@ -1604,7 +1621,7 @@ function handleRequest(req, res) {
                   // Point at an update only when the shape is plausibly stale.
                   // A budget rejection already carries the newest identity, so
                   // an "update the bridge" hint would send the user the wrong way.
-                  message: freeTierMsg ? retryMsg : `${retryMsg} (${UPDATE_HINT})`,
+                  message: retryFreeTierMsg ? retryMsg : `${retryMsg} (${UPDATE_HINT})`,
                   type: retryType,
                   code: upstreamRes.status,
                 },

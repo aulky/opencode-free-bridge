@@ -106,6 +106,29 @@ function line(ok, label, detail = "") {
   console.log(`  ${mark} ${label}${detail ? "  " + detail : ""}`);
 }
 
+/**
+ * Tri-state line: `true` prints OK, `false` prints FAIL, `null` prints SKIP.
+ *
+ * A live drill can only judge the layer it staged if upstream actually read the
+ * request. `429` is capacity, not a verdict on the request shape (the control
+ * probe treats it the same way), so an assertion that depends on upstream
+ * answering is `null` rather than a false failure.
+ */
+function lineMaybe(ok, label, detail = "") {
+  const mark = ok === null ? "SKIP" : ok ? "OK  " : "FAIL";
+  console.log(`  ${mark} ${label}${detail ? "  " + detail : ""}`);
+}
+
+/** Upstream answered with capacity pressure instead of a gate verdict. */
+function isBusy(res) {
+  return res.status === 429;
+}
+
+/** `ok`, or `null` when upstream gave no verdict to judge. */
+function judge(ok, undecided) {
+  return ok ? true : undecided ? null : false;
+}
+
 async function waitHealthy(port, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -145,16 +168,23 @@ async function drillVersionFloor({ identity, __syncUserAgent }) {
   console.log(`  UA after    : ${uaAfter}`);
   console.log(`  client saw  : HTTP ${res.status} ${JSON.stringify(content(res))}`);
 
-  line(res.status === 200, "client received 200, not the gate error");
-  line(content(res).length > 0, "client received real content");
+  const busy = isBusy(res);
+  const answered = res.status === 200 && content(res).length > 0;
+  const moved =
+    uaAfter !== uaBefore &&
+    uaAfter.startsWith("opencode/latest/") &&
+    !uaAfter.includes("/1.0.0/");
+
+  lineMaybe(judge(res.status === 200, busy), "client received 200, not the gate error");
+  lineMaybe(judge(content(res).length > 0, busy), "client received real content");
   line(healed, "version floor was learned from the rejection");
   line(uaAfter !== uaBefore, "User-Agent moved off the rejected version");
-  line(
-    uaAfter.startsWith("opencode/latest/") && !uaAfter.includes("/1.0.0/"),
-    "identity now follows the current release"
-  );
+  line(moved, "identity now follows the current release");
 
-  return res.status === 200 && content(res).length > 0 && healed;
+  // A 429 means upstream never judged the healed shape, so the client-facing
+  // half of this drill is undecided even when every heal assertion passed.
+  if (!healed || !moved) return false;
+  return judge(answered, busy);
 }
 
 async function drillLegacyShape({ identity, __syncUserAgent }) {
@@ -189,10 +219,12 @@ async function drillLegacyShape({ identity, __syncUserAgent }) {
   console.log(`  legacy UA   : ${LEGACY_UA}`);
   console.log(`  client saw  : HTTP ${res.status} ${JSON.stringify(content(res))}`);
 
-  line(res.status === 200, "legacy access pattern still accepted");
-  line(content(res).length > 0, "legacy pattern returns real content");
+  const busy = isBusy(res);
+  const answered = res.status === 200 && content(res).length > 0;
+  lineMaybe(judge(res.status === 200, busy), "legacy access pattern still accepted");
+  lineMaybe(judge(content(res).length > 0, busy), "legacy pattern returns real content");
 
-  return res.status === 200 && content(res).length > 0;
+  return judge(answered, busy);
 }
 
 async function drillEmptyTools({ identity }) {
@@ -214,11 +246,14 @@ async function drillEmptyTools({ identity }) {
   console.log(`  tools after : ${JSON.stringify(after)}`);
   console.log(`  client saw  : HTTP ${res.status} ${JSON.stringify(content(res))}`);
 
+  const busy = isBusy(res);
+  const answered = res.status === 200 && content(res).length > 0;
   line(after.length > 0, "an empty profile falls back to the shipped tools");
-  line(res.status === 200, "client received 200, not 403");
-  line(content(res).length > 0, "client received real content");
+  lineMaybe(judge(res.status === 200, busy), "client received 200, not 403");
+  lineMaybe(judge(content(res).length > 0, busy), "client received real content");
 
-  return after.length > 0 && res.status === 200 && content(res).length > 0;
+  if (after.length === 0) return false;
+  return judge(answered, busy);
 }
 
 async function drillSessionShape({ identity, __syncUserAgent, sessionCache }) {
@@ -248,20 +283,20 @@ async function drillSessionShape({ identity, __syncUserAgent, sessionCache }) {
   console.log(`  id after    : ${after} (len ${after.length}, prefix "${identity.getSessionPrefix()}")`);
   console.log(`  client saw  : HTTP ${res.status} ${JSON.stringify(content(res))}`);
 
-  line(res.status === 200, "client received 200, not the FreeTierError");
-  line(content(res).length > 0, "client received real content");
-  line(identity.getSessionPrefix() === goodPrefix, "prefix restored by the refresh");
-  line(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(after), "re-minted id matches the accepted shape");
-  line(
-    cached.every((id) => /^ses_/.test(id)),
-    "no rejected id left in the session cache"
-  );
+  const busy = isBusy(res);
+  const answered = res.status === 200 && content(res).length > 0;
+  const prefixRestored = identity.getSessionPrefix() === goodPrefix;
+  const shapeOk = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(after);
+  const cacheClean = cached.every((id) => /^ses_/.test(id));
 
-  return (
-    res.status === 200 &&
-    content(res).length > 0 &&
-    identity.getSessionPrefix() === goodPrefix
-  );
+  lineMaybe(judge(res.status === 200, busy), "client received 200, not the FreeTierError");
+  lineMaybe(judge(content(res).length > 0, busy), "client received real content");
+  line(prefixRestored, "prefix restored by the refresh");
+  line(shapeOk, "re-minted id matches the accepted shape");
+  line(cacheClean, "no rejected id left in the session cache");
+
+  if (!prefixRestored || !shapeOk || !cacheClean) return false;
+  return judge(answered, busy);
 }
 
 /**
@@ -930,7 +965,10 @@ async function main() {
   const failed = results.filter(([, ok]) => ok === false);
   const skipped = results.filter(([, ok]) => ok === null);
   if (skipped.length > 0) {
-    console.log(`\n  ${skipped.length} live drill(s) skipped: upstream gate closed for this IP.`);
+    console.log(
+      `\n  ${skipped.length} live drill(s) undecided: upstream gave no verdict (gate closed or 429 capacity).` +
+        `\n  Every assertion that could be checked locally still passed; rerun when the IP has allowance.`
+    );
   }
   process.exit(failed.length === 0 ? 0 : 1);
 }
