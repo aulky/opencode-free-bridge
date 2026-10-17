@@ -156,7 +156,15 @@ describe("server unit & integration tests", () => {
     assert.equal(headers["x-opencode-session-id"], sessionId);
     assert.equal(headers["x-session-affinity"], sessionId);
     assert.equal(headers["x-session-id"], sessionId);
-    assert.equal("x-opencode-request" in headers, false);
+    // The real CLI mints a per-request message id; measured on the wire as
+    // `msg_` + 20 lowercase hex, different on every request.
+    assert.match(headers["x-opencode-request"], /^msg_[0-9a-f]{20}$/);
+    const headers2 = buildUpstreamHeaders({ headers: {} }, sessionId);
+    assert.notEqual(
+      headers2["x-opencode-request"],
+      headers["x-opencode-request"],
+      "the request id must be minted per request, not reused"
+    );
 
     // Chat payload with client 'read' tool conflict + max_tokens: 50 on longcat
     identity.applyRecipe({

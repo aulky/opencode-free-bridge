@@ -136,6 +136,10 @@ const DEFAULT_RECIPE = Object.freeze({
     "x-opencode-project",
     "x-opencode-session",
     "x-opencode-client",
+    // The real CLI's per-request message id. It was absent from this fallback
+    // list, so even though buildGateHeaders knew how to mint it, the loop over
+    // header names never emitted it.
+    "x-opencode-request",
   ]),
 });
 
@@ -2183,6 +2187,7 @@ const GATE_HEADER_VALUES = [
   "user-agent",
   "x-opencode-client",
   "x-opencode-project",
+  "x-opencode-request",
   "x-opencode-session",
   "x-opencode-session-id",
   "x-session-affinity",
@@ -2194,6 +2199,13 @@ function buildGateHeaders(ctx = {}) {
     "user-agent": ctx.userAgent,
     "x-opencode-client": ctx.client,
     "x-opencode-project": ctx.project,
+    // A per-request message id, `msg_` + 20 lowercase hex. Measured from the
+    // real CLI's outgoing headers: it changes on every request and is not
+    // derived from the session id, so it is minted the same way rather than
+    // copied. This header is not part of the 403 cause on any IP measured so
+    // far, but it is part of the CLI's request shape, and a shape difference
+    // the bridge cannot explain is a difference it should not ship.
+    "x-opencode-request": ctx.requestId,
     "x-opencode-session": ctx.sessionId,
     "x-opencode-session-id": ctx.sessionId,
     "x-session-affinity": ctx.sessionId,
