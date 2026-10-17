@@ -61,6 +61,7 @@ const DRILLS = [
   "allowlist",
   "retry-endpoint",
   "endpoint-move",
+  "gate-heal",
 ];
 
 function ask(port, body) {
@@ -524,6 +525,167 @@ async function drillEndpointMove({ identity }) {
   return hits[0] === "old" && hits[1] === "new" && res.status === 200;
 }
 
+/**
+ * Control probe: is upstream accepting this IP *at all* right now?
+ *
+ * The live drills stage a rejected shape and expect the bridge to heal it. But
+ * the gateway also refuses a healthy request with the same `403 FreeTierError`
+ * when the caller's allowance is exhausted — measured: byte-identical CLI
+ * requests alternate 200/403 within seconds. Without a control, a throttled IP
+ * makes every live drill report FAIL even though nothing is wrong with the
+ * bridge, and each of those failures pushes the cooldown further out.
+ *
+ * The probe is a direct request, not one through the bridge, shaped the way the
+ * real CLI shapes it (`max_completion_tokens`, `store: false`, full tool set).
+ * 200 or 429 means the gate is open (429 is capacity, not refusal).
+ */
+async function probeUpstream(identity) {
+  const { buildUpstreamPayload, buildUpstreamHeaders, resolveEndpoints } = require("./server");
+  const model = "big-pickle";
+  const sessionId = identity.createSessionId(true);
+  const headers = buildUpstreamHeaders({ headers: {} }, sessionId);
+  const body = buildUpstreamPayload(
+    { model, messages: [{ role: "user", content: "Reply with exactly: OK" }], max_tokens: 24 },
+    model,
+    false,
+    "full"
+  ).upstreamBody;
+  // Match the CLI's own token field: this is the shape measured to pass.
+  body.max_completion_tokens = body.max_tokens;
+  delete body.max_tokens;
+  body.store = false;
+
+  try {
+    const res = await fetch(resolveEndpoints(model).chatUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60000),
+    });
+    const text = await res.text().catch(() => "");
+    const open = res.status === 200 || res.status === 429;
+    return { open, status: res.status, detail: text.slice(0, 120).replace(/\n/g, " ") };
+  } catch (err) {
+    return { open: false, status: 0, detail: err.message };
+  }
+}
+
+/**
+ * gate-heal — the whole reactive path, against a deterministic fake gate.
+ *
+ * The live drills prove the heal against the real service, but they need the
+ * caller's IP to be inside its allowance. This drill stages the same sequence
+ * offline: a fake upstream that refuses the staged shape with `403
+ * FreeTierError` and accepts the refreshed one. It asserts the *order* of the
+ * heal (stale request → refresh → re-minted id → full tool set → retry → 200),
+ * which is what the bridge controls; whether upstream is in the mood is not.
+ */
+async function drillGateHeal({ identity }) {
+  console.log("\ngate-heal — reactive heal, deterministic fake gate (no live upstream)");
+
+  const seen = [];
+  let rejectedOnce = false;
+  const fake = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      let body = {};
+      try {
+        body = JSON.parse(raw);
+      } catch {}
+      const sid = String(req.headers["x-opencode-session-id"] || "");
+      const toolCount = Array.isArray(body.tools) ? body.tools.length : 0;
+      const shapeOk = sid.startsWith("ses_") && toolCount > 2;
+
+      if (!shapeOk && !rejectedOnce) {
+        rejectedOnce = true;
+        seen.push({ ok: false, sid, toolCount });
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            type: "error",
+            error: {
+              type: "FreeTierError",
+              message: "OpenCode's free tier can only be used from within OpenCode.",
+            },
+          })
+        );
+      }
+      seen.push({ ok: true, sid, toolCount });
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { content: "OK" }, finish_reason: null }],
+        })}\n\n`
+      );
+      res.write(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })}\n\n`
+      );
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  await new Promise((r) => fake.listen(0, "127.0.0.1", r));
+  const fakePort = fake.address().port;
+
+  const beforeUrl = identity.getEndpoints().chatUrl;
+  identity.applyRecipe({ chatUrl: `http://127.0.0.1:${fakePort}/v1/chat/completions` });
+  identity.__setSessionPrefix("ses"); // the shape upstream reads as "not OpenCode"
+  identity.__setLastCheckTime(Date.now());
+
+  // Stand in for the refresh: restore the derived shape the real refresh learns.
+  const realOnGate = identity.onGateRejection;
+  identity.onGateRejection = async () => {
+    identity.__setSessionPrefix("ses_");
+    // A real refresh also reads the release's tool sources. Seed the profile it
+    // would produce, so this drill asserts the escalation path rather than the
+    // "source unreachable" fallback (which can only offer the shipped set).
+    identity.applyRecipe({
+      tools: {
+        read: identity.DEFAULT_TOOLS.read,
+        shell: identity.DEFAULT_TOOLS.shell,
+        glob: { description: "g".repeat(40), parameters: { type: "object", properties: {} } },
+        edit: { description: "e".repeat(40), parameters: { type: "object", properties: {} } },
+      },
+      toolNames: ["read", "shell", "glob", "edit"],
+    });
+    return { retry: true, reason: "drill-refresh" };
+  };
+
+  let res;
+  try {
+    res = await ask(port(), {
+      model: "big-pickle",
+      messages: [{ role: "user", content: "Reply with exactly: OK" }],
+    });
+  } finally {
+    identity.onGateRejection = realOnGate;
+    identity.applyRecipe({ chatUrl: beforeUrl });
+    identity.__setSessionPrefix("ses_");
+    await new Promise((r) => fake.close(r));
+  }
+
+  const first = seen[0];
+  const retry = seen[1];
+  console.log(`  attempts        : ${JSON.stringify(seen.map((s) => ({ ok: s.ok, sid: s.sid.slice(0, 8), tools: s.toolCount })))}`);
+  console.log(`  client saw      : HTTP ${res.status} ${JSON.stringify(content(res))}`);
+
+  line(Boolean(first) && !first.ok, "first attempt carried the rejected shape");
+  line(Boolean(retry) && retry.ok, "the retry carried a refreshed shape");
+  line(Boolean(retry) && retry.sid.startsWith("ses_"), "the retry re-minted the session id");
+  line(Boolean(retry) && retry.toolCount > 2, "the retry escalated to the full tool set");
+  line(res.status === 200, "client received 200, not the gate error");
+  line(content(res).length > 0, "client received real content");
+
+  return Boolean(retry) && retry.ok && res.status === 200 && content(res).length > 0;
+}
+
 async function main() {
   const wanted = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const drills = wanted.length > 0 ? wanted : DRILLS;
@@ -547,8 +709,33 @@ async function main() {
   const models = srv.__getDiscoveryState().activeModels;
   console.log(`  discovered ${models.length} free models`);
 
+  // Only the drills that talk to upstream need the gate to be open.
+  const LIVE = new Set(["version-floor", "legacy-shape", "empty-tools", "session-shape"]);
+  const liveWanted = drills.filter((d) => LIVE.has(d));
+  let gateOpen = true;
+  if (liveWanted.length > 0) {
+    const probe = await probeUpstream(identity);
+    gateOpen = probe.open;
+    console.log(
+      `  upstream control: HTTP ${probe.status} → gate ${gateOpen ? "open" : "CLOSED"}${gateOpen ? "" : ` (${probe.detail})`}`
+    );
+    if (!gateOpen) {
+      console.log(
+        "  live drills skipped: a direct CLI-shaped request was refused, so upstream is not accepting this IP right now."
+      );
+      console.log(
+        "  This is the per-IP allowance, not a bridge fault — rerun later for a live verdict. Offline drills still run."
+      );
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+
   const results = [];
   for (const name of drills) {
+    if (LIVE.has(name) && !gateOpen) {
+      results.push([name, null]); // skipped, not failed
+      continue;
+    }
     const DRILL_FNS = {
       "version-floor": drillVersionFloor,
       "legacy-shape": drillLegacyShape,
@@ -558,6 +745,7 @@ async function main() {
       allowlist: drillAllowlist,
       "retry-endpoint": drillRetryEndpoint,
       "endpoint-move": drillEndpointMove,
+      "gate-heal": drillGateHeal,
     };
     const fn = DRILL_FNS[name];
     // A cached session id from a previous drill would be reused for an
@@ -577,8 +765,15 @@ async function main() {
   server.close();
 
   console.log("\nSummary");
-  for (const [name, ok] of results) console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}`);
-  process.exit(results.every(([, ok]) => ok) ? 0 : 1);
+  for (const [name, ok] of results) {
+    console.log(`  ${ok === null ? "SKIP" : ok ? "PASS" : "FAIL"}  ${name}`);
+  }
+  const failed = results.filter(([, ok]) => ok === false);
+  const skipped = results.filter(([, ok]) => ok === null);
+  if (skipped.length > 0) {
+    console.log(`\n  ${skipped.length} live drill(s) skipped: upstream gate closed for this IP.`);
+  }
+  process.exit(failed.length === 0 ? 0 : 1);
 }
 
 let port = () => 0;

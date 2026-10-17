@@ -59,6 +59,61 @@ upstream no longer needs a bridge release.
   requests alternate between `200` and `403` within seconds on the same host.
   The error is surfaced verbatim instead of pointing at `install.sh`.
 
+### Audit: three more silent failures, found and fixed
+
+A review of the layers that were still assumed rather than derived turned up
+three cases where the bridge reported success for something that had failed.
+
+- **An error inside the stream became a fake success.** The gateway can answer
+  `200` and then write `data: {"error":...}` inside the SSE body (measured: a
+  `503` from a model's own backend). A non-streaming client was handed
+  `200` with `content: null` and `finish_reason: "stop"` — indistinguishable
+  from an empty answer. Both lanes now detect the error event: non-stream
+  clients get a real `502` with the upstream message, streaming clients get an
+  SSE `error` event followed by `[DONE]`.
+- **A model-level `410` was treated as an endpoint move.** The `404/410` heal
+  exists for path migrations, but `410` is also what a retired model returns
+  (`{"error":{"type":"ModelDeprecated"}}`). Retrying that at another URL would
+  repeat the same answer, and reading the body twice had also reduced the
+  message to a generic `"Upstream error 410"`. Model-level errors now bypass the
+  endpoint heal and reach the client verbatim.
+- **The free-model list came from a naming convention.** Discovery filtered
+  `/models` by `-free` / `-contributor` / `big-pickle`, so it listed
+  `cat-jam-free`, `step-5-preview-free`, and `muse-spark-1.3-contributor-free`
+  (all deprecated upstream) and missed `nemotron-3-ultra-free` (free and active
+  in the catalog, absent from `/models`). The provider catalog is now the
+  authority: `cost` + `status` + `tool_call` produce a per-model verdict
+  (`free` / `paid` / `deprecated`), and `/models` only contributes ids the
+  catalog does not describe. Same file the CLI loads at boot.
+
+### The gate drill can tell "bridge is wrong" from "IP is throttled"
+
+A live drill stages a shape upstream rejects and asserts the bridge heals it. But
+the gateway refuses a *healthy* request with the same `403 FreeTierError` once the
+caller's allowance is exhausted — measured again here: six requests alternating
+between a byte-exact CLI payload and the bridge's own wire output were refused
+403 across three rounds, both shapes, no exceptions. Without a control, a
+throttled IP reported FAIL for every live drill, and each of those failures
+pushed the cooldown further out.
+
+`npm run drill` now sends one CLI-shaped control request first. If it is refused,
+the four live drills report `SKIP` (with the reason and the status) instead of
+FAIL, the exit code is decided by the offline drills, and no further rejected
+requests are made. A new offline drill `gate-heal` covers what the live drills
+were proving — the *order* of the heal (stale shape → refresh → re-minted id →
+full tool set → retry → 200) — against a deterministic fake gate, so the
+self-heal keeps a proof that does not depend on upstream's mood.
+
+### Aliases derived, not hardcoded
+
+`MODEL_MAP` had drifted the same way: four of its targets were retired models,
+so `step` and `muse-spark` resolved to ids that answer `410`. Shorthand aliases
+now come from the catalog's `family` field (`deepseek` → `deepseek-flash` →
+`deepseek-v4.1-flash-free`), with a prefix fallback for revision names
+(`nemotron-3.5`). The static table keeps only shorthands the catalog cannot
+derive (`mimo-v2.5`, `pickle`), and an entry whose target is deprecated is
+ignored rather than followed.
+
 ### Cross-host validation (m1, different IP)
 
 The adaptive bridge was deployed beside the v1.5.3 bridge on a second host and

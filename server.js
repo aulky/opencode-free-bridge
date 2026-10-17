@@ -268,17 +268,38 @@ async function discoverModels() {
     const json = await res.json();
     const items = json.data || [];
 
-    const freeItems = items
-      .filter((item) => {
-        const id = (item.id || "").toLowerCase();
-        if (id.startsWith("jev-")) return false; // Exclude systemone evaluator models
-        return id.endsWith("-free") || id.includes("-contributor") || id === "big-pickle";
-      })
-      .map((item) => ({
-        id: item.id,
-        object: "model",
-        owned_by: item.owned_by || "opencode",
-      }));
+    // The provider catalog decides what is free — it is the file the CLI reads
+    // at boot, and its `cost`/`status` fields are facts about the plan. The
+    // gateway's /models list only contributes models the catalog does not
+    // describe (a few evaluator entries), because a name is not a price: a
+    // model named `-free` that the catalog marks deprecated must drop out, and
+    // one the catalog marks free must survive /models omitting it.
+    const ownedBy = new Map(items.map((i) => [String(i.id || "").toLowerCase(), i]));
+    const kept = [];
+    const seen = new Set();
+    const keep = (id) => {
+      const lower = String(id).toLowerCase();
+      if (seen.has(lower)) return;
+      seen.add(lower);
+      kept.push(id);
+    };
+
+    for (const id of identity.getFreeModels()) keep(id);
+    for (const item of items) {
+      const id = String(item.id || "");
+      const lower = id.toLowerCase();
+      if (lower.startsWith("jev-")) continue; // systemone evaluator models
+      const verdict = identity.getCatalogVerdict(lower);
+      if (verdict) continue; // the catalog already ruled on this id
+      if (!lower.endsWith("-free") && !lower.includes("-contributor") && lower !== "big-pickle") continue;
+      keep(id);
+    }
+
+    const freeItems = kept.map((id) => ({
+      id,
+      object: "model",
+      owned_by: ownedBy.get(String(id).toLowerCase())?.owned_by || "opencode",
+    }));
 
     if (freeItems.length > 0) {
       activeModels = freeItems;
@@ -298,29 +319,31 @@ async function discoverModels() {
   }
 }
 
-// Internal alias normalizer for common shorthand requests
+// Internal alias normalizer for common shorthand requests.
+//
+// Only shorthands the catalog cannot derive live here: revision numbers
+// ("mimo-v2.5") that are not prefixes of the current id, and conversational
+// names ("pickle"). Family shorthands ("deepseek", "glm", "longcat") come from
+// the catalog instead (`identity.resolveModelAlias`), so a retired revision
+// stops being reachable without editing this table. Entries whose target the
+// catalog marks deprecated have been removed — with them gone the lookup falls
+// through to the derived alias and then to the literal name.
 const MODEL_MAP = {
-  "muse-spark":                 "muse-spark-1.3-contributor-free",
-  "muse-spark-1.3":             "muse-spark-1.3-contributor-free",
-  "muse-spark-1.2":             "muse-spark-1.2-contributor-free",
   "mimo":                       "mimo-v2.6-flash-free",
   "mimo-v2.5":                  "mimo-v2.6-flash-free",
   "mimo-v2.5-free":             "mimo-v2.6-flash-free",
   "mimo-v2.6":                  "mimo-v2.6-flash-free",
   "nemotron":                   "nemotron-3.5-lightning-free",
-  "nemotron-3":                 "nemotron-3.5-lightning-free",
-  "nemotron-3-ultra":           "nemotron-3.5-lightning-free",
-  "nemotron-3-ultra-free":      "nemotron-3.5-lightning-free",
+  "nemotron-3":                 "nemotron-3-ultra-free",
+  "nemotron-3-ultra":           "nemotron-3-ultra-free",
+  "nemotron-3-ultra-free":      "nemotron-3-ultra-free",
   "nemotron-3.5":               "nemotron-3.5-lightning-free",
-  "step":                       "step-5-preview-free",
-  "step-5":                     "step-5-preview-free",
   "deepseek":                   "deepseek-v4.1-flash-free",
   "deepseek-v4":                "deepseek-v4.1-flash-free",
   "deepseek-v4.1":              "deepseek-v4.1-flash-free",
   "big-pickle":                 "big-pickle",
   "pickle":                     "big-pickle",
   "space-bunny":                "space-bunny-free",
-  "cat-jam":                    "cat-jam-free",
   "longcat":                    "longcat-2.5-preview-free",
   "longcat-2.5":                "longcat-2.5-preview-free",
 };
@@ -329,7 +352,22 @@ function normalizeModel(rawModel) {
   if (typeof rawModel !== "string") return "";
   const stripped = rawModel.trim().replace(/^(opencode\/|oc\/|zen\/|9router\/|openai\/)/i, "").trim();
   if (!stripped) return "";
-  return MODEL_MAP[stripped.toLowerCase()] || stripped;
+  // A name that is already a real model id is passed through untouched; only a
+  // shorthand is resolved. The catalog's families are consulted first, so a
+  // revision that retired keeps resolving to a live sibling without a bridge
+  // release; the static table below remains for names the catalog does not
+  // group (and for the case where the catalog has not been read yet).
+  const lower = stripped.toLowerCase();
+  const verdict = identity.getCatalogVerdict(lower);
+  // A live id passes through; a *deprecated* one does not — upstream would
+  // answer 410 ModelDeprecated, so an alias that still points at it must be
+  // allowed to fall through to the live sibling.
+  if (verdict === "free" || verdict === "paid") return stripped;
+  const derived = identity.resolveModelAlias(lower);
+  if (derived) return derived;
+  const mapped = MODEL_MAP[lower];
+  if (mapped && identity.getCatalogVerdict(mapped) !== "deprecated") return mapped;
+  return stripped;
 }
 
 // Protocol routing: tracks which models require /inference/v1/responses vs
@@ -843,6 +881,20 @@ function buildUpstreamHeaders(req, sessionId) {
   };
 }
 
+/**
+ * Upstream can answer HTTP 200 and then report a failure *inside* the stream
+ * (`data: {"error":{...}}`, e.g. "Streaming response failed: [503] ...").
+ * Left unhandled, a non-streaming client is handed a 200 with `content: null`
+ * and `finish_reason: "stop"` — a fake success. Returns the error text when the
+ * event is an error, otherwise null.
+ */
+function extractStreamError(ev) {
+  const err = ev?.error;
+  if (!err) return null;
+  if (typeof err === "string") return err;
+  return err.message || err.type || JSON.stringify(err);
+}
+
 function extractResponsesFinishReason(ev, hasToolCalls) {
   const status = ev?.response?.status;
   const reason = ev?.response?.incomplete_details?.reason;
@@ -1249,15 +1301,33 @@ function handleRequest(req, res) {
         // is otherwise indistinguishable from "this route does not exist", so
         // re-derive from the catalog and retry once, but only when the derived
         // URL actually differs. Replaying the same URL on a 404 would loop.
+        // A body can only be read once. When an earlier branch has already
+        // consumed it, the generic error path below must reuse the text instead
+        // of reading an empty stream and reporting "Upstream error <status>".
+        let consumedErrorText = null;
         if (!upstreamRes.ok && (upstreamRes.status === 404 || upstreamRes.status === 410)) {
           const staleUrl = upstreamUrl;
+          let moveText = "";
           try {
-            await upstreamRes.text();
+            moveText = await upstreamRes.text();
           } catch {}
+          consumedErrorText = moveText;
+          // A 410 can also be about the *model*, not the route
+          // (`{"error":{"type":"ModelDeprecated"}}`). Retrying such a request at
+          // another URL would just repeat the same model-level answer, so the
+          // endpoint heal only applies when the error does not name a model.
+          let moveErrType = "";
+          try {
+            const j = JSON.parse(moveText);
+            moveErrType = j?.error?.type || j?.type || "";
+          } catch {}
+          const modelLevelError = /model(deprecated|unavailable|protocolunsupported)/i.test(
+            moveErrType
+          );
           await identity.refresh({ force: true }).catch(() => null);
           liveEndpoints = resolveEndpoints(targetModel);
           const derivedUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
-          if (derivedUrl && derivedUrl !== staleUrl) {
+          if (!modelLevelError && derivedUrl && derivedUrl !== staleUrl) {
             console.warn(
               `[opencode-free-bridge] Upstream endpoint moved (${upstreamRes.status}): ${staleUrl} → ${derivedUrl}; retrying once`
             );
@@ -1268,6 +1338,9 @@ function handleRequest(req, res) {
               body: JSON.stringify(upstreamBody),
               signal: abortController.signal,
             });
+            // The text above belonged to the response we just replaced. Reading
+            // it for the new response would report the old error verbatim.
+            consumedErrorText = null;
           }
         }
 
@@ -1277,11 +1350,13 @@ function handleRequest(req, res) {
         // The body must therefore be read before the decision — passing empty
         // strings here made this branch unreachable for 403.
         if (!upstreamRes.ok) {
-          let errText = "";
-          try {
-            errText = await upstreamRes.text();
-          } catch {
-            errText = "";
+          let errText = consumedErrorText ?? "";
+          if (consumedErrorText === null) {
+            try {
+              errText = await upstreamRes.text();
+            } catch {
+              errText = "";
+            }
           }
           let errJson = null;
           try {
@@ -1423,6 +1498,21 @@ function handleRequest(req, res) {
               if (!rawJson || rawJson === "[DONE]") return;
               try {
                 const ev = JSON.parse(rawJson);
+                const inStreamError = extractStreamError(ev);
+                if (inStreamError) {
+                  console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${inStreamError}`);
+                  res.write(
+                    `data: ${JSON.stringify({
+                      error: {
+                        message: inStreamError,
+                        type: ev?.error?.type || "upstream_error",
+                        code: 502,
+                      },
+                    })}\n\n`
+                  );
+                  res.write("data: [DONE]\n\n");
+                  return;
+                }
                 if (ev.type === "response.output_text.delta" && ev.delta) {
                   res.write(
                     `data: ${JSON.stringify({
@@ -1557,6 +1647,28 @@ function handleRequest(req, res) {
                 res.write("data: [DONE]\n\n");
                 return;
               }
+              // A mid-stream failure is not a completion. Forward it as an error
+              // event so the client can tell the difference, and stop reading.
+              // The `"error"` substring check keeps the zero-parse fast path
+              // below intact for normal chunks.
+              if (raw.includes('"error"')) try {
+                const maybe = JSON.parse(raw);
+                const streamErr = extractStreamError(maybe);
+                if (streamErr) {
+                  console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${streamErr}`);
+                  res.write(
+                    `data: ${JSON.stringify({
+                      error: {
+                        message: streamErr,
+                        type: maybe?.error?.type || "upstream_error",
+                        code: 502,
+                      },
+                    })}\n\n`
+                  );
+                  res.write("data: [DONE]\n\n");
+                  return;
+                }
+              } catch {}
               // Zero-parse fast path: when no client tools are aliased and the chunk
               // carries no `"reasoning":` field to normalize, forward raw SSE bytes directly.
               if (!hasAliases && !raw.includes('"reasoning"')) {
@@ -1596,6 +1708,7 @@ function handleRequest(req, res) {
         const nonStreamToolMap = new Map();
         let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
         let upstreamFinishReason = null;
+        let streamError = null;
 
         const handleNonStreamLine = (line) => {
           if (!line.startsWith("data: ")) return;
@@ -1604,6 +1717,15 @@ function handleRequest(req, res) {
 
           try {
             const ev = JSON.parse(rawJson);
+
+            // A 200 followed by an in-stream error is a failure, not an empty
+            // completion. Without this the client would receive content: null
+            // with finish_reason "stop".
+            const inStreamError = extractStreamError(ev);
+            if (inStreamError) {
+              streamError = inStreamError;
+              return;
+            }
 
             if (useResponses) {
               if (ev.type === "response.output_text.delta" && ev.delta) {
@@ -1701,6 +1823,16 @@ function handleRequest(req, res) {
         };
 
         await consumeSseLines(reader, decoder, handleNonStreamLine);
+
+        if (streamError) {
+          console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${streamError}`);
+          res.writeHead(502, { "Content-Type": "application/json" });
+          return res.end(
+            JSON.stringify({
+              error: { message: streamError, type: "upstream_error", code: 502 },
+            })
+          );
+        }
 
         const validToolCalls = toolCalls.filter(Boolean);
         const messageObj = { role: "assistant", content: assistantText || null };
@@ -1873,6 +2005,7 @@ module.exports = {
   resolveEndpoints,
   buildUpstreamHeaders,
   extractResponsesFinishReason,
+  extractStreamError,
   getPersistentSessionId,
   discoverModels,
   handleRequest,

@@ -19,6 +19,8 @@ const {
   readRequestBody,
   server,
   identity,
+  discoverModels,
+  __getDiscoveryState,
 } = require("../server");
 function sseStreamFromLines(lines) {
   const encoder = new TextEncoder();
@@ -90,7 +92,12 @@ describe("server unit & integration tests", () => {
     assert.equal(normalizeModel("oc/"), "");
     assert.equal(normalizeModel("zen/mimo"), "mimo-v2.6-flash-free");
     assert.equal(normalizeModel("opencode/longcat"), "longcat-2.5-preview-free");
-    assert.equal(normalizeModel("cat-jam"), "cat-jam-free");
+    // `cat-jam` used to map to `cat-jam-free`. The catalog now marks that model
+    // deprecated, so the alias no longer resolves to it: sending a retired id
+    // would only earn a 410 from upstream. The shorthand falls through to the
+    // literal name, and the caller gets a truthful "model unavailable".
+    assert.equal(normalizeModel("cat-jam"), "cat-jam");
+    assert.notEqual(normalizeModel("muse-spark"), "muse-spark-1.3-contributor-free");
   });
 
   it("createId never overflows the 12-bit counter into timestamp bits and keeps counter <= 16", () => {
@@ -475,6 +482,93 @@ describe("server unit & integration tests", () => {
       assert.equal(evilRes.headers["access-control-allow-origin"], undefined);
     });
 
+    it("lets the catalog, not the model's name, decide what is free", async () => {
+      // The gateway's /models list is not the authority: it can still list a
+      // model the catalog marks deprecated, and it can omit one the catalog
+      // calls free. Naming (`-free`) is a convention, not a price.
+      const realGetFree = identity.getFreeModels;
+      const realVerdict = identity.getCatalogVerdict;
+      identity.getFreeModels = () => ["glm-5.3-flash-free", "nemotron-3-ultra-free"];
+      identity.getCatalogVerdict = (id) => {
+        const lower = String(id).toLowerCase();
+        if (lower === "glm-5.3-flash-free") return "free";
+        if (lower === "nemotron-3-ultra-free") return "free";
+        if (lower === "cat-jam-free") return "deprecated";
+        return undefined;
+      };
+      mockFetchImpl = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [
+            { id: "cat-jam-free" },        // catalog: deprecated → must drop
+            { id: "glm-5.3-flash-free" },  // catalog: free → keep
+            { id: "jev-1.13-free" },       // evaluator → never listed
+            { id: "some-new-free" },       // unknown to catalog → keep
+          ],
+        }),
+      });
+
+      try {
+        await discoverModels();
+        const ids = __getDiscoveryState().activeModels.map((m) => m.id);
+        assert.ok(ids.includes("glm-5.3-flash-free"));
+        assert.ok(ids.includes("nemotron-3-ultra-free"), "catalog-free survives /models omitting it");
+        assert.ok(ids.includes("some-new-free"), "an id the catalog does not describe keeps the name heuristic");
+        assert.ok(!ids.includes("cat-jam-free"), "a deprecated model drops even though /models lists it");
+        assert.ok(!ids.includes("jev-1.13-free"));
+      } finally {
+        identity.getFreeModels = realGetFree;
+        identity.getCatalogVerdict = realVerdict;
+      }
+    });
+
+    it("turns an in-stream error into a real error, not an empty 200 (non-stream client)", async () => {
+      // Measured upstream behaviour: the gateway answers HTTP 200 and then
+      // writes `data: {"error":...}` inside the stream (e.g. a 503 from the
+      // model's own backend). Forwarding that as-is handed a non-streaming
+      // client a 200 with content:null and finish_reason "stop" — a fake
+      // success. The client must see a failure.
+      mockFetchImpl = async () => ({
+        ok: true,
+        status: 200,
+        body: sseStreamFromLines([
+          'data: {"error":{"type":"server_error","message":"Streaming response failed: [503] Upstream unavailable"}}\n\n',
+        ]),
+      });
+
+      const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+        stream: false,
+      });
+
+      assert.equal(res.status, 502);
+      assert.match(res.body.error.message, /503/);
+      assert.equal(res.body.choices, undefined, "no fake completion may be returned");
+    });
+
+    it("forwards an in-stream error as an SSE error event (streaming client)", async () => {
+      mockFetchImpl = async () => ({
+        ok: true,
+        status: 200,
+        body: sseStreamFromLines([
+          'data: {"error":{"type":"server_error","message":"Streaming response failed: [503] Upstream unavailable"}}\n\n',
+        ]),
+      });
+
+      const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      });
+
+      assert.equal(res.status, 200);
+      assert.match(res.raw, /"error"/);
+      assert.match(res.raw, /503/);
+      assert.match(res.raw, /\[DONE\]/);
+    });
+
     it("re-derives the endpoint and retries once when the path moves (404)", async () => {
       // A path migration upstream surfaces as a 404 at the old URL, not as a
       // gate rejection. The catalog is the authority for the base URL, so the
@@ -527,6 +621,39 @@ describe("server unit & integration tests", () => {
         identity.getEndpoints = realGetEndpoints;
         identity.__reset();
         identity.__setLastCheckTime(Date.now());
+      }
+    });
+
+    it("surfaces a model-level 410 verbatim instead of retrying it as an endpoint move", async () => {
+      // A 410 can name the model (`ModelDeprecated`), not the route. Retrying at
+      // another URL would repeat the same answer, and the original message must
+      // reach the client rather than a generic "Upstream error 410".
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        return {
+          ok: false,
+          status: 410,
+          text: async () =>
+            JSON.stringify({
+              type: "error",
+              error: { type: "ModelDeprecated", message: "Model x has been deprecated." },
+            }),
+        };
+      };
+      const realRefresh = identity.refresh;
+      identity.refresh = async () => ({ updated: true, changed: ["chatUrl"] });
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(res.status, 410);
+        assert.equal(calls, 1, "a model-level 410 must not be retried");
+        assert.match(res.body.error.message, /has been deprecated/);
+        assert.equal(res.body.error.type, "ModelDeprecated");
+      } finally {
+        identity.refresh = realRefresh;
       }
     });
 

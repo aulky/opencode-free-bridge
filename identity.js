@@ -181,6 +181,13 @@ let toolProfileVersion = DEFAULT_RECIPE.version;
 let toolNames = [];
 // Per-model route overrides from the provider catalog (model id -> base URL).
 let modelEndpoints = {};
+// Free-tier model ids derived from the provider catalog (zero cost, not
+// deprecated). Empty until the first successful catalog read.
+let freeModels = [];
+// id → "free" | "paid" | "deprecated", straight from the provider catalog.
+let catalogVerdicts = {};
+// catalog family → a free model id in that family (e.g. "nemotron-free").
+let modelFamilies = {};
 let lastRelease = null;
 let lastAvailable = null;
 let lastCheckTime = 0;
@@ -506,6 +513,45 @@ async function extractCatalog() {
     if (base !== api) overrides[id.toLowerCase()] = base;
   }
   if (Object.keys(overrides).length > 0) out.modelEndpoints = overrides;
+
+  // The free-tier list is a catalog fact, not a naming convention. Deriving it
+  // from `cost` + `status` is what the CLI itself does (models-dev.ts maps
+  // `status ?? "active"` and keeps zero-cost models), so a model that stops
+  // being free or gets deprecated drops out without a bridge release — and one
+  // that is free but missing from the gateway's /models is not lost.
+  //
+  // `catalogVerdicts` records every model the catalog describes, so a caller
+  // can tell "the catalog says this one is paid/deprecated" apart from "the
+  // catalog does not know this id at all" (the gateway lists a few evaluator
+  // models the catalog omits).
+  const freeModels = [];
+  const verdicts = {};
+  for (const [id, m] of Object.entries(oc?.models || {})) {
+    const zeroCost = Number(m?.cost?.input) === 0 && Number(m?.cost?.output) === 0;
+    const deprecated = m?.status === "deprecated";
+    const usable = m?.tool_call !== false;
+    const key = id.toLowerCase();
+    verdicts[key] = deprecated ? "deprecated" : zeroCost && usable ? "free" : "paid";
+    if (verdicts[key] === "free") freeModels.push(id);
+  }
+  if (freeModels.length > 0) out.freeModels = freeModels;
+  if (Object.keys(verdicts).length > 0) out.catalogVerdicts = verdicts;
+
+  // Shorthand aliases, derived from the catalog's own `family` field instead of
+  // a hand-maintained table. `family` groups revisions of one model
+  // (`nemotron-free`, `deepseek-flash`), so the newest non-deprecated free
+  // member answers the family name — and when a revision is retired the alias
+  // follows automatically. An explicit table still wins for names that are not
+  // family-shaped (`mimo`, `pickle`).
+  const families = {};
+  for (const [id, m] of Object.entries(oc?.models || {})) {
+    if (verdicts[id.toLowerCase()] !== "free") continue;
+    const family = typeof m?.family === "string" ? m.family.trim().toLowerCase() : "";
+    if (!family) continue;
+    if (!families[family]) families[family] = id;
+  }
+  if (Object.keys(families).length > 0) out.modelFamilies = families;
+
   return out;
 }
 
@@ -705,6 +751,38 @@ function applyRecipe(update = {}, tag = null) {
 
   if (Array.isArray(update.optionalHeaders)) {
     optionalHeaders = update.optionalHeaders.map(String);
+  }
+
+  if (Array.isArray(update.freeModels) && update.freeModels.length > 0) {
+    const incoming = update.freeModels.map(String).filter((n) => /^[A-Za-z0-9._:-]+$/.test(n));
+    if (incoming.length > 0 && stableStringify(incoming) !== stableStringify(freeModels)) {
+      freeModels = incoming;
+      changed.push("freeModels");
+    }
+  }
+
+  if (update.modelFamilies && typeof update.modelFamilies === "object") {
+    const next = {};
+    for (const [family, id] of Object.entries(update.modelFamilies)) {
+      if (typeof id === "string" && /^[A-Za-z0-9._:-]+$/.test(id)) {
+        next[String(family).toLowerCase()] = id;
+      }
+    }
+    if (Object.keys(next).length > 0 && stableStringify(next) !== stableStringify(modelFamilies)) {
+      modelFamilies = next;
+      changed.push("modelFamilies");
+    }
+  }
+
+  if (update.catalogVerdicts && typeof update.catalogVerdicts === "object") {
+    const next = {};
+    for (const [id, v] of Object.entries(update.catalogVerdicts)) {
+      if (v === "free" || v === "paid" || v === "deprecated") next[String(id).toLowerCase()] = v;
+    }
+    if (Object.keys(next).length > 0 && stableStringify(next) !== stableStringify(catalogVerdicts)) {
+      catalogVerdicts = next;
+      changed.push("catalogVerdicts");
+    }
   }
 
   if (update.modelEndpoints && typeof update.modelEndpoints === "object") {
@@ -992,6 +1070,52 @@ function getToolNames() {
  * upstream provider catalog at refresh time; `server.js` reads these per
  * request, so an endpoint migration applies without a restart.
  */
+/**
+ * Free-tier model ids derived from the provider catalog. Empty means the
+ * catalog has not been read yet — callers keep their own list in that case
+ * rather than treating "unknown" as "none are free".
+ */
+function getFreeModels() {
+  return freeModels.slice();
+}
+
+/** Catalog-derived shorthand: a family name (or a prefix of a free model id)
+ *  mapped to a live free model. Returns undefined when nothing matches. */
+function resolveModelAlias(name) {
+  const key = String(name || "").toLowerCase().trim();
+  if (!key) return undefined;
+  if (modelFamilies[key]) return modelFamilies[key];
+  // Prefix form: "nemotron" for family "nemotron-free", "nemotron-3" for the
+  // model id `nemotron-3-ultra-free`. Longest match wins so a short prefix does
+  // not shadow a more specific one.
+  let best;
+  for (const [family, id] of Object.entries(modelFamilies)) {
+    const matches =
+      key === family ||
+      key === family.replace(/-free$/, "") ||
+      family.startsWith(`${key}-`) ||
+      id.toLowerCase().startsWith(`${key}-`) ||
+      id.toLowerCase().startsWith(key);
+    if (!matches) continue;
+    if (!best || family.length > best.family.length) best = { family, id };
+  }
+  if (best) return best.id;
+  // Revision-prefix form ("nemotron-3.5" for `nemotron-3.5-lightning-free`):
+  // the family map keeps one representative, so fall back to the free list and
+  // take the most specific (longest) prefix match, ties broken lexicographically
+  // so the choice is stable across runs.
+  const candidates = freeModels
+    .filter((id) => id.toLowerCase().startsWith(`${key}-`) || id.toLowerCase().startsWith(key))
+    .sort((a, b) => a.length - b.length || a.localeCompare(b));
+  return candidates[0];
+}
+
+/** The catalog's verdict for one model id: "free", "paid", "deprecated", or
+ *  undefined when the catalog does not describe it. */
+function getCatalogVerdict(modelId) {
+  return catalogVerdicts[String(modelId || "").toLowerCase()];
+}
+
 function getEndpoints(modelId = null) {
   const base = {
     chatUrl: recipe.chatUrl,
@@ -1158,6 +1282,9 @@ function getState() {
     optionalHeaders: optionalHeaders.slice(),
     unsentHeaders: getUnsentHeaders(),
     toolNames: getToolNames(),
+    freeModels: freeModels.slice(),
+    catalogVerdicts: { ...catalogVerdicts },
+    modelFamilies: { ...modelFamilies },
     endpoints: getEndpoints(),
     inFlight: Boolean(refreshInFlight),
     tools: {
@@ -1175,6 +1302,9 @@ function __reset() {
   toolProfileVersion = DEFAULT_RECIPE.version;
   toolNames = [];
   modelEndpoints = {};
+  freeModels = [];
+  catalogVerdicts = {};
+  modelFamilies = {};
   lastRelease = null;
   lastAvailable = null;
   lastCheckTime = 0;
@@ -1231,6 +1361,9 @@ module.exports = {
   getHeaderNames,
   getUnsentHeaders,
   getToolNames,
+  getFreeModels,
+  getCatalogVerdict,
+  resolveModelAlias,
   getEndpoints,
   buildGateHeaders,
   getSessionPrefix,

@@ -7,7 +7,7 @@ Exposes a local `/v1/chat/completions` endpoint that any OpenAI-compatible clien
 ## Features
 
 - **Self-healing client identity** — the free tier only serves requests from the OpenCode client, and that check keeps moving. The bridge derives its mask from OpenCode's public source at the current release tag, re-checks lazily on request, and heals itself when upstream rejects it. No manual update when the gate moves.
-- **Automatic model discovery** — the free-model list is fetched from the upstream gateway at startup and refreshed hourly. New models appear without a code change; retired ones disappear.
+- **Automatic model discovery** — the free-model list is derived from the same provider catalog the CLI loads at boot (`cost` + `status`), refreshed hourly, with the gateway's `/models` list filling in ids the catalog does not describe. New models appear without a code change; retired ones disappear.
 - **Dual-protocol routing** — Meta Muse models are routed to the Responses API, everything else to Chat Completions.
 - **Reasoning-aware token budgeting** — reasoning tokens count against the output budget. The bridge enforces a floor so short requests still return content instead of an empty response.
 - **Reasoning content support** — thinking models preserve their reasoning in `reasoning_content` for both streaming and non-streaming clients.
@@ -49,12 +49,20 @@ The bridge listens on `http://127.0.0.1:20129` by default.
 npm test                # offline unit & HTTP contract tests (no network)
 node verify.js          # live check: every model, real prompt
 node verify.js --quick  # live check: one short probe per model
-npm run drill           # live gate drill: prove the self-heal actually heals
+npm run drill           # gate drill: prove the self-heal actually heals
 ```
 
 `npm run drill` deliberately starts the bridge in a state upstream rejects, sends
 one request, and checks the client still gets an answer. It is the only test
-that exercises the gate path against the real service:
+that exercises the gate path against the real service.
+
+Before the live drills it sends one **control** request shaped the way the real
+CLI shapes it. The gateway refuses a healthy request with the same `403
+FreeTierError` when the caller's allowance is exhausted (measured: byte-identical
+CLI requests alternate 200/403 within seconds), so without a control a throttled
+IP reports FAIL for every live drill and each failure pushes the cooldown
+further out. If the control is refused, the live drills report `SKIP` with the
+reason; the offline drills still run and still decide the exit code:
 
 | Drill | What it stages | What it proves |
 |---|---|---|
@@ -63,6 +71,7 @@ that exercises the gate path against the real service:
 | `session-shape` | a session-id prefix upstream does not recognise | `403 FreeTierError` → recipe re-derived → **fresh** id minted → stale id evicted from cache |
 | `legacy-shape` | the pre-1.5.0 access pattern (control) | the old shape is *accepted* — the gate is not about the endpoint or version string |
 | `endpoint-move` | a chat URL whose path no longer routes (404) | the catalog is re-read, the derived URL is retried once, and the client never sees the 404 |
+| `gate-heal` | a fake gate that refuses the staged shape (offline) | the order of the heal: stale shape → refresh → re-minted id → full tool set → retry → 200 |
 | `routing` | a chat URL repointed *after* boot | the endpoint is read per request, not frozen at startup |
 | `allowlist` | a tool renamed in the release's sources | the derived name reaches the wire in `full` scope and the retired name is dropped |
 | `retry-endpoint` | a gate rejection plus a catalog move | the self-heal retry lands on the refreshed endpoint |
@@ -453,6 +462,8 @@ either way the wire shape could never converge on what the release ships.
 | header names | yes (`model-request.ts`) | followed; unknown values reported in `unsentHeaders` |
 | `read` / `shell` schemas and names | yes (`read.ts`, `shell.ts`) | followed; the set replaces the old one |
 | inference endpoint | yes — provider catalog (`models.opencode.ai/api.json`) | followed on refresh; a `404` at the stale path triggers a re-derive + one retry |
+| free-model list | yes — catalog `cost` / `status` / `tool_call` | a model that stops being free or is deprecated drops out; `/models` only adds ids the catalog omits |
+| shorthand aliases (`deepseek`, `glm`, …) | yes — catalog `family` | follows the family to a live free model; a retired revision stops being reachable |
 | header *values* | **no** — mapping in `buildGateHeaders` | must be added in code |
 | tool *parameter* semantics | partly — types/minimums/descriptions derived | a brand-new field type falls back to `string` |
 
