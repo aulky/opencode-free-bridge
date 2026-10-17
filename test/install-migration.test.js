@@ -95,6 +95,16 @@ test("installer finds bun installed outside PATH", () => {
   assert.match(src, /\.bun\/bin\/bun/, "installer must look in ~/.bun/bin");
 });
 
+test("installer parses staged files instead of running bun --check", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // `bun --check` is not a flag Bun supports. Bun treats the argument as an
+  // entrypoint and runs it, which started a server mid-install and made every
+  // upgrade fail its "syntax check".
+  assert.doesNotMatch(src, /\$RUNTIME" --check/, "installer must not use bun --check");
+  assert.match(src, /new Function\(src\)/, "installer must parse without executing");
+});
+
 test("installer stages and validates downloads before stopping the old bridge", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");

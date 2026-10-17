@@ -243,8 +243,21 @@ fetch transport-fingerprint.js
 fetch transport-baseline.json
 
 # A syntactically broken release must never replace a working install.
+#
+# `bun --check` does NOT mean "parse only": Bun has no --check flag, so it
+# treats the file as the entrypoint and *runs* it. That started a second server
+# during an install and, worse, made every upgrade abort with "failed a syntax
+# check". Parse the source instead: new Function compiles without executing.
+syntax_check() {
+  "$RUNTIME" -e '
+    const fs = require("fs");
+    const src = fs.readFileSync(process.argv[1], "utf8").replace(/^#!.*\n/, "");
+    try { new Function(src); } catch (err) { console.error(err.message); process.exit(1); }
+  ' "$1"
+}
+
 for js in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js; do
-  "$RUNTIME" --check "$STAGE/$js" >/dev/null 2>&1 || die "$js failed a syntax check; the running bridge was left untouched"
+  syntax_check "$STAGE/$js" >/dev/null 2>&1 || die "$js failed a syntax check; the running bridge was left untouched"
 done
 "$RUNTIME" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$STAGE/package.json" \
   || die "package.json is not valid JSON; the running bridge was left untouched"
