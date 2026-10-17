@@ -2,109 +2,76 @@
 
 ## [2.0.0] — 2026-10-17
 
-### Adaptive identity — the bridge follows the gate instead of chasing it
+### Lean adaptive identity — handshake + source derivation in a single module
 
-v1.6.0 made the *headers* self-healing but left the tool definitions hardcoded.
-That was the wrong place to stop: the `tools` array is the layer upstream moves
-most often (9router#4837: headers → +tools → exact schemas → endpoint, all within
-three days). This release removes the last hardcoded assumption and adds a
-four-tier resolution chain.
+v1.6.0 made the *headers* self-healing from the Atom feed, but left the tool
+definitions static. v2.0.0 unifies release resolution, `reactive`/`always` update
+modes, and source-derived tool schemas into `identity.js` without any external
+dependencies or background bloat.
 
-**The version handshake is the real contract.** The CLI does not read the GitHub
-release feed to decide what is current — it asks a purpose-built endpoint:
+- **Authoritative update handshake (`identity.resolveRelease`)**: Queries
+  `GET https://opencode.ai/update/api/<channel>/cli/npm?current=<version>` to
+  obtain `version`, `metadata.github.sha`, and `minimum`, with automatic fallback
+  to the GitHub `releases.atom` feed. Removes the hardcoded `2.` major filter.
+- **`UPDATE_MODE` (`reactive` default, `always` opt-in)**: In `reactive` mode,
+  the bridge only switches versions and fetches source when upstream rejects a
+  request (`403 FreeTierError` / `426 UpgradeRequired`) or flags `minimum: true`,
+  replaying the rejected request once transparently. In `always` mode, it follows
+  every new release lazily when `IDENTITY_TTL_MS` expires.
+- **Source-derived recipe & tool schemas (`identity.extractRecipe`)**: Reads
+  `identifier.ts`, `session-id.ts`, `app.ts`, `model-request.ts`, `read.ts`, and
+  `shell.ts` at the immutable release commit SHA to keep the session-id format,
+  User-Agent, headers, and `read`/`shell` tool fingerprint schemas in sync.
+- **Pooled CSPRNG session IDs**: Preserves the zero-allocation `crypto.randomFillSync`
+  buffer pool inside `identity.createId` (10,000 IDs in <15ms).
+- **Clean `/health` inspection**: Reports `identity.userAgent`, `updateMode`,
+  `sourceTag`, `versionFloor`, `release`, `available`, `headers`,
+  `optionalHeaders`, `unsentHeaders`, and `tools` status.
+- **Gate path fixes found by the live drill**:
+  - A gate rejection is now identified from the error **body** (`type`/`message`)
+    rather than the status line. The old check passed empty strings, so the
+    self-heal branch was unreachable for `403 FreeTierError` — only `426`
+    (which matches on status alone) ever healed.
+  - An empty tool profile no longer wins over the shipped fallback: `{}` is
+    truthy, so the bridge used to send `tools: []` and get `403`.
+  - The header set is derived from upstream's request builder and actually sent;
+    conditional headers (parent-session lineage) are separated so their absence
+    is not reported as a gap.
+  - The periodic CLI poll (`recheck`) no longer forces adoption, so `reactive`
+    really is reactive.
+  - The retry after a gate rejection now **re-mints the session id**. The id is
+    derived from the recipe, so one minted before the refresh encodes the shape
+    that was just rejected; replaying it failed identically. The stale id is also
+    evicted from the session cache, otherwise every later request from that
+    client would reuse it and stay stuck at 403.
+- **`gate-drill.js` (`npm run drill`)**: live, unmocked proof of the self-heal —
+  stages a rejected identity, sends one request, asserts the client gets a real
+  answer. Four drills: `version-floor` (426), `empty-tools` (403), `session-shape`
+  (the `FreeTierError` above) and `legacy-shape` as a control.
 
-```
-GET https://opencode.ai/update/api/latest/cli/npm?current=<version>
-→ { version, active, minimum, metadata: { github: { sha } } }
-```
+### What the free-tier gate actually checks (measured)
 
-`metadata.github.sha` is the commit the release was built from. A tag can be
-moved; a commit cannot, so source is now read at the SHA. `minimum: true` is
-upstream saying the floor has moved — adopted immediately in every update mode.
+| Condition | Result |
+|---|---|
+| `ses_` + 12 lowercase hex + 14 base62 (30 chars) | accepted |
+| prefix without `_`, uppercase hex, other lengths, counter `>= 64` | `403 FreeTierError` |
+| no `tools` in the request body | `403 FreeTierError` |
+| User-Agent below 1.18.0 | `426 UpgradeRequired` |
+| `/zen/v1` endpoint, old ai-sdk User-Agent, old tool *names* | accepted — **not** checked |
 
-**`handshake.js` (new).** Resolves the authoritative release: version, commit
-SHA, and the `minimum` flag. Falls back to the Atom feed when the update service
-is unreachable, and reports the degradation (`source: "atom-feed"`, `sha: null`)
-rather than pretending the result is equivalent. Never throws — a total failure
-returns the last known-good record marked `stale`.
+The pre-1.5.0 access pattern therefore still works today. The gate is about the
+session id shape, the presence of tools, and the version floor — not the endpoint
+or the version string in the User-Agent.
 
-**`artifact.js` (new).** Reads the tool definitions from the published
-`@opencode/core` package, which ships the compiled bundle with
-`// src/tool/plugin/<name>.ts` markers and literal `description:` strings. This
-avoids re-implementing Effect's `Schema.toJsonSchemaDocument` / `$defs` inlining
-/ `allOf` flattening — the package has already done it. A minimal tar reader
-(gzip + ustar, no dependencies) plus a brace-aware JS scanner resolves:
+**Tool profiles now replace instead of merge, and are sent whole.** A hardcoded
+core-name filter would record a renamed tool from source but keep sending the old
+name, and a merge would never drop a removed tool. Either way the wire shape
+could not converge on the release.
 
-- tool-level descriptions, including builders like `(shell) => [...]` whose
-  `${OS}` / `${shell}` holes are evaluated for the Linux+bash context the gate
-  is calibrated on;
-- parameter schemas, including fields inherited from another chunk
-  (`PageInput2.fields.offset`), which is what makes `offset`/`limit` come out as
-  optional integers rather than required unknowns;
-- one level of variable aliasing (`var Input9 = LocationInput`).
-
-Verified byte-identical to the previously hardcoded `read` and `shell`
-definitions, which is how the extractor was validated.
-
-**`capture.js` (new).** Records what a real CLI actually sends, by starting a
-loopback server that speaks enough OpenAI protocol to satisfy it and pointing an
-isolated CLI at it via `OPENCODE_CONFIG`. The recording is ground truth: no
-inference, and a direct answer to "what changed?" when diffed against the
-previous capture. Exposed as `POST /capture`; the user's own config is never
-touched and no traffic leaves the machine. Prefers the npm CLI on `PATH` — the
-standalone v2 binary resolves models differently and rejects a config-only
-provider.
-
-**`probe.js` (new).** Differential diagnosis for a rejection the derived profile
-does not explain. Off unless `PROBE_ENABLED=1`, capped at `PROBE_MAX_ATTEMPTS`
-(default 6), and silent for `PROBE_COOLDOWN_MS` (default 15 min) after a failed
-batch — because upstream applies a per-IP cooldown after a burst of failures,
-which masks the real error. Each attempt changes exactly one dimension against
-the last known-good baseline, so a success names its own cause.
-
-**`identity.js` — rewritten resolution.** Version now comes from the handshake
-rather than the feed, and the `versions.find(v => v.startsWith("2."))` filter is
-gone. That filter was a time bomb: the day opencode shipped 3.0.0 it would match
-nothing, the fallback would keep the newest 2.x, and the bridge would freeze one
-major version behind with no error. `UPDATE_MODE` (`reactive` default,
-`always` opt-in) decides how eagerly a new release is adopted. Tool profiles are
-resolved through `capture → artifact → default` and reloaded on every gate
-rejection, since that layer can move without a version bump.
-
-**`server.js` — no hardcoded tool definitions.** `FINGERPRINT_TOOL_DEFINITIONS`
-and the frozen `CANONICAL_TOOLS_*` arrays are gone; the fingerprint is resolved
-per request from the live profile, so an update takes effect on the next request
-without a restart. A gate retry now rebuilds the request body as well as the
-headers, and the probe is wired in after the normal self-heal fails. The
-exports `FINGERPRINT_TOOL_NAMES` / `FINGERPRINT_TOOL_DEFINITIONS` /
-`CANONICAL_TOOLS_CHAT` / `CANONICAL_TOOLS_RESPONSES` remain as live getters for
-backwards compatibility.
-
-**Token cost of a capture.** A capture carries everything the CLI sends — about
-ten definitions, ~20 KB of JSON — and every one of those bytes is billed as
-prompt tokens on every request. The gate only fingerprints a small core, so
-`TOOL_PROFILE_SCOPE=core` (default) sends just `read` plus whichever of
-`shell`/`bash` the profile provides. Measured on a live request: 5224 → 1885
-prompt tokens, same answer. `TOOL_PROFILE_SCOPE=full` restores the complete set
-if a gate ever requires a tool outside the core.
-
-**Observability.** `/health` now reports `update.release` (version, SHA, source,
-`minimum`), `tools` (source, version, tool names, error), `probe` (enabled,
-cooldown) and `capture` (available, path, captured tool names). `/profile`
-returns the exact tool definitions on the wire.
-
-**Tests.** 105 total (was 61): new suites for handshake, artifact extraction,
-capture normalisation and probe safety. `npm test` remains offline — the
-artifact suite builds real tar bytes in memory rather than downloading.
-
-### Behaviour notes
-
-- `refreshCliVersion()` still exists and still delegates to `identity.refresh`.
-- Steady state costs one handshake request per `IDENTITY_TTL_MS`; the 1.3 MB
-  package is fetched once per version and cached in
-  `~/.opencode-free-bridge/cache`.
-- A `tools.source` of `default` in `/health` means both real sources failed; the
-  bridge keeps working on the shipped definitions but is not adapting.
+**What is not derived:** the inference endpoint (it lives in the CLI's model
+routing config, not the files read here — overridable via `OPENCODE_CHAT_URL` /
+`OPENCODE_RESPONSES_URL`) and header *values* (the name-to-value mapping is code).
+Both are reported rather than silently assumed.
 
 ## [1.6.0] — 2026-10-17
 

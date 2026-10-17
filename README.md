@@ -49,7 +49,19 @@ The bridge listens on `http://127.0.0.1:20129` by default.
 npm test                # offline unit & HTTP contract tests (no network)
 node verify.js          # live check: every model, real prompt
 node verify.js --quick  # live check: one short probe per model
+npm run drill           # live gate drill: prove the self-heal actually heals
 ```
+
+`npm run drill` deliberately starts the bridge in a state upstream rejects, sends
+one request, and checks the client still gets an answer. It is the only test
+that exercises the gate path against the real service:
+
+| Drill | What it stages | What it proves |
+|---|---|---|
+| `version-floor` | a User-Agent below the advertised floor | `426 UpgradeRequired` → floor learned → identity refreshed → request replayed |
+| `empty-tools` | a tool profile that resolves to nothing | the bridge falls back to the shipped fingerprint instead of sending `tools: []` |
+| `session-shape` | a session-id prefix upstream does not recognise | `403 FreeTierError` → recipe re-derived → **fresh** id minted → stale id evicted from cache |
+| `legacy-shape` | the pre-1.5.0 access pattern (control) | the old shape is *accepted* — the gate is not about the endpoint or version string |
 
 ```
   OK  bridge v1.5.0, 9 free models discovered
@@ -224,17 +236,10 @@ Then register `http://127.0.0.1:20130/v1` as an additional connection.
 | `MAX_BODY_BYTES` | `10485760` | Maximum request payload size in bytes (10 MiB) |
 | `IDENTITY_TTL_MS` | `900000` | How long the derived client identity is trusted before a request triggers a background re-check (15 min). No timer — an idle bridge makes no network calls. |
 | `UPDATE_MODE` | `reactive` | `reactive` moves only on a gate rejection or `minimum: true`; `always` follows every release. |
-| `TOOL_PROFILE_TTL_MS` | `21600000` | How long an extracted tool profile is trusted (6 h). |
-| `TOOL_PROFILE_SCOPE` | `core` | `core` sends only the fingerprinted tools (`read` + `shell`/`bash`); `full` sends the whole profile exactly as a CLI would. `core` saves ~15 KB of prompt tokens per request. |
 | `OPENCODE_CHANNEL` | `latest` | Update channel to follow (`latest`, `beta`, `dev`). |
 | `OPENCODE_MAJOR` | _(none)_ | Pin a major version line, e.g. `2`. Unset follows the newest release of any major. |
 | `OPENCODE_USER_AGENT` | _(derived)_ | Pin the client user-agent and disable identity derivation entirely. |
 | `OPENCODE_SOURCE_BASE` | GitHub raw | Override where the identity recipe is read from. |
-| `OPENCODE_BRIDGE_CACHE` | `~/.opencode-free-bridge/cache` | Where extracted tool profiles and CLI captures are stored. |
-| `OPENCODE_BIN` | first `opencode` on `PATH` | CLI binary used by `/capture`. |
-| `PROBE_ENABLED` | `0` | Enable differential probing after an unexplained rejection. |
-| `PROBE_MAX_ATTEMPTS` | `6` | Hard cap on probe requests per batch. |
-| `PROBE_COOLDOWN_MS` | `900000` | Silence period after a failed probe batch (15 min). |
 
 ## Client identity
 
@@ -243,16 +248,16 @@ check is a moving target. It has changed repeatedly — endpoint, headers, reque
 body, exact tool schemas, minimum client version — and the changes have arrived
 within hours of each other (see [9router#4837](https://github.com/decolua/9router/issues/4837)).
 
-Hardcoding the mask means a code change every time. The bridge instead resolves
-it from the same sources the CLI itself uses, in four tiers of increasing
-fidelity:
+Hardcoding the mask means a code change every time. Instead, `identity.js` resolves
+it directly from the same sources the CLI itself uses:
 
-| Tier | Source | What it gives | Cost |
-|---|---|---|---|
-| 1 | **Update handshake** — `opencode.ai/update/api/latest/cli/npm` | authoritative version + **commit SHA** + `minimum` flag | one small JSON request per TTL |
-| 2 | **Published package** — `@opencode/core` from npm | the exact tool definitions the release ships | 1.3 MB, once per version, cached |
-| 3 | **CLI capture** — `POST /capture` | the literal bytes a real CLI sends | one local CLI run, opt-in |
-| 4 | **Differential probe** — `PROBE_ENABLED=1` | which dimension a rejection was about | ≤6 upstream calls, then a cooldown |
+1. **Update handshake** (`opencode.ai/update/api/latest/cli/npm`) — resolves the
+   authoritative version, exact **commit SHA** (`metadata.github.sha`), and
+   `minimum` flag (with fallback to GitHub's `releases.atom` feed).
+2. **Source derivation at the commit SHA** — extracts the session-id recipe,
+   User-Agent template, required headers, and `read`/`shell` tool fingerprint
+   schemas directly from the lightweight TypeScript source files at that immutable
+   commit, falling back safely to the last known-good definitions.
 
 ### Why the handshake, not the release feed
 
@@ -276,8 +281,8 @@ When it appears, the bridge adopts the release immediately in **both** update
 modes — there is nothing to wait for.
 
 The Atom feed is kept as a fallback for when the update service is unreachable.
-It carries a version but no SHA, so `update.release.source` reads `atom-feed`
-and `update.release.sha` is `null`. That is a degraded mode, not a failure.
+It carries a version but no SHA, so `identity.release.source` reads `atom-feed`
+and `identity.release.sha` is `null`. That is a degraded mode, not a failure.
 
 ### Update modes
 
@@ -289,85 +294,36 @@ and `update.release.sha` is `null`. That is a degraded mode, not a failure.
 Either way, a `426 UpgradeRequired` is handled immediately: the floor named in
 the error is adopted verbatim, even if the handshake is unreachable.
 
-### Tool definitions
+In `reactive` mode a release that has not moved the gate is recorded but not
+adopted — `/health` reports it as `identity.available`. The periodic CLI poll
+(`CLI_VERSION_TTL_MS`, 6 h) also respects the mode: it refreshes the *knowledge*
+of what is current, not the identity in use.
 
-This is the layer that moved most often, and the one that used to be hardcoded.
-It is now resolved in this order:
+### What actually updates
 
-1. **`capture.json`** — recorded from a real CLI. Exact bytes, no inference.
-2. **`artifact`** — extracted from the published `@opencode/core` bundle. The
-   bundler leaves `// src/tool/plugin/<name>.ts` markers and literal
-   `description:` strings, so the definitions can be read statically without
-   re-implementing Effect's schema-to-JSON-Schema conversion.
-3. **`default`** — the definitions the bridge ships with. Used only until one of
-   the above succeeds, so a cold start with no network still works.
+A refresh replaces exactly these, and nothing else:
 
-`/health` reports which source is in use under `tools.source`. If it says
-`default` for long, both the package download and any capture are failing.
+| Field | Read from | Fallback |
+|---|---|---|
+| `version` (User-Agent) | handshake `version` | last known-good |
+| `sessionCharset` / `sessionLength` / `sessionMultiplier` | `packages/schema/src/identifier.ts` | last known-good |
+| `sessionPrefix` | `packages/schema/src/session-id.ts` | `ses_` |
+| `userAgentTemplate` | `packages/core/src/app.ts` | `opencode/${channel}/${version}/${cli}` |
+| header names | `packages/core/src/session/model-request.ts` | the shipped set |
+| `read` / `shell` schemas | `packages/core/src/tool/plugin/{read,shell}.ts` | `DEFAULT_TOOLS` |
 
-A capture records everything the CLI sends — around ten definitions, ~20 KB of
-JSON, which is billed as prompt tokens on every request. The gate only
-fingerprints a small core, so by default only `read` plus whichever of
-`shell`/`bash` the profile has is sent. Set `TOOL_PROFILE_SCOPE=full` to send
-the complete set if a gate ever starts requiring something outside it.
+Six plain TypeScript files, **~45 KB total**, fetched from
+`raw.githubusercontent.com/anomalyco/opencode/<sha>/<path>`. No npm tarball, no
+CLI binary, no local process, no disk cache.
 
-Verify what is actually on the wire:
+Header names are split into two sets during extraction: headers upstream sends
+unconditionally, and conditional ones (parent-session lineage, written as
+`...(session.parentID ? {...} : {})`). The bridge sends the first set and reports
+the second under `identity.optionalHeaders` — it never creates nested sessions,
+so their absence is correct, not a gap.
 
-```bash
-curl -s http://127.0.0.1:20129/profile | jq '.tools[].function.name'
-```
-
-### Recording a real CLI (tier 3)
-
-When a gate moves in a way the derived profile does not explain, stop inferring
-and record the real thing:
-
-```bash
-# requires an `opencode` binary on PATH
-curl -X POST http://127.0.0.1:20129/capture
-```
-
-This starts a loopback server that speaks just enough OpenAI protocol, runs the
-CLI once against it with a throwaway `OPENCODE_CONFIG`, and saves the request it
-emits. Your own OpenCode config is never touched and no traffic leaves the
-machine.
-
-The recording replaces the derived profile immediately. It is also the fastest
-way to answer "what changed?" — diff the new capture against the old one.
-
-Note that the npm CLI and the standalone v2 binary are **not** interchangeable
-here: the npm package honours `OPENCODE_CONFIG` for a custom provider, the v2
-binary resolves models differently. `capture.js` prefers the first `opencode` on
-`PATH` for that reason; override with `OPENCODE_BIN`.
-
-### Differential probing (tier 4)
-
-Off by default, because it is the only part of the bridge that deliberately
-sends requests it expects to fail. Upstream rate-limits failures per IP and
-applies a temporary cooldown after a burst, which masks the real error — so a
-probe loop makes the problem worse, not better.
-
-```bash
-PROBE_ENABLED=1 node server.js
-```
-
-When enabled, a rejection that survives the normal self-heal triggers at most
-`PROBE_MAX_ATTEMPTS` (default 6) requests. Each one changes **exactly one**
-dimension against the last known-good baseline — endpoint lane, a header, the
-presence of tools, streaming — so a success names its own cause. A failed batch
-enters `PROBE_COOLDOWN_MS` (default 15 min) of silence.
-
-The diagnosis lands in `/health` under `probe.lastRun`; nothing is adopted
-silently except the attempt that actually worked.
-
-### What it refuses to do
-
-- Move the version backwards.
-- Apply a half-parsed recipe (previous values stay in use, `missingFields` says
-  which).
-- Retry when nothing was learned — a persistent rejection surfaces as a real
-  error instead of a retry loop.
-- Probe without an explicit opt-in.
+If upstream adds a required header whose value this bridge cannot derive, it
+appears in `identity.unsentHeaders` rather than being sent empty.
 
 ### Inspecting state
 
@@ -377,38 +333,101 @@ curl -s http://127.0.0.1:20129/health
 
 ```json
 {
+  "status": "ok",
+  "provider": "opencode-free-bridge",
+  "version": "2.0.0",
+  "discoveredModels": 9,
   "identity": {
     "userAgent": "opencode/latest/2.0.32/cli",
+    "updateMode": "reactive",
     "sourceTag": "d4a6223d017e17f1beaa91d3e6ecc6511c5132ad",
     "versionFloor": null,
-    "drift": { "missing": [], "extra": [], "checkedAgainst": "d4a6223d…" }
-  },
-  "update": {
-    "mode": "reactive",
-    "release": { "version": "2.0.32", "sha": "d4a6223d…", "source": "update-api", "minimum": false }
-  },
-  "tools": {
-    "source": "artifact",
-    "version": "2.0.32",
-    "toolNames": ["read", "shell", "glob", "edit", "grep", "websearch", "write"]
-  },
-  "probe": { "enabled": false, "cooldownRemainingMs": 0 }
+    "lastCheckAgeMs": 1240,
+    "ttlMs": 900000,
+    "lastError": null,
+    "available": null,
+    "headers": [
+      "x-opencode-session-id", "x-session-affinity", "X-Session-Id",
+      "User-Agent", "x-opencode-project", "x-opencode-session", "x-opencode-client"
+    ],
+    "unsentHeaders": [],
+    "release": {
+      "version": "2.0.32",
+      "sha": "d4a6223d017e17f1beaa91d3e6ecc6511c5132ad",
+      "minimum": false,
+      "source": "update-api"
+    },
+    "tools": {
+      "source": "source",
+      "version": "2.0.32",
+      "toolNames": ["read", "shell"]
+    }
+  }
 }
 ```
-
-A non-empty `identity.drift.missing` means upstream started sending a header the
-bridge does not — the early warning that a gate is moving. A `tools.source` of
-`default` means the adaptive path is not reaching either real source.
-
 ## Troubleshooting
 
 **All models report `BUSY`**
 The upstream free tier is throttling the current IP. Retry later, or run the bridge from a different host.
 
+### What the `403 FreeTierError` actually checks
+
+The error:
+
+```
+HTTP 403 {"type":"error","error":{"type":"FreeTierError",
+  "message":"OpenCode's free tier can only be used from within OpenCode.
+             Download it at https://opencode.ai and keep building."}}
+```
+
+Measured against the live service, the trigger is the **session id shape**:
+
+| Session id | Result |
+|---|---|
+| `ses_` + 12 lowercase hex + 14 base62 (30 chars) | accepted |
+| missing `_` (`ses<hex>…`) | `403 FreeTierError` |
+| uppercase hex | `403 FreeTierError` |
+| other lengths (26, 34) | `403 FreeTierError` |
+| counter field `>= 64` | `403 FreeTierError` |
+| no `tools` in the body | `403 FreeTierError` |
+
+The endpoint (`/zen/v1` vs `/inference/v1`), the User-Agent string, and the tool
+*names* are **not** checked — the pre-1.5.0 pattern passes unchanged. Only the
+version *floor* is enforced separately, via `426 UpgradeRequired`.
+
+This is why a stale recipe is the dangerous case: the id is derived from the
+recipe, so a wrong `sessionPrefix` / `sessionLength` / `sessionCharset` mints an
+id upstream reads as "not OpenCode". The self-heal therefore re-mints the id
+after refreshing — replaying the old one would fail identically — and evicts it
+from the session cache so later requests do not reuse it.
+
+The same applies to the tool profile: an extracted profile **replaces** the
+previous one and is sent whole. Merging would keep a renamed tool forever, and a
+hardcoded name filter would record the new name but keep sending the old one —
+either way the wire shape could never converge on what the release ships.
+
+### What is derived vs. what is fixed
+
+| Layer | Derived at runtime? | If upstream moves it |
+|---|---|---|
+| session-id shape | yes (`identifier.ts`, `session-id.ts`) | followed on refresh |
+| User-Agent template + version | yes (`app.ts`, handshake) | followed on refresh |
+| header names | yes (`model-request.ts`) | followed; unknown values reported in `unsentHeaders` |
+| `read` / `shell` schemas and names | yes (`read.ts`, `shell.ts`) | followed; the set replaces the old one |
+| inference endpoint | **no** — `OPENCODE_CHAT_URL` / `OPENCODE_RESPONSES_URL` | must be updated in config |
+| header *values* | **no** — mapping in `buildGateHeaders` | must be added in code |
+| tool *parameter* semantics | partly — types/minimums/descriptions derived | a brand-new field type falls back to `string` |
+
+The endpoint is the one layer that cannot be read from the release source: it
+lives in the CLI's model routing config, not in the files this bridge reads. It
+is overridable by env var for exactly that case.
+
 **`403 FreeTierError` / `426 UpgradeRequired`**
 Normally self-healing: the bridge refreshes its identity and retries once. If it
 persists, check `/health` — look at `identity.userAgent`, `identity.versionFloor`
-and `identity.lastError`. To force a fresh derivation:
+and `identity.lastError`. A gate rejection is recognised from the error **body**
+(`type` / `message`), not the status alone, so the body is read before the
+decision. To force a fresh derivation:
 
 ```bash
 IDENTITY_TTL_MS=0 node ~/.opencode-free-bridge/server.js

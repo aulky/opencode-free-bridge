@@ -46,13 +46,6 @@ function isFreeTierCliGateError(status, errType, errMsg) {
   );
 }
 const identity = require("./identity");
-// The adaptive stack: handshake resolves which release is authoritative,
-// artifact reads its tool definitions, capture records a real CLI's request,
-// probe diagnoses a gate move we do not recognise.
-const handshake = require("./handshake");
-const artifact = require("./artifact");
-const capture = require("./capture");
-const probe = require("./probe");
 
 // The identity (user-agent, session-id format, header set) is owned by
 // identity.js, which derives it from opencode's public source and refreshes it
@@ -114,20 +107,24 @@ function isLocalOrigin(origin) {
 }
 
 /**
- * Kept for callers and tests that expect the old name. Delegates to the
- * identity layer, which fetches the release feed AND derives the rest of the
- * recipe from opencode's source. Unlike the old implementation this also
- * updates the session-id format, so a changed id shape heals too.
+ * Kept for callers and tests that expect the old name. Consults the handshake
+ * and derives the rest of the recipe from opencode's source.
  *
- * The `lastCliVersionCheckTime` guard is preserved so the feed is still read at
- * most once per CLI_VERSION_TTL_MS even when called repeatedly.
+ * This is a *poll*: it bypasses the identity freshness guard so the release
+ * check happens on its own schedule, but adoption still follows UPDATE_MODE.
+ * In `reactive` mode a release that has not moved the gate is recorded (and
+ * reported by /health as `identity.available`) without being adopted — forcing
+ * it here would silently turn `reactive` into `always` every 6h.
+ *
+ * The `lastCliVersionCheckTime` guard keeps the handshake read at most once per
+ * CLI_VERSION_TTL_MS even when called repeatedly.
  */
 async function refreshCliVersion() {
   const now = Date.now();
   if (now - lastCliVersionCheckTime < CLI_VERSION_TTL_MS) {
     return { updated: false, reason: "fresh" };
   }
-  const result = await identity.refresh({ force: true });
+  const result = await identity.refresh({ recheck: true });
   syncUserAgent();
   lastCliVersionCheckTime = now;
   return result;
@@ -255,10 +252,10 @@ function markProtocolSupport(modelId, useResponses) {
 // then it had to contain specific tool names, then (per 9router#4837) the exact
 // schemas. Hardcoding those definitions here meant a code change every time.
 //
-// The definitions now come from identity.js, which resolves them in this order:
-//   1. capture.json  — recorded from a real CLI (exact bytes)
-//   2. artifact      — extracted from the published @opencode/core bundle
-//   3. DEFAULT_TOOLS — shipped fallback, used only until 1 or 2 succeeds
+// The definitions now come from identity.js, which derives them at the release
+// commit SHA named by the update handshake:
+//   1. source        — `read.ts` / `shell.ts` at that immutable commit
+//   2. DEFAULT_TOOLS — shipped fallback, used until a source read succeeds
 //
 // The names below are kept for the call sites and tests that predate the
 // change; they are read from the live profile, not frozen at load time.
@@ -688,22 +685,42 @@ function buildUpstreamPayload(body, targetModel, useResponses) {
   return { upstreamBody, aliasToOriginal };
 }
 
+/**
+ * Mint a fresh session id after the identity changed.
+ *
+ * The id is derived from the recipe, so an id minted *before* a refresh encodes
+ * the shape the gate just rejected. The self-heal path therefore has to replace
+ * it — replaying the stale id would send the same rejected request and fail
+ * identically. The cache entry is dropped for the same reason: otherwise the
+ * next request from this client would get the stale id back.
+ */
+function regenerateSessionId(req, body, staleId) {
+  for (const [key, entry] of sessionCache) {
+    if (entry.sessionId === staleId) sessionCache.delete(key);
+  }
+  return getPersistentSessionId(req, body);
+}
+
 function buildUpstreamHeaders(req, sessionId) {
   const downstreamUa = req?.headers?.["user-agent"] || "";
   const ua = isValidV2UserAgent(downstreamUa) ? downstreamUa : currentUserAgent;
   const client = req?.headers?.["x-opencode-client"];
   const project = req?.headers?.["x-opencode-project"] || "global";
+  // The gate header set is derived by identity.js from upstream's own request
+  // builder, so a header added upstream starts being sent on the next request
+  // after a refresh. Values this bridge cannot derive are reported, not sent
+  // empty: an empty required header is worse than an absent one.
+  const { headers: gateHeaders } = identity.buildGateHeaders({
+    userAgent: ua,
+    client: client === "desktop" || client === "cli" ? client : "cli",
+    project: String(project),
+    sessionId,
+  });
   return {
     "Authorization": "Bearer public",
     "Content-Type": "application/json",
     "Accept": "text/event-stream",
-    "User-Agent": ua,
-    "x-opencode-client": client === "desktop" || client === "cli" ? client : "cli",
-    "x-opencode-project": String(project),
-    "x-opencode-session": sessionId,
-    "x-opencode-session-id": sessionId,
-    "x-session-affinity": sessionId,
-    "x-session-id": sessionId,
+    ...gateHeaders,
   };
 }
 
@@ -767,7 +784,7 @@ function getPersistentSessionId(req, body) {
     }
     sessionCache.delete(lookupKey);
   }
-  const newSessionId = "ses_" + createId(true);
+  const newSessionId = identity.createSessionId(true);
   if (lookupKey) {
     if (sessionCache.size >= MAX_SESSIONS) {
       for (const [k, v] of sessionCache) {
@@ -889,9 +906,6 @@ function handleRequest(req, res) {
   // Health check
   if (pathname === "" || pathname === "/" || pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    // `identity` is computed per request (not cached) so it reflects the mask
-    // currently in use — the first thing to check when upstream starts
-    // rejecting requests.
     const idState = identity.getState();
     return res.end(
       JSON.stringify({
@@ -901,80 +915,25 @@ function handleRequest(req, res) {
         discoveredModels: activeModels.length,
         identity: {
           userAgent: idState.userAgent,
+          updateMode: idState.updateMode,
           sourceTag: idState.lastSourceTag,
           versionFloor: idState.versionFloor,
           lastCheckAgeMs: idState.lastCheckTime ? Date.now() - idState.lastCheckTime : null,
           ttlMs: idState.ttlMs,
           lastError: idState.lastRefreshError,
-          // Non-empty means the last source read could not derive these fields:
-          // the recipe is still working, but a regex stopped matching upstream.
-          missingFields: idState.missingFields,
-          drift: idState.lastDrift,
+          release: idState.release,
+          // Set in reactive mode when a release exists that has not been adopted
+          // because the gate has not moved. `null` once adopted.
+          available: idState.available,
+          // The header names in force, and any the recipe asks for that this
+          // bridge cannot fill — a non-empty `unsentHeaders` means a manual
+          // mapping is needed before the next gate move is followed.
+          headers: idState.headers,
+          unsentHeaders: idState.unsentHeaders,
+          tools: idState.tools,
         },
-        // Which release the bridge is following, and how it found out.
-        update: {
-          mode: idState.updateMode,
-          release: handshake.getState().lastResult,
-          error: handshake.getState().lastError,
-        },
-        // The tool definitions actually on the wire, and where they came from.
-        // `source` is the single most useful field when a gate moves:
-        //   capture  = recorded from a real CLI (best)
-        //   artifact = extracted from the published package
-        //   default  = shipped fallback, meaning both sources failed
-        tools: idState.toolProfile,
-        // Diagnostic probing is off by default; this says whether it is on and
-        // whether it is currently backing off.
-        probe: probe.getState(),
-        capture: capture.getState(),
       })
     );
-  }
-
-  // Explicit profile inspection: the tool definitions currently in use, in the
-  // exact shape they are sent upstream.
-  if (req.method === "GET" && pathname === "/profile") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(
-      JSON.stringify({
-        tools: identity.getToolList(false),
-        state: identity.getState().toolProfile,
-        release: handshake.getState().lastResult,
-      })
-    );
-  }
-
-  // Manual capture: run the real CLI once and record what it sends. This is the
-  // recovery path when a gate moves and the derived profile is not enough —
-  // it replaces inference with the actual bytes.
-  if (req.method === "POST" && pathname === "/capture") {
-    capture
-      .captureAndSave()
-      .then((result) => {
-        if (result.error) {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ ok: false, error: result.error }));
-        }
-        // Adopt the fresh capture immediately so the next request uses it.
-        identity
-          .loadToolProfile(identity.getRecipe().version, { force: true })
-          .catch(() => {});
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            ok: true,
-            path: result.path,
-            toolNames: result.profile.toolNames,
-            endpoint: result.profile.endpoint,
-            headerNames: result.profile.headerNames,
-          })
-        );
-      })
-      .catch((err) => {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      });
-    return;
   }
 
   // Model list (triggers async re-discovery when the hourly TTL expired)
@@ -1158,39 +1117,54 @@ function handleRequest(req, res) {
           }
         }
 
-        // Self-healing identity: if upstream rejects the mask (403 FreeTierError
-        // or 426 UpgradeRequired), refresh the identity immediately and replay
-        // the request once. The client never sees the intermediate rejection.
-        let gateRetried = false;
-        if (!upstreamRes.ok && isFreeTierCliGateError(upstreamRes.status, "", "")) {
-          const gateStatus = upstreamRes.status;
-          let gateBody = "";
+        // Self-healing identity. A gate rejection is identified by the error
+        // *body*, not the status line: a 403 is only the gate when its type or
+        // message says so, while 426 is the version-floor handshake by itself.
+        // The body must therefore be read before the decision — passing empty
+        // strings here made this branch unreachable for 403.
+        if (!upstreamRes.ok) {
+          let errText = "";
           try {
-            gateBody = await upstreamRes.text();
+            errText = await upstreamRes.text();
           } catch {
-            gateBody = "";
+            errText = "";
           }
-          let probeType = "";
-          let probeMsg = gateBody;
+          let errJson = null;
           try {
-            const j = JSON.parse(gateBody);
-            probeType = j.error?.type || "";
-            probeMsg = j.error?.message || gateBody;
+            errJson = JSON.parse(errText);
           } catch {
-            // non-JSON body: keep raw text as the message
+            errJson = null;
+          }
+          const errType = errJson?.error?.type || errJson?.type || "";
+          const rawMsg =
+            errJson?.error?.message ||
+            errJson?.message ||
+            errText ||
+            `Upstream error ${upstreamRes.status}`;
+
+          if (!isFreeTierCliGateError(upstreamRes.status, errType, rawMsg)) {
+            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            return res.end(
+              JSON.stringify({
+                error: {
+                  message: rawMsg,
+                  type: errType || "upstream_error",
+                  code: upstreamRes.status,
+                },
+              })
+            );
           }
 
+          const gateStatus = upstreamRes.status;
           const verdict = await identity
-            .onGateRejection(gateStatus, probeType, probeMsg, false)
-            .catch(() => ({ retry: false }));
+            .onGateRejection(gateStatus, errType, rawMsg, false)
+            .catch(() => ({ retry: false, reason: "refresh-error" }));
 
           if (verdict.retry) {
             syncUserAgent();
-            const retryHeaders = buildUpstreamHeaders(req, sessionId);
             console.warn(
               `[opencode-free-bridge] Identity refreshed (${verdict.reason}) after upstream ${gateStatus}; retrying once`
             );
-            gateRetried = true;
             // Rebuild the body too: the tool profile may have changed, and the
             // tools are part of what the gate inspects.
             ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
@@ -1198,90 +1172,48 @@ function handleRequest(req, res) {
               targetModel,
               useResponses
             ));
+            // Re-mint the session id. The one minted before this request was
+            // produced by the recipe the gate just rejected; replaying it would
+            // send the same rejected shape and fail identically. The cached
+            // entry is dropped so the next request also gets a correct id.
+            const retrySessionId = regenerateSessionId(req, body, sessionId);
             upstreamRes = await fetch(upstreamUrl, {
               method: "POST",
-              headers: retryHeaders,
+              headers: buildUpstreamHeaders(req, retrySessionId),
               body: JSON.stringify(upstreamBody),
               signal: abortController.signal,
             });
           }
 
-          // Still rejected after healing? The gate moved in a way the derived
-          // profile does not explain. Differential probing is the last resort:
-          // it is off by default and rate-limited, because a burst of failures
-          // triggers an upstream cooldown that hides the real error.
-          if (!upstreamRes.ok && gateRetried && probe.isEnabled()) {
-            const report = await probe
-              .run(
-                {
-                  url: upstreamUrl,
-                  headers: buildUpstreamHeaders(req, sessionId),
-                  body: upstreamBody,
+          if (!upstreamRes.ok) {
+            // Either nothing was learned (a retry would replay the same rejected
+            // request) or the retry was rejected too. Surface the real error
+            // instead of looping.
+            console.warn(
+              `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}): ${rawMsg} — ${verdict.retry ? "retry also rejected" : `no identity change to apply (${verdict.reason || "unknown"})`} — ${UPDATE_HINT}`
+            );
+            let retryText = "";
+            try {
+              retryText = await upstreamRes.text();
+            } catch {}
+            let retryJson = null;
+            try {
+              retryJson = JSON.parse(retryText);
+            } catch {}
+            const retryType = retryJson?.error?.type || retryJson?.type || errType || "upstream_error";
+            const retryMsg =
+              retryJson?.error?.message || retryJson?.message || retryText || rawMsg;
+            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            return res.end(
+              JSON.stringify({
+                error: {
+                  message: `${retryMsg} (${UPDATE_HINT})`,
+                  type: retryType,
+                  code: upstreamRes.status,
                 },
-                {
-                  tools: identity.getToolList(useResponses),
-                  sessionId,
-                }
-              )
-              .catch(() => null);
-
-            if (report && report.ran) {
-              console.warn(
-                `[opencode-free-bridge] Probe ${report.reason}: ` +
-                  report.attempts
-                    .map((a) => `${a.label}=${a.ok ? "PASS" : a.status || a.skipped || a.note}`)
-                    .join(" ")
-              );
-              if (report.learned && report.learnedAttempt) {
-                // A single dimension fixed it. Adopt that attempt verbatim for
-                // this retry so the client gets a real answer, and leave the
-                // diagnosis in /health for the operator.
-                console.warn(
-                  `[opencode-free-bridge] Probe learned: ${report.learned}. Replaying with it.`
-                );
-                upstreamRes = await fetch(report.learnedAttempt.url, {
-                  method: "POST",
-                  headers: report.learnedAttempt.headers,
-                  body: JSON.stringify(report.learnedAttempt.body),
-                  signal: abortController.signal,
-                });
-                if (upstreamRes.ok) {
-                  // The learned shape works; make it the new baseline.
-                  ({ upstreamBody, aliasToOriginal } = {
-                    upstreamBody: report.learnedAttempt.body,
-                    aliasToOriginal,
-                  });
-                }
-              }
-            }
+              })
+            );
           }
-        }
-
-        if (!upstreamRes.ok) {
-          const errText = await upstreamRes.text();
-          let errJson;
-          try {
-            errJson = JSON.parse(errText);
-          } catch {
-            errJson = { message: errText };
-          }
-          const errType = errJson.error?.type || "upstream_error";
-          const rawMsg =
-            errJson.error?.message || errJson.message || `Upstream error ${upstreamRes.status}`;
-          const isGateErr = isFreeTierCliGateError(upstreamRes.status, errType, rawMsg);
-          if (isGateErr) {
-            console.warn(`[opencode-free-bridge] Upstream CLI gate rejected request (${upstreamRes.status}): ${rawMsg} — ${UPDATE_HINT}`);
-          }
-          res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
-          return res.end(
-            JSON.stringify({
-              error: {
-                message: isGateErr ? `${rawMsg} (${UPDATE_HINT})` : rawMsg,
-                type: errType,
-                code: upstreamRes.status,
-              },
-            })
-          );
         }
 
         const completionId = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
@@ -1719,19 +1651,6 @@ if (require.main === module) {
   // Discovery runs in background: /v1/models is live as soon as upstream
   // answers. Boot never blocks on network.
   discoverModels().catch(() => {});
-  // Resolve the tool profile in the background so the first request already
-  // sends the current definitions instead of the shipped fallback. Failure is
-  // harmless: DEFAULT_TOOLS keeps the bridge working.
-  identity
-    .loadToolProfile(identity.getRecipe().version)
-    .then((r) => {
-      if (r && r.updated) {
-        console.log(
-          `[opencode-free-bridge] Tool profile ${identity.getRecipe().version} loaded from ${r.source}: ${r.tools.join(", ")}`
-        );
-      }
-    })
-    .catch(() => {});
   // Model list rotates on upstream's schedule, so it keeps a timer. The
   // IDENTITY does not: it is refreshed lazily from the request path (see
   // identity.ensureFresh), so an idle bridge makes no network calls at all.
@@ -1787,10 +1706,6 @@ module.exports = {
   readRequestBody,
   refreshCliVersion,
   identity,
-  handshake,
-  artifact,
-  capture,
-  probe,
   __getUserAgent: () => currentUserAgent,
   __syncUserAgent: syncUserAgent,
   DISCOVERY_TTL_MS,

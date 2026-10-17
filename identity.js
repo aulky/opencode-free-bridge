@@ -1,144 +1,96 @@
 #!/usr/bin/env node
 /**
- * identity.js — the OpenCode "mask" layer.
+ * identity.js — adaptive OpenCode CLI identity & security-layer sync.
  *
- * The bridge must present itself as the OpenCode client. Rather than freezing
- * that identity in code (which goes stale every time upstream moves a gate),
- * this module derives it from the same place the CLI does: the published
- * opencode release, resolved through the CLI's own update handshake.
+ * Keeps the bridge aligned with the official OpenCode CLI when upstream adjusts
+ * its free-tier gate (User-Agent version floor, session ID format, headers, or
+ * core tool fingerprint definitions).
  *
- * Design rules (learned from upstream behaviour, see CHANGELOG):
+ * How it works:
+ *  1. HANDSHAKE — Queries the same update endpoint the OpenCode CLI uses:
+ *       GET https://opencode.ai/update/api/<channel>/cli/npm?current=<version>
+ *       -> { version, minimum, metadata: { github: { sha } } }
+ *     Falls back to GitHub's releases.atom feed if the update API is unreachable.
  *
- *  1. LAZY — nothing runs on a timer. Identity is checked when a request is
- *     about to be made, and only if the cached copy is older than TTL. An idle
- *     bridge performs zero network calls.
- *  2. REACTIVE — if upstream rejects us (403 FreeTierError / 426
- *     UpgradeRequired), we refresh immediately, ignore TTL, and let the caller
- *     retry the request once. The user never sees the intermediate failure.
- *  3. SOURCE-DERIVED — the recipe (session id format, user-agent template,
- *     header names) is extracted from opencode's public source, read at the
- *     exact commit the release was built from (see handshake.js).
- *  4. FAIL-SAFE — extraction that does not yield a complete recipe is
- *     discarded; the last known-good recipe stays in use. A parsing change
- *     upstream can never break a working bridge.
- *  5. PINNABLE — `UPDATE_MODE=always` follows every release; `reactive` (the
- *     default) only moves when a gate rejects us. An upstream `minimum: true`
- *     overrides both, because that is upstream stating the floor has moved.
+ *  2. UPDATE MODES (`UPDATE_MODE`):
+ *     - `reactive` (default): Uses the current identity until upstream rejects a
+ *       request (403 FreeTierError / 426 UpgradeRequired) or flags `minimum: true`,
+ *       then refreshes immediately and retries the request once.
+ *     - `always`: Proactively adopts every new OpenCode release when the lazy
+ *       TTL expires.
  *
- * Zero dependencies, Node.js >= 18.
+ *  3. SOURCE SYNC — When moving to a new release (or forced by a gate error),
+ *     fetches the lightweight source files at the release's exact commit SHA
+ *     to update the session ID recipe, User-Agent template, and `read`/`shell`
+ *     tool fingerprint schemas. Incomplete parses fall back safely to the last
+ *     known-good values.
  */
 
-const handshake = require("./handshake");
-const artifact = require("./artifact");
-const capture = require("./capture");
+const crypto = require("crypto");
 
+const UPDATE_API_BASE =
+  process.env.OPENCODE_UPDATE_API_BASE || "https://opencode.ai/update/api";
+const ATOM_URL =
+  process.env.OPENCODE_RELEASES_ATOM_URL ||
+  "https://github.com/anomalyco/opencode/releases.atom";
 const SOURCE_BASE =
-  process.env.OPENCODE_SOURCE_BASE || "https://raw.githubusercontent.com/anomalyco/opencode";
+  process.env.OPENCODE_SOURCE_BASE ||
+  "https://raw.githubusercontent.com/anomalyco/opencode";
 
-// Recipe files in the opencode repo, and what each one tells us.
-const SOURCE_FILES = {
-  identifier: "packages/schema/src/identifier.ts",
-  sessionId: "packages/schema/src/session-id.ts",
-  app: "packages/core/src/app.ts",
-  modelRequest: "packages/core/src/session/model-request.ts",
-};
+const CHANNEL = process.env.OPENCODE_CHANNEL || "latest";
+const ARTIFACT = "cli";
+const DISTRIBUTION = process.env.OPENCODE_DISTRIBUTION || "npm";
 
-/**
- * UPDATE_MODE controls how eagerly the bridge follows a new release.
- *
- *   reactive  (default) only move when a gate rejection forces it, or when
- *             upstream marks the release `minimum: true`
- *   always    follow every release as soon as the TTL expires
- *
- * The distinction matters because most releases do not touch the gate. Following
- * every one costs a source read per release for no benefit; following none
- * leaves the bridge stuck the moment a gate does move.
- */
-const UPDATE_MODE = (process.env.UPDATE_MODE || "reactive").toLowerCase();
-
-// How long a checked identity is trusted before the next request re-checks it.
-// Only consulted when a request arrives — no background timer.
 const IDENTITY_TTL_MS = parseInt(
   process.env.IDENTITY_TTL_MS || String(15 * 60 * 1000),
   10
 );
-const FEED_TIMEOUT_MS = parseInt(process.env.IDENTITY_FETCH_TIMEOUT_MS || "5000", 10);
-const SOURCE_TIMEOUT_MS = parseInt(process.env.IDENTITY_SOURCE_TIMEOUT_MS || "8000", 10);
-// Tool profiles come from a 1.3 MB package download: check them far less often
-// than the version, and only when the version has actually moved.
-const TOOL_PROFILE_TTL_MS = parseInt(
-  process.env.TOOL_PROFILE_TTL_MS || String(6 * 60 * 60 * 1000),
+const HANDSHAKE_TIMEOUT_MS = parseInt(
+  process.env.HANDSHAKE_TIMEOUT_MS || process.env.IDENTITY_FETCH_TIMEOUT_MS || "6000",
+  10
+);
+const SOURCE_TIMEOUT_MS = parseInt(
+  process.env.IDENTITY_SOURCE_TIMEOUT_MS || "8000",
   10
 );
 
-/**
- * Last known-good recipe. Every field here is used by the request path, so a
- * partial update is never applied — see `applyRecipe`.
- */
+function getUpdateMode() {
+  const mode = (process.env.UPDATE_MODE || "reactive").toLowerCase().trim();
+  return mode === "always" ? "always" : "reactive";
+}
+
+const SOURCE_FILES = Object.freeze({
+  identifier: "packages/schema/src/identifier.ts",
+  sessionId: "packages/schema/src/session-id.ts",
+  app: "packages/core/src/app.ts",
+  modelRequest: "packages/core/src/session/model-request.ts",
+  readTool: "packages/core/src/tool/plugin/read.ts",
+  shellTool: "packages/core/src/tool/plugin/shell.ts",
+});
+
 const DEFAULT_RECIPE = Object.freeze({
   channel: "latest",
   version: "2.0.32",
   client: "cli",
-  // Session ID: `ses_` + 12 hex (timestamp) + 14 base62 (random) = 26 chars.
   sessionPrefix: "ses_",
   sessionCharset: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
   sessionLength: 26,
   sessionMultiplier: 0x1000,
-  // Names the CLI sends on model requests. Used for drift reporting only.
+  userAgentTemplate: "opencode/${app.channel}/${app.version}/${app.name}",
+  // The header names upstream's own request builder sets, in its order. This is
+  // the fallback when the source read fails, so it must be the complete set —
+  // a partial list would silently stop sending a header the gate checks.
   headers: Object.freeze([
     "x-opencode-session-id",
     "x-session-affinity",
     "X-Session-Id",
-    "x-opencode-session",
+    "User-Agent",
     "x-opencode-project",
+    "x-opencode-session",
     "x-opencode-client",
   ]),
 });
 
-let recipe = { ...DEFAULT_RECIPE };
-let lastCheckTime = 0;
-let refreshInFlight = null;
-// Lowest client version upstream has told us it will accept.
-let versionFloor = null;
-let lastRefreshError = null;
-// Diagnostics for /health and drift reporting.
-let lastSourceTag = null;
-let lastDrift = null;
-// Recipe fields a healthy source read should be able to derive. Anything left
-// in `lastMissingFields` means a regex stopped matching upstream's source.
-const RECIPE_FIELDS = [
-  "sessionCharset",
-  "sessionLength",
-  "sessionMultiplier",
-  "sessionPrefix",
-  "userAgentTemplate",
-  "headers",
-];
-let lastMissingFields = [];
-
-// --- Tool profile -----------------------------------------------------------
-// The `tools` array in the request body is the layer that moved most often
-// (9router#4837: headers → +tools → exact schemas within days). It is therefore
-// the layer that must never be hardcoded.
-//
-// Resolution order, best evidence first:
-//   1. capture.json  — recorded from a real CLI (exact bytes, ground truth)
-//   2. artifact      — extracted from the published @opencode/core bundle
-//   3. DEFAULT_TOOLS — the last known-good definitions, used only until one of
-//                      the above succeeds
-let toolProfile = null;
-let toolProfileSource = null;
-let toolProfileVersion = null;
-let toolProfileFetchedAt = 0;
-let toolProfileError = null;
-let toolProfileInFlight = null;
-
-/**
- * Last-known-good definitions. These are the definitions the bridge shipped
- * with; they remain the fallback so a cold start with no network still works.
- * They are NOT the source of truth — `artifact.js` reproduces them byte-for-byte
- * from the published package, which is how we know the extractor is correct.
- */
 const DEFAULT_TOOLS = Object.freeze({
   read: {
     description:
@@ -193,19 +145,21 @@ const DEFAULT_TOOLS = Object.freeze({
   },
 });
 
-/**
- * The tool names the gate has required so far, in the order they appeared.
- * `read` is the one constant across every observed gate; `shell` replaced `bash`
- * in the v2 line. Kept as a preference list rather than a hard requirement, so
- * a profile that names different tools still wins.
- */
-const REQUIRED_TOOL_HINTS = ["read", "shell", "bash", "glob", "grep"];
+const CORE_TOOL_NAMES = ["read", "shell", "bash"];
 
-/**
- * Key-order-independent JSON, for comparing two tool profiles by content.
- * Property order in a JSON Schema carries no meaning, so a profile that only
- * reorders keys must not be treated as a change worth retrying for.
- */
+let recipe = { ...DEFAULT_RECIPE };
+let toolProfile = null;
+let toolProfileSource = "default";
+let toolProfileVersion = DEFAULT_RECIPE.version;
+let lastRelease = null;
+let lastAvailable = null;
+let lastCheckTime = 0;
+let refreshInFlight = null;
+let versionFloor = null;
+let lastRefreshError = null;
+let lastSourceTag = null;
+let optionalHeaders = [];
+
 function stableStringify(val) {
   if (!val || typeof val !== "object") return JSON.stringify(val);
   if (Array.isArray(val)) return "[" + val.map(stableStringify).join(",") + "]";
@@ -217,17 +171,7 @@ function clampString(value, max) {
   return typeof value === "string" && value.length > 0 && value.length <= max ? value : null;
 }
 
-/**
- * Parse a release feed (atom or JSON-ish text) for version tags.
- * Returns versions sorted newest-first.
- */
-function parseVersions(text) {
-  const found = [];
-  const re = /<title>v?(\d+\.\d+\.\d+)<\/title>/gi;
-  let m;
-  while ((m = re.exec(text)) !== null) found.push(m[1]);
-  return sortVersions(found);
-}
+// --- Version & Handshake Helpers ---------------------------------------------
 
 function sortVersions(list) {
   const seen = new Set();
@@ -241,6 +185,23 @@ function sortVersions(list) {
     });
 }
 
+function parseVersions(text) {
+  const found = [];
+  const re = /<title>v?(\d+\.\d+\.\d+)<\/title>/gi;
+  let m;
+  while ((m = re.exec(String(text || ""))) !== null) found.push(m[1]);
+  return sortVersions(found);
+}
+
+function selectVersion(versions) {
+  if (!Array.isArray(versions) || versions.length === 0) return null;
+  const pinned = process.env.OPENCODE_MAJOR;
+  if (pinned && /^\d+$/.test(pinned)) {
+    return versions.find((v) => v.split(".")[0] === pinned) || null;
+  }
+  return versions[0];
+}
+
 function compareVersions(a, b) {
   const [a1, a2, a3] = String(a).split(".").map(Number);
   const [b1, b2, b3] = String(b).split(".").map(Number);
@@ -249,24 +210,220 @@ function compareVersions(a, b) {
   return a3 - b3;
 }
 
-/**
- * Pull the version floor out of an UpgradeRequired message, e.g.
- * "OpenCode 1.18.0 or newer is required to use the free tier".
- */
 function parseVersionFloor(message) {
   const m = String(message || "").match(/(\d+\.\d+\.\d+)\s+or newer/i);
   return m ? m[1] : null;
 }
 
+function sourceRef(release) {
+  if (release && release.sha) return release.sha;
+  if (release && release.version) return `v${release.version}`;
+  return process.env.OPENCODE_SOURCE_REF || "dev";
+}
+
+async function fetchJson(url, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
+  const res = await fetch(url, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function fetchText(url, timeoutMs = SOURCE_TIMEOUT_MS) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.text();
+}
+
 /**
- * Extract a recipe from opencode source files. Pure function: takes the file
- * bodies, returns a partial recipe. Missing pieces are simply absent, and
- * `applyRecipe` refuses to apply an incomplete result.
+ * Resolve the current authoritative CLI release via OpenCode's update handshake,
+ * falling back to the GitHub Atom feed when the update API is unreachable.
+ */
+async function resolveRelease(currentVersion = recipe.version) {
+  const channel = process.env.OPENCODE_CHANNEL || CHANNEL;
+  const url =
+    `${UPDATE_API_BASE}/${encodeURIComponent(channel)}/${encodeURIComponent(ARTIFACT)}` +
+    `/${encodeURIComponent(DISTRIBUTION)}?current=${encodeURIComponent(currentVersion || "0.0.0")}`;
+  try {
+    const data = await fetchJson(url, HANDSHAKE_TIMEOUT_MS);
+    const version = typeof data?.version === "string" ? data.version : null;
+    if (!version) throw new Error("update service returned no version");
+    const github = data?.metadata?.github || {};
+    const sha =
+      typeof github.sha === "string" && /^[0-9a-f]{7,40}$/i.test(github.sha)
+        ? github.sha
+        : null;
+    lastRelease = {
+      version,
+      sha,
+      minimum: data.minimum === true,
+      active: data.active !== false,
+      channel: data.channel || channel,
+      source: "update-api",
+      resolvedAt: Date.now(),
+      stale: false,
+    };
+    return lastRelease;
+  } catch (primaryErr) {
+    try {
+      const text = await fetchText(ATOM_URL, HANDSHAKE_TIMEOUT_MS);
+      const version = selectVersion(parseVersions(text));
+      if (!version) throw new Error("no version found in release feed");
+      lastRelease = {
+        version,
+        sha: null,
+        minimum: false,
+        active: true,
+        channel,
+        source: "atom-feed",
+        resolvedAt: Date.now(),
+        stale: false,
+        degraded: `update-api: ${primaryErr.message}`,
+      };
+      return lastRelease;
+    } catch (feedErr) {
+      const error = `update-api: ${primaryErr.message}; atom-feed: ${feedErr.message}`;
+      if (lastRelease) return { ...lastRelease, stale: true, error };
+      return {
+        version: null,
+        sha: null,
+        minimum: false,
+        active: true,
+        channel,
+        source: "none",
+        resolvedAt: null,
+        stale: true,
+        error,
+      };
+    }
+  }
+}
+
+// --- Source Extraction (Recipe + Tool Definitions) ---------------------------
+
+function interpolateTemplate(str, vars) {
+  return str.replace(/\$\{([^}]+)\}/g, (_, expr) => {
+    const key = expr.trim();
+    return vars[key] !== undefined ? String(vars[key]) : `
+${key}`;
+  });
+}
+
+/**
+ * Extract a single tool's wire definition (`description` + JSON Schema `parameters`)
+ * directly from its TypeScript plugin source (`read.ts` or `shell.ts`).
+ */
+function extractToolFromSource(source, fallbackName) {
+  if (typeof source !== "string" || !source.trim()) return null;
+
+  const nameMatch = source.match(/export\s+const\s+name\s*=\s*"([a-z][a-z0-9_-]*)"/i);
+  const name = nameMatch ? nameMatch[1] : fallbackName;
+  if (!name) return null;
+
+  const vars = { OS: "Linux", shell: "bash" };
+  for (const m of source.matchAll(/const\s+([A-Z][A-Z0-9_]*)\s*=\s*([0-9][0-9_*\s+]*)/g)) {
+    const clean = m[2].replace(/_/g, "").trim();
+    if (/^[0-9*\s+]+$/.test(clean)) {
+      const val = clean
+        .split("+")
+        .map((part) => part.split("*").reduce((acc, n) => acc * Number(n.trim()), 1))
+        .reduce((a, b) => a + b, 0);
+      if (Number.isFinite(val)) vars[m[1]] = val;
+    }
+  }
+
+  // 1. Tool description: either an array builder `const description = (...) => [ ... ].join(" ")`
+  //    or a string literal `description: "..."` inside `editor.add({ ... })`.
+  let description = null;
+  const builderMatch = source.match(
+    /const\s+description\s*=\s*\([^)]*\)\s*=>\s*\[([\s\S]*?)\]\.join\(\s*" "\s*\)/m
+  );
+  if (builderMatch) {
+    const parts = [];
+    const litRe = /"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`/g;
+    let lm;
+    while ((lm = litRe.exec(builderMatch[1])) !== null) {
+      const raw = lm[1] !== undefined ? lm[1] : interpolateTemplate(lm[2], vars);
+      if (raw) parts.push(raw);
+    }
+    if (parts.length > 0) description = parts.join(" ");
+  } else {
+    const addBlock = source.match(/editor\.add\(\{([\s\S]*?)\binput\s*:/);
+    if (addBlock) {
+      const descMatch = addBlock[1].match(/description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`)/);
+      if (descMatch) {
+        description =
+          descMatch[1] !== undefined
+            ? descMatch[1]
+            : interpolateTemplate(descMatch[2], vars);
+      }
+    }
+  }
+  if (!description || description.length < 20) return null;
+
+  // 2. Input Schema.Struct({ ... }) before Output definition.
+  const beforeOutput = source.split(/const\s+(?:Structured)?Output\b/)[0] || source;
+  const structMatch = beforeOutput.match(/Schema\.Struct\(\{([\s\S]*?)\}\)\s*(?:\n|;|$)/);
+  if (!structMatch) return null;
+
+  const properties = {};
+  const required = [];
+  const fieldRe =
+    /([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([\s\S]*?\.annotate\(\{\s*description\s*:\s*(?:"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`)\s*,?\s*\}\))/g;
+  let fm;
+  while ((fm = fieldRe.exec(structMatch[1])) !== null) {
+    const key = fm[1];
+    const expr = fm[2];
+    const fieldDesc =
+      fm[3] !== undefined ? fm[3] : interpolateTemplate(fm[4] || "", vars);
+
+    const isOptional =
+      expr.includes("Schema.optionalKey") ||
+      expr.includes(".fields.offset") ||
+      expr.includes(".fields.limit");
+
+    const prop = {};
+    if (/Boolean/.test(expr)) {
+      prop.type = "boolean";
+    } else if (/NonNegativeInt|\.fields\.(?:offset|limit)/.test(expr)) {
+      prop.type = "integer";
+      prop.minimum = 0;
+    } else if (/PositiveInt/.test(expr)) {
+      prop.type = "integer";
+      prop.minimum = 1;
+    } else if (/Schema\.(?:Int|Number)/.test(expr)) {
+      prop.type = "integer";
+    } else {
+      prop.type = "string";
+    }
+    if (fieldDesc) prop.description = fieldDesc;
+
+    properties[key] = prop;
+    if (!isOptional) required.push(key);
+  }
+
+  if (Object.keys(properties).length === 0) return null;
+
+  return {
+    name,
+    description,
+    parameters: {
+      type: "object",
+      properties,
+      required,
+      additionalProperties: false,
+    },
+  };
+}
+
+/**
+ * Extract session ID, User-Agent template, headers, and tool schemas from
+ * upstream source files.
  */
 function extractRecipe(files = {}) {
   const out = {};
 
-  // --- session id format ---
   const identifier = files.identifier;
   if (typeof identifier === "string") {
     const charset = identifier.match(/const\s+chars\s*=\s*"([^"]+)"/);
@@ -287,41 +444,67 @@ function extractRecipe(files = {}) {
     }
   }
 
-  // The `ses_` prefix lives in session-id.ts, not identifier.ts — the id
-  // generator is prefix-agnostic.
   const sessionId = files.sessionId;
   if (typeof sessionId === "string") {
     const prefix = sessionId.match(/make\(\s*"([a-z]+_)"\s*\+\s*descending/);
     if (prefix) out.sessionPrefix = prefix[1];
   }
 
-  // --- user-agent template ---
   const app = files.app;
   if (typeof app === "string") {
     const tpl = app.match(/return\s+`(opencode\/[^`]+)`/);
     if (tpl) out.userAgentTemplate = tpl[1];
   }
 
-  // --- header names sent on model requests ---
   const modelRequest = files.modelRequest;
   if (typeof modelRequest === "string") {
     const block = modelRequest.match(/headers:\s*\{([\s\S]{0,2000}?)\n\s{8}\}/);
     if (block) {
-      const names = [...block[1].matchAll(/"([A-Za-z][A-Za-z0-9-]*)":/g)].map(
-        (m) => m[1]
-      );
-      const unique = [...new Set(names)].filter((n) => n.length < 64);
-      if (unique.length > 0) out.headers = unique;
+      // Split by line so a conditional spread can be told apart from a header
+      // that is always sent. Upstream writes parent-session headers as
+      // `...(session.parentID ? { "x-parent": ... } : {})`, which this bridge
+      // has no value for — reporting those as missing would be a false alarm.
+      const required = [];
+      const optional = [];
+      const seen = new Set();
+      for (const line of block[1].split("\n")) {
+        const nameMatch = line.match(/"([A-Za-z][A-Za-z0-9-]*)":/);
+        if (!nameMatch) continue;
+        const name = nameMatch[1];
+        const key = name.toLowerCase();
+        if (key.length === 0 || key.length >= 64 || seen.has(key)) continue;
+        seen.add(key);
+        // A spread guarded by a ternary is conditional.
+        if (line.trim().startsWith("...") && line.includes("?")) optional.push(name);
+        else required.push(name);
+      }
+      if (required.length > 0) out.headers = required;
+      if (optional.length > 0) out.optionalHeaders = optional;
     }
+  }
+
+  const extractedTools = {};
+  const readDef = extractToolFromSource(files.readTool, "read");
+  if (readDef) {
+    extractedTools[readDef.name] = {
+      description: readDef.description,
+      parameters: readDef.parameters,
+    };
+  }
+  const shellDef = extractToolFromSource(files.shellTool, "shell");
+  if (shellDef) {
+    extractedTools[shellDef.name] = {
+      description: shellDef.description,
+      parameters: shellDef.parameters,
+    };
+  }
+  if (Object.keys(extractedTools).length > 0) {
+    out.tools = extractedTools;
   }
 
   return out;
 }
 
-/**
- * Render a user-agent from the CLI's template shape
- * (`opencode/${channel}/${version}/${name}`) plus the release version.
- */
 function buildUserAgent(next = recipe) {
   const tpl = next.userAgentTemplate;
   if (typeof tpl === "string") {
@@ -337,12 +520,7 @@ function getUserAgent() {
   return buildUserAgent(recipe);
 }
 
-/**
- * Validate then apply a recipe update. Rejects updates that would leave the
- * identity incomplete, so a half-parsed source file can never take the bridge
- * down. Returns the list of changed fields (empty when nothing moved).
- */
-function applyRecipe(update = {}, sourceTag = null) {
+function applyRecipe(update = {}, tag = null) {
   const next = { ...recipe };
   const changed = [];
 
@@ -384,282 +562,152 @@ function applyRecipe(update = {}, sourceTag = null) {
   }
 
   if (typeof update.userAgentTemplate === "string") {
-    // Only accept a template that still renders a plausible OpenCode UA.
     const probe = buildUserAgent({ ...next, userAgentTemplate: update.userAgentTemplate });
     if (/^opencode\/[A-Za-z0-9-]+\/\d+\.\d+\.\d+\/[A-Za-z0-9-]+$/.test(probe)) {
-      next.userAgentTemplate = update.userAgentTemplate;
       if (probe !== buildUserAgent(recipe)) changed.push("userAgentTemplate");
+      next.userAgentTemplate = update.userAgentTemplate;
     }
   }
 
   if (Array.isArray(update.headers) && update.headers.length > 0) {
+    const incoming = update.headers.map(String);
     const same =
-      update.headers.length === next.headers.length &&
-      update.headers.every((h, i) => h === next.headers[i]);
+      incoming.length === next.headers.length &&
+      incoming.every((h, i) => h.toLowerCase() === next.headers[i].toLowerCase());
     if (!same) {
-      next.headers = update.headers;
+      next.headers = incoming;
       changed.push("headers");
+    }
+  }
+
+  if (Array.isArray(update.optionalHeaders)) {
+    optionalHeaders = update.optionalHeaders.map(String);
+  }
+
+  if (update.tools && typeof update.tools === "object") {
+    // The extracted set *replaces* the previous one rather than merging into
+    // it. Merging would keep a tool upstream has renamed or removed forever,
+    // so the wire shape could never converge on what the release actually
+    // ships — the opposite of adapting.
+    const nextTools = { ...update.tools };
+    if (Object.keys(nextTools).length > 0) {
+      if (stableStringify(nextTools) !== stableStringify(getTools())) {
+        changed.push("tools");
+      }
+      toolProfile = nextTools;
+      toolProfileSource = "source";
+      toolProfileVersion = next.version;
     }
   }
 
   if (changed.length > 0) {
     recipe = next;
   }
-  // The source tag records where the recipe was last read from, not whether it
-  // changed. Two consecutive releases with identical schema still need the tag
-  // to advance, or /health would report a stale reference forever.
-  if (sourceTag) lastSourceTag = sourceTag;
+  if (tag) lastSourceTag = tag;
   return changed;
 }
 
-/**
- * Compare what upstream sends against what we send. Reporting only.
- *
- * Two headers are excluded because they are conditional upstream, not part of
- * the baseline mask: `x-opencode-parent-session-id` / `x-parent-session-id` are
- * only attached when a request belongs to a subagent session. The bridge has no
- * subagents, so their absence is correct rather than drift — reporting them
- * would be a permanent false alarm that trains the reader to ignore this field.
- */
-const CONDITIONAL_HEADERS = new Set(["x-opencode-parent-session-id", "x-parent-session-id"]);
-
-function detectDrift() {
-  const ours = new Set([
-    "x-opencode-session-id",
-    "x-opencode-session",
-    "x-session-affinity",
-    "x-session-id",
-    "x-opencode-project",
-    "x-opencode-client",
-    "user-agent",
-  ]);
-  const theirs = new Set(
-    recipe.headers.map((h) => h.toLowerCase()).filter((h) => !CONDITIONAL_HEADERS.has(h))
-  );
-  const missing = [...theirs].filter((h) => !ours.has(h));
-  const extra = [...ours].filter((h) => !theirs.has(h));
-  lastDrift = { missing, extra, checkedAgainst: lastSourceTag };
-  return lastDrift;
-}
-
-async function fetchText(url, timeoutMs) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.text();
-}
+// --- Refresh & Reactive Self-Heal --------------------------------------------
 
 /**
- * Load the tool profile for a release, best evidence first.
- *
- * Order matters and is deliberate:
- *   1. A saved capture is exact — it is literally what a CLI sent.
- *   2. The published package is authoritative but inferred — it is the code the
- *      release was built from, read statically.
- *   3. DEFAULT_TOOLS is the shipped fallback, used only when both fail.
- *
- * Never throws: a failure keeps the previous profile in place.
+ * @param {object}  [opts]
+ * @param {boolean} [opts.force]    Adopt whatever the handshake reports, even in
+ *                                  reactive mode and even when the version has
+ *                                  not moved (the gate can move without a bump).
+ *                                  Used by the gate-rejection self-heal.
+ * @param {boolean} [opts.recheck]  Skip the freshness guard and consult the
+ *                                  handshake now, but still respect UPDATE_MODE
+ *                                  when deciding whether to adopt. Used by the
+ *                                  periodic CLI-version poll.
  */
-async function loadToolProfile(version, { force = false } = {}) {
-  if (!version) return { updated: false, reason: "no-version" };
-  if (toolProfileInFlight) return toolProfileInFlight;
-
-  const fresh =
-    toolProfile &&
-    toolProfileVersion === version &&
-    Date.now() - toolProfileFetchedAt < TOOL_PROFILE_TTL_MS;
-  if (fresh && !force) return { updated: false, reason: "fresh" };
-
-  toolProfileInFlight = (async () => {
-    try {
-      // 1. Recorded from a real CLI: exact bytes, no inference.
-      const captured = capture.loadProfile();
-      if (captured && captured.tools && Object.keys(captured.tools).length > 0) {
-        toolProfile = captured.tools;
-        toolProfileSource = "capture";
-        toolProfileVersion = version;
-        toolProfileFetchedAt = Date.now();
-        toolProfileError = null;
-        return {
-          updated: true,
-          source: "capture",
-          tools: Object.keys(captured.tools),
-          capturedAt: captured.capturedAt,
-        };
-      }
-
-      // 2. Extract from the published package at this exact version.
-      const profile = await artifact.load(version);
-      if (profile && profile.tools && Object.keys(profile.tools).length > 0) {
-        toolProfile = profile.tools;
-        toolProfileSource = "artifact";
-        toolProfileVersion = version;
-        toolProfileFetchedAt = Date.now();
-        toolProfileError = null;
-        if (Array.isArray(profile.partial) && profile.partial.length > 0) {
-          console.warn(
-            `[opencode-free-bridge] Tool profile ${version} partially resolved: ` +
-              profile.partial.map((p) => `${p.tool}(${p.unresolved.join("|")})`).join(", ")
-          );
-        }
-        return {
-          updated: true,
-          source: "artifact",
-          tools: Object.keys(profile.tools),
-          missing: profile.missing,
-          partial: profile.partial,
-        };
-      }
-      throw new Error("artifact extraction yielded no tools");
-    } catch (err) {
-      toolProfileError = err.message || String(err);
-      // Keep whatever profile we already have; DEFAULT_TOOLS covers a cold start.
-      if (!toolProfile) {
-        toolProfile = { ...DEFAULT_TOOLS };
-        toolProfileSource = "default";
-      }
-      return { updated: false, error: toolProfileError, source: toolProfileSource };
-    } finally {
-      toolProfileInFlight = null;
-    }
-  })();
-
-  return toolProfileInFlight;
-}
-
-/**
- * Refresh the identity from upstream. Single-flight: concurrent callers share
- * one round of network calls. Never throws — a failed refresh keeps the
- * existing recipe in place.
- *
- * Version resolution goes through `handshake.js`, which asks the same endpoint
- * the CLI asks. That gives us two things the Atom feed cannot:
- *
- *   - the commit SHA the release was built from, so source is read at an
- *     immutable reference rather than a movable tag;
- *   - `minimum: true`, upstream's own statement that the floor has moved.
- *     That is acted on immediately, in both UPDATE_MODEs, because waiting for a
- *     rejection when the answer is already known only costs a failed request.
- *
- * The three source files are only fetched when the version actually moves (or
- * a rejection forces a re-derivation), keeping steady-state traffic minimal.
- */
-async function refresh({ force = false } = {}) {
+async function refresh({ force = false, recheck = false } = {}) {
   if (process.env.OPENCODE_USER_AGENT) {
-    // Operator pinned the UA: nothing to derive.
     return { updated: false, reason: "pinned" };
   }
-  if (!force && Date.now() - lastCheckTime < IDENTITY_TTL_MS) {
+  if (!force && !recheck && Date.now() - lastCheckTime < IDENTITY_TTL_MS) {
     return { updated: false, reason: "fresh" };
   }
   if (refreshInFlight) return refreshInFlight;
 
   refreshInFlight = (async () => {
     try {
-      // 1. Which release is authoritative? Ask the CLI's own endpoint.
-      const release = await handshake.resolve(recipe.version);
+      const release = await resolveRelease(recipe.version);
       const latest = release.version;
       if (!latest) throw new Error(release.error || "handshake resolved no version");
 
       lastCheckTime = Date.now();
       lastRefreshError = release.stale ? release.error || "handshake stale" : null;
 
-      // `force` means "ignore the TTL and look now" — it does NOT mean "trust
-      // whatever upstream says". Version only ever moves forward:
-      //
-      //   upstream < ours   → ignore. An older release would drop us below the
-      //                       floor upstream enforces (and below any floor
-      //                       learned from an UpgradeRequired).
-      //   upstream == ours  → re-derive only when forced: a gate can move
-      //                       without a version bump.
-      //   upstream > ours   → adopt, unless UPDATE_MODE=reactive and nothing
-      //                       indicates the gate moved.
       const cmp = compareVersions(latest, recipe.version);
-
       if (cmp < 0) {
-        return { updated: false, version: recipe.version, reason: `newer-local:${recipe.version}` };
+        return {
+          updated: false,
+          version: recipe.version,
+          reason: `newer-local:${recipe.version}`,
+        };
       }
 
+      const updateMode = getUpdateMode();
       const forcedByUpstream = release.minimum === true;
-      const shouldAdopt = cmp > 0 && (force || UPDATE_MODE === "always" || forcedByUpstream);
+      const shouldAdopt = cmp > 0 && (force || updateMode === "always" || forcedByUpstream);
 
       if (cmp === 0 && !force) {
-        // Same version: still make sure a tool profile exists for it.
-        const tools = await loadToolProfile(recipe.version);
         return {
           updated: false,
           version: recipe.version,
           reason: "up-to-date",
-          tools: tools.updated ? tools : undefined,
         };
       }
       if (cmp > 0 && !shouldAdopt) {
+        // Reactive mode: remember that a release exists without adopting it.
+        // The next gate rejection forces a refresh, which flips shouldAdopt.
+        lastAvailable = latest;
         return {
           updated: false,
           version: recipe.version,
           available: latest,
-          reason: `available-not-adopted:${UPDATE_MODE}`,
+          reason: `available-not-adopted:${updateMode}`,
         };
       }
+      lastAvailable = null;
 
-      // 2. Version moved (or forced): derive the rest of the recipe from that
-      //    exact commit. This is the only place the 4-file read happens.
-      const ref = handshake.sourceRef(release);
+      const ref = sourceRef(release);
       const update = { version: latest };
       let sourceRead = false;
-      try {
-        const bodies = await Promise.all(
-          Object.entries(SOURCE_FILES).map(async ([key, path]) => [
-            key,
-            await fetchText(`${SOURCE_BASE}/${ref}/${path}`, SOURCE_TIMEOUT_MS),
-          ])
-        );
-        Object.assign(update, extractRecipe(Object.fromEntries(bodies)));
-        sourceRead = true;
-      } catch {
-        // Source unavailable (offline, renamed path, rate limit): the version
-        // alone is still worth adopting — it is the part that actually gates.
+
+      const settled = await Promise.allSettled(
+        Object.entries(SOURCE_FILES).map(async ([key, filePath]) => [
+          key,
+          await fetchText(`${SOURCE_BASE}/${ref}/${filePath}`, SOURCE_TIMEOUT_MS),
+        ])
+      );
+      const fetchedFiles = {};
+      for (const item of settled) {
+        if (item.status === "fulfilled") {
+          fetchedFiles[item.value[0]] = item.value[1];
+          sourceRead = true;
+        }
+      }
+      if (sourceRead) {
+        Object.assign(update, extractRecipe(fetchedFiles));
       }
 
       const changed = applyRecipe(update, ref);
-
-      // 3. Tool definitions for this version. Fetched in the same pass because
-      //    a version bump is the only event that can change them.
-      const tools = await loadToolProfile(latest, { force: true });
-
-      // Extraction completeness. A regex that no longer matches upstream's
-      // source is NOT fatal — the previous recipe keeps working and the version
-      // still advances. But it is the early warning that the next gate move
-      // will not be followed, so it must be visible rather than silent.
-      if (sourceRead) {
-        lastMissingFields = RECIPE_FIELDS.filter((f) => update[f] === undefined);
-        if (lastMissingFields.length > 0) {
-          console.warn(
-            `[opencode-free-bridge] Identity extraction incomplete at ${ref}: ` +
-              `could not derive ${lastMissingFields.join(", ")}. ` +
-              `Previous values are still in use, but a gate change may not be followed.`
-          );
-        }
-      }
-
-      detectDrift();
       return {
-        updated: changed.length > 0 || tools.updated,
+        updated: changed.length > 0,
         changed,
         version: recipe.version,
         tag: ref,
         sourceRead,
-        missing: lastMissingFields,
         release: {
           version: release.version,
           sha: release.sha,
           source: release.source,
           minimum: release.minimum,
         },
-        tools: tools.updated ? tools : undefined,
       };
     } catch (err) {
       lastRefreshError = err.message || String(err);
-      // Keep the old recipe; retry on the next lazy check.
       return { updated: false, error: lastRefreshError };
     } finally {
       refreshInFlight = null;
@@ -670,41 +718,31 @@ async function refresh({ force = false } = {}) {
 }
 
 /**
- * Lazy freshness check for the request path.
- *
- * Deliberately NON-BLOCKING: the refresh runs in the background and the current
- * request proceeds with the identity already in hand. A request must never wait
- * on GitHub to be served — the mask only changes between releases, so serving
- * one request with the previous mask is harmless, and the next request picks up
- * the new one. Real gate rejections are handled reactively by
- * `onGateRejection`, which does block because at that point we have no choice.
+ * Non-blocking freshness check on the request path.
+ * - In `always` mode: kicks off a background handshake check after TTL expiry.
+ * - In `reactive` mode: stays silent after initial check until a gate error occurs.
  */
 function ensureFresh() {
   if (Date.now() - lastCheckTime < IDENTITY_TTL_MS) {
     return { updated: false, reason: "fresh" };
   }
-  // Fire and forget: never awaited by the request path.
+  if (getUpdateMode() === "reactive" && lastCheckTime > 0) {
+    return { updated: false, reason: "reactive-idle" };
+  }
   refresh().catch(() => {});
   return { updated: false, reason: "refreshing-in-background" };
 }
 
 /**
- * Upstream rejected our identity. Refresh immediately, ignoring TTL, and tell
- * the caller whether a single retry is worth attempting.
- *
- * `attempted` is the caller's own "already retried once" flag so a persistent
- * rejection cannot loop.
+ * Reactive self-heal when upstream rejects our request with a CLI gate error
+ * (403 FreeTierError or 426 UpgradeRequired).
  */
 async function onGateRejection(status, errType, errMsg, attempted = false) {
   if (attempted) return { retry: false, reason: "already-retried" };
 
-  const before = recipe.version;
-  // Snapshot the profile *content*, not just its label: a reload that returns
-  // the same definitions has taught us nothing, and retrying would burn quota.
-  const toolsBefore = stableStringify(toolProfile || DEFAULT_TOOLS);
+  const versionBefore = recipe.version;
+  const toolsBefore = stableStringify(getTools());
 
-  // An UpgradeRequired response tells us the exact floor. Adopt it even if the
-  // handshake is unreachable, so we stay above the gate.
   const floor = parseVersionFloor(errMsg);
   if (floor) {
     versionFloor = floor;
@@ -714,19 +752,10 @@ async function onGateRejection(status, errType, errMsg, attempted = false) {
   }
 
   const result = await refresh({ force: true });
+  const toolsAfter = stableStringify(getTools());
 
-  // The tool layer can move without a version bump, so a rejection always
-  // re-reads the tool profile too — that is the whole point of this path.
-  await loadToolProfile(recipe.version, { force: true });
-
-  const toolsAfter = stableStringify(toolProfile || DEFAULT_TOOLS);
-
-  // Retry only when we actually learned something: a newer version, an adopted
-  // floor, changed recipe fields, or tool definitions that differ from what we
-  // were sending. A blind retry on an unchanged mask would burn quota and delay
-  // the real error.
   const learned =
-    recipe.version !== before ||
+    recipe.version !== versionBefore ||
     toolsAfter !== toolsBefore ||
     (result && Array.isArray(result.changed) && result.changed.length > 0);
 
@@ -735,33 +764,41 @@ async function onGateRejection(status, errType, errMsg, attempted = false) {
     reason: floor
       ? `version-floor:${floor}`
       : learned
-        ? `updated:${[result?.reason, toolProfileSource].filter(Boolean).join("+")}`
+        ? `updated:${result?.version || recipe.version}`
         : "no-change",
     status,
     errType,
-    toolSource: toolProfileSource,
   };
 }
 
-/**
- * Build a session id in the format upstream currently expects.
- *
- * The 48-bit prefix encodes `timestamp * multiplier + counter`. Upstream
- * decodes it and expects the counter to stay small, so we wrap into the next
- * millisecond once it fills the multiplier space — otherwise a burst of ids in
- * one millisecond pushes counter bits into the timestamp field and upstream
- * rejects the request.
- */
+// --- Fast Session ID Generator (Pooled CSPRNG) -------------------------------
+
 let lastTimestamp = 0;
 let counter = 0;
 const MAX_COUNTER_PER_MS = 16;
+const RAND_POOL_SIZE = 14 * 256;
+const randPool = Buffer.allocUnsafe(RAND_POOL_SIZE);
+let randPoolOffset = RAND_POOL_SIZE;
+
+function nextRandomChars(chars, count) {
+  if (randPoolOffset + count > RAND_POOL_SIZE) {
+    crypto.randomFillSync(randPool);
+    randPoolOffset = 0;
+  }
+  const len = chars.length;
+  let out = "";
+  for (let i = 0; i < count; i++) {
+    out += chars[randPool[randPoolOffset + i] % len];
+  }
+  randPoolOffset += count;
+  return out;
+}
 
 function createId(descending = true, timestamp = Date.now()) {
   const {
     sessionCharset: chars,
     sessionLength: length,
     sessionMultiplier: mult,
-    sessionPrefix: prefix,
   } = recipe;
 
   if (timestamp !== lastTimestamp) {
@@ -778,97 +815,50 @@ function createId(descending = true, timestamp = Date.now()) {
 
   const hexChars = 12;
   const hex = (value & mask).toString(16).padStart(hexChars, "0");
-
   const randomChars = Math.max(0, length - hexChars);
-  let out = "";
-  for (let i = 0; i < randomChars; i++) {
-    out += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return hex + out;
+  return hex + nextRandomChars(chars, randomChars);
 }
+
+// --- Accessors & Tool Formatting ---------------------------------------------
 
 function getRecipe() {
   return { ...recipe };
 }
 
-function getState() {
-  return {
-    recipe: getRecipe(),
-    userAgent: getUserAgent(),
-    lastCheckTime,
-    ttlMs: IDENTITY_TTL_MS,
-    versionFloor,
-    lastRefreshError,
-    lastSourceTag,
-    lastDrift,
-    // Non-empty means the last successful source read could not derive these
-    // fields — the early warning that a regex no longer matches upstream.
-    missingFields: lastMissingFields,
-    inFlight: Boolean(refreshInFlight),
-    updateMode: UPDATE_MODE,
-    toolProfile: {
-      source: toolProfileSource,
-      version: toolProfileVersion,
-      fetchedAt: toolProfileFetchedAt,
-      ageMs: toolProfileFetchedAt ? Date.now() - toolProfileFetchedAt : null,
-      ttlMs: TOOL_PROFILE_TTL_MS,
-      toolNames: toolProfile ? Object.keys(toolProfile) : null,
-      error: toolProfileError,
-    },
-  };
-}
-
-/** The tool definitions currently in use. */
 function getTools() {
-  return toolProfile || DEFAULT_TOOLS;
+  // An empty profile is not a profile. Without this guard `toolProfile || ...`
+  // lets `{}` win (objects are truthy) and the bridge sends `tools: []`, which
+  // upstream rejects with 403 — the exact failure the fingerprint exists to
+  // avoid. An empty or malformed profile falls back to the shipped set.
+  if (toolProfile && Object.keys(toolProfile).length > 0) return toolProfile;
+  return DEFAULT_TOOLS;
 }
 
 /**
- * How many tools to send upstream.
- *
- * A capture records everything a real CLI sends — around ten definitions,
- * ~20 KB of JSON, which costs real prompt tokens on every request. The gate
- * only fingerprints a small core, so sending the whole set is waste.
- *
- *   core    (default) only the tools the gate is known to check
- *   full    every tool in the profile, exactly as a CLI would send it
- *
- * `TOOL_PROFILE_SCOPE=full` is the escape hatch: if a gate ever starts
- * requiring a tool outside the core set, sending the full captured list is the
- * faithful reproduction.
+ * The upstream header names currently in force, in upstream's own order.
+ * `server.js` builds its header object from this, so a header added upstream
+ * starts being sent on the next request after a refresh.
  */
-const TOOL_SCOPE = (process.env.TOOL_PROFILE_SCOPE || "core").toLowerCase();
+function getHeaderNames() {
+  return Array.isArray(recipe.headers) ? recipe.headers.slice() : DEFAULT_RECIPE.headers.slice();
+}
 
-/**
- * Tools the gate has been observed to fingerprint. `read` has been present in
- * every variant; `shell` replaced `bash` in the v2 line, so both are kept and
- * whichever the profile provides is used.
- */
-const CORE_TOOL_NAMES = ["read", "shell", "bash"];
-
-/**
- * Tool definitions shaped for the wire, in the order the gate expects them.
- *
- * `read` leads because it is the one tool present in every observed gate
- * variant. Any additional tools follow in the profile's own order.
- */
 function getToolList(flat = false) {
   const profile = getTools();
   const available = Object.keys(profile);
 
-  let ordered;
-  if (TOOL_SCOPE === "full") {
-    ordered = [
-      ...REQUIRED_TOOL_HINTS.filter((n) => profile[n]),
-      ...available.filter((n) => !REQUIRED_TOOL_HINTS.includes(n)),
-    ];
-  } else {
-    // Core scope: only the fingerprinted names the profile actually has. If it
-    // has none of them (a malformed capture), fall back to everything rather
-    // than sending an empty array, which the gate rejects outright.
-    ordered = CORE_TOOL_NAMES.filter((n) => profile[n]);
-    if (ordered.length === 0) ordered = available;
-  }
+  // A source-derived profile is sent whole. Filtering it through a hardcoded
+  // name list would defeat the point of deriving it: if upstream renames
+  // `shell`, the extractor records the new name but a fixed list would keep
+  // sending the old one — adapting the recipe while silently dropping the
+  // change from the wire. The core filter exists only for oversized profiles
+  // (the retired capture path), where the extra tools cost prompt tokens.
+  const ordered =
+    toolProfileSource === "source" || available.length <= CORE_TOOL_NAMES.length
+      ? available
+      : CORE_TOOL_NAMES.filter((n) => profile[n]).length > 0
+        ? CORE_TOOL_NAMES.filter((n) => profile[n])
+        : available;
 
   return ordered.map((name) => {
     const def = profile[name];
@@ -891,65 +881,166 @@ function getToolList(flat = false) {
   });
 }
 
-/** Test hooks — not used by the server. */
+/**
+ * Resolve the header names upstream's client sends to concrete values.
+ *
+ * Returns `{ headers, unsent }`. `unsent` lists names we know upstream sends
+ * but whose value this bridge cannot derive — reported in `/health` instead of
+ * being sent empty, because an empty required header is worse than a missing
+ * one.
+ */
+const GATE_HEADER_VALUES = [
+  "user-agent",
+  "x-opencode-client",
+  "x-opencode-project",
+  "x-opencode-session",
+  "x-opencode-session-id",
+  "x-session-affinity",
+  "x-session-id",
+];
+
+function buildGateHeaders(ctx = {}) {
+  const values = {
+    "user-agent": ctx.userAgent,
+    "x-opencode-client": ctx.client,
+    "x-opencode-project": ctx.project,
+    "x-opencode-session": ctx.sessionId,
+    "x-opencode-session-id": ctx.sessionId,
+    "x-session-affinity": ctx.sessionId,
+    "x-session-id": ctx.sessionId,
+  };
+  const headers = {};
+  const unsent = [];
+  for (const name of getHeaderNames()) {
+    const lower = String(name).toLowerCase();
+    const value = values[lower];
+    // Header names are case-insensitive. Emit one canonical spelling per name
+    // so a change of case upstream cannot produce a duplicate key: `User-Agent`
+    // keeps its conventional form, every `x-opencode-*` header stays lowercase.
+    if (value === undefined) unsent.push(name);
+    else headers[lower === "user-agent" ? "User-Agent" : lower] = value;
+  }
+  return { headers, unsent };
+}
+
+/**
+ * Header names the current recipe asks for that this bridge has no value for.
+ * Non-empty means upstream added a header whose value is not derivable from
+ * the release source — the alert that a manual mapping is needed, since the
+ * request will be sent without it.
+ */
+function getUnsentHeaders() {
+  const known = new Set(GATE_HEADER_VALUES);
+  const conditional = new Set(optionalHeaders.map((n) => String(n).toLowerCase()));
+  return getHeaderNames().filter((n) => {
+    const key = String(n).toLowerCase();
+    // Conditional headers (parent-session lineage) are only sent by the CLI
+    // when the session has a parent. This bridge never creates nested
+    // sessions, so their absence is expected, not a gap to report.
+    return !known.has(key) && !conditional.has(key);
+  });
+}
+
+function getSessionPrefix() {
+  return recipe.sessionPrefix || DEFAULT_RECIPE.sessionPrefix;
+}
+
+/** Session id with upstream's prefix, e.g. `ses_<12 hex><14 base62>`. */
+function createSessionId(descending = true, timestamp = Date.now()) {
+  return getSessionPrefix() + createId(descending, timestamp);
+}
+
+function getState() {
+  return {
+    recipe: getRecipe(),
+    userAgent: getUserAgent(),
+    updateMode: getUpdateMode(),
+    lastCheckTime,
+    ttlMs: IDENTITY_TTL_MS,
+    versionFloor,
+    lastRefreshError,
+    lastSourceTag,
+    release: lastRelease,
+    available: lastAvailable,
+    headers: getHeaderNames(),
+    optionalHeaders: optionalHeaders.slice(),
+    unsentHeaders: getUnsentHeaders(),
+    inFlight: Boolean(refreshInFlight),
+    tools: {
+      source: toolProfileSource,
+      version: toolProfileVersion,
+      toolNames: Object.keys(getTools()),
+    },
+  };
+}
+
 function __reset() {
   recipe = { ...DEFAULT_RECIPE };
+  toolProfile = null;
+  toolProfileSource = "default";
+  toolProfileVersion = DEFAULT_RECIPE.version;
+  lastRelease = null;
+  lastAvailable = null;
   lastCheckTime = 0;
   refreshInFlight = null;
   versionFloor = null;
   lastRefreshError = null;
   lastSourceTag = null;
-  lastDrift = null;
-  lastMissingFields = [];
+  optionalHeaders = [];
   lastTimestamp = 0;
   counter = 0;
-  toolProfile = null;
-  toolProfileSource = null;
-  toolProfileVersion = null;
-  toolProfileFetchedAt = 0;
-  toolProfileError = null;
-  toolProfileInFlight = null;
 }
 
 function __setLastCheckTime(v) {
   lastCheckTime = v;
 }
 
+/** Test hook: stage a session prefix without going through recipe validation. */
+function __setSessionPrefix(prefix) {
+  recipe = { ...recipe, sessionPrefix: String(prefix) };
+}
+
 function __setToolProfile(tools, source = "test") {
   toolProfile = tools;
   toolProfileSource = source;
   toolProfileVersion = recipe.version;
-  toolProfileFetchedAt = Date.now();
-  toolProfileError = null;
 }
 
 module.exports = {
   IDENTITY_TTL_MS,
-  TOOL_PROFILE_TTL_MS,
-  UPDATE_MODE,
+   get UPDATE_MODE() {
+    return getUpdateMode();
+  },
   DEFAULT_RECIPE,
   DEFAULT_TOOLS,
-  REQUIRED_TOOL_HINTS,
   SOURCE_FILES,
   parseVersions,
   sortVersions,
+  selectVersion,
   compareVersions,
   parseVersionFloor,
+  sourceRef,
+  resolveRelease,
+  extractToolFromSource,
   extractRecipe,
   buildUserAgent,
   applyRecipe,
-  detectDrift,
   refresh,
-  loadToolProfile,
   ensureFresh,
   onGateRejection,
   createId,
   getUserAgent,
   getRecipe,
   getTools,
+  getHeaderNames,
+  getUnsentHeaders,
+  buildGateHeaders,
+  getSessionPrefix,
+  createSessionId,
   getToolList,
   getState,
   __reset,
   __setLastCheckTime,
+  __setSessionPrefix,
   __setToolProfile,
 };

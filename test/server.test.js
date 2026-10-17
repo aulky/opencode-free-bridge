@@ -475,6 +475,187 @@ describe("server unit & integration tests", () => {
       assert.equal(evilRes.headers["access-control-allow-origin"], undefined);
     });
 
+    it("retries a 403 gate rejection after the identity learns something (body must be read first)", async () => {
+      // Regression: the gate branch used to test `isFreeTierCliGateError(status, "", "")`
+      // before reading the body. A 403 carries its type only in the body, so the
+      // branch was unreachable for 403 — only 426 healed. This asserts a 403
+      // whose body names FreeTierError actually reaches the self-heal path.
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        if (calls === 1) {
+          return {
+            ok: false,
+            status: 403,
+            text: async () =>
+              JSON.stringify({
+                type: "error",
+                error: { type: "FreeTierError", message: "Free models are only available in OpenCode CLI." },
+              }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          // Chat-completions lane: big-pickle is not a Responses model.
+          body: sseStreamFromLines([
+            'data: {"id":"x","choices":[{"index":0,"delta":{"content":"healed"},"finish_reason":null}]}\n\n',
+            'data: {"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n',
+            "data: [DONE]\n\n",
+          ]),
+        };
+      };
+
+      // Make the identity refresh report a change, so a retry is warranted.
+      const realOnGate = identity.onGateRejection;
+      identity.onGateRejection = async () => ({ retry: true, reason: "test-update" });
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(calls, 2, "the rejected request must be replayed once");
+        assert.equal(res.status, 200);
+        assert.equal(res.body.choices[0].message.content, "healed");
+      } finally {
+        identity.onGateRejection = realOnGate;
+      }
+    });
+
+    it("re-mints the session id on retry, so a rejected id shape is not replayed", async () => {
+      // The FreeTierError above is what upstream returns when the request does
+      // not look like the OpenCode client. Measured cause: the session id shape.
+      // The id is derived from the recipe, so an id minted before the refresh
+      // encodes the shape that was just rejected — replaying it fails the same
+      // way. This asserts the retry carries a *different*, correct id.
+      const seen = [];
+      let calls = 0;
+      mockFetchImpl = async (url, opts) => {
+        calls++;
+        seen.push(opts?.headers?.["x-opencode-session-id"] || opts?.headers?.["x-opencode-session"]);
+        if (calls === 1) {
+          return {
+            ok: false,
+            status: 403,
+            text: async () =>
+              JSON.stringify({
+                type: "error",
+                error: {
+                  type: "FreeTierError",
+                  message:
+                    "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.",
+                },
+              }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: sseStreamFromLines([
+            'data: {"id":"x","choices":[{"index":0,"delta":{"content":"healed"},"finish_reason":null}]}\n\n',
+            "data: [DONE]\n\n",
+          ]),
+        };
+      };
+
+      const realOnGate = identity.onGateRejection;
+      identity.onGateRejection = async () => ({ retry: true, reason: "test-update" });
+      sessionCache.clear();
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+          headers: { "x-opencode-session": "client-session-1" },
+        });
+        assert.equal(res.status, 200);
+        assert.equal(seen.length, 2, "one rejected request, one replay");
+        assert.notEqual(seen[0], seen[1], "the replay must not reuse the rejected session id");
+        assert.match(seen[1], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+      } finally {
+        identity.onGateRejection = realOnGate;
+        sessionCache.clear();
+      }
+    });
+
+    it("evicts a rejected session id from the cache so it is never reused", async () => {
+      // The rejected id is derived from the recipe, so it is cached under the
+      // client's key. If it survives the heal, every later request from that
+      // client replays the same rejected shape — the bridge would be stuck.
+      sessionCache.clear();
+      const body = { model: "big-pickle", messages: [{ role: "user", content: "cache me" }] };
+      const req = { headers: {} };
+      const first = getPersistentSessionId(req, body);
+      assert.equal(sessionCache.size, 1);
+
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        if (calls === 1) {
+          return {
+            ok: false,
+            status: 403,
+            text: async () =>
+              JSON.stringify({
+                type: "error",
+                error: {
+                  type: "FreeTierError",
+                  message:
+                    "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.",
+                },
+              }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: sseStreamFromLines([
+            'data: {"id":"x","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n',
+            "data: [DONE]\n\n",
+          ]),
+        };
+      };
+
+      const realOnGate = identity.onGateRejection;
+      identity.onGateRejection = async () => ({ retry: true, reason: "test-update" });
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", body);
+        assert.equal(res.status, 200);
+        // The old id must be gone; a fresh one must be cached instead.
+        const cached = [...sessionCache.values()].map((e) => e.sessionId);
+        assert.equal(cached.includes(first), false, "rejected id must be evicted");
+        assert.equal(cached.length, 1, "exactly one replacement id");
+      } finally {
+        identity.onGateRejection = realOnGate;
+        sessionCache.clear();
+      }
+    });
+
+    it("does not retry when the identity learned nothing, and surfaces the real error", async () => {
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        return {
+          ok: false,
+          status: 403,
+          text: async () =>
+            JSON.stringify({ error: { type: "FreeTierError", message: "free tier" } }),
+        };
+      };
+      const realOnGate = identity.onGateRejection;
+      identity.onGateRejection = async () => ({ retry: false, reason: "no-change" });
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(calls, 1, "no retry loop when nothing changed");
+        assert.equal(res.status, 403);
+        assert.equal(res.body.error.type, "FreeTierError");
+      } finally {
+        identity.onGateRejection = realOnGate;
+      }
+    });
+
     it("appends update hint only when upstream returns OpenCode CLI / FreeTierError gate rejection", async () => {
       mockFetchImpl = async () => ({
         ok: false,

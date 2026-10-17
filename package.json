@@ -11,7 +11,7 @@
     "test": "node --test test/*.test.js",
     "verify": "node verify.js",
     "verify:quick": "node verify.js --quick",
-    "capture": "node -e \"require('./capture').captureAndSave().then(r=>console.log(r.error?('capture failed: '+r.error):('saved '+r.path)))\""
+    "drill": "node gate-drill.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -19,12 +19,9 @@
   "files": [
     "server.js",
     "identity.js",
-    "handshake.js",
-    "artifact.js",
-    "capture.js",
-    "probe.js",
     "token-budget.js",
     "verify.js",
+    "gate-drill.js",
     "install.sh",
     "README.md"
   ],
