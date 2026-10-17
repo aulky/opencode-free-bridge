@@ -104,6 +104,17 @@ were proving — the *order* of the heal (stale shape → refresh → re-minted 
 full tool set → retry → 200) — against a deterministic fake gate, so the
 self-heal keeps a proof that does not depend on upstream's mood.
 
+### Free-tier only, enforced instead of assumed
+
+The bridge sends `Authorization: Bearer public` and has no login, so a paid
+model can only fail upstream — measured: `gpt-5.4` answers `401 AuthError
+"Missing API key."`, which sends the user hunting for an account that this
+bridge cannot use. The catalog already knows the price, so a non-free id is now
+refused locally: `404 model_not_free` ("this bridge has no account to run it
+with; free models are listed at /v1/models"), or `404 model_deprecated` for a
+retired one. `normalizeModel` no longer passes a paid id through either, so an
+alias pointing at one falls through to a free sibling.
+
 ### Aliases derived, not hardcoded
 
 `MODEL_MAP` had drifted the same way: four of its targets were retired models,

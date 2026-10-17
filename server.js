@@ -359,10 +359,11 @@ function normalizeModel(rawModel) {
   // group (and for the case where the catalog has not been read yet).
   const lower = stripped.toLowerCase();
   const verdict = identity.getCatalogVerdict(lower);
-  // A live id passes through; a *deprecated* one does not — upstream would
-  // answer 410 ModelDeprecated, so an alias that still points at it must be
-  // allowed to fall through to the live sibling.
-  if (verdict === "free" || verdict === "paid") return stripped;
+  // This bridge is free-tier only: it sends `Authorization: Bearer public` and
+  // has no way to authenticate a paid request. A paid id would therefore only
+  // earn a 401/402 upstream, so it is not passed through — an alias that points
+  // at one is allowed to fall through to a free sibling instead.
+  if (verdict === "free") return stripped;
   const derived = identity.resolveModelAlias(lower);
   if (derived) return derived;
   const mapped = MODEL_MAP[lower];
@@ -1194,6 +1195,28 @@ function handleRequest(req, res) {
               type: "invalid_request_error",
               param: "model",
               code: "model_required",
+            },
+          })
+        );
+      }
+
+      // Free tier only: this bridge sends `Authorization: Bearer public` and
+      // cannot authenticate anything else, so a model the catalog prices above
+      // zero can only fail upstream. Say that here — an upstream 401 ("no
+      // session") sends the user hunting for a login that does not exist.
+      const modelVerdict = identity.getCatalogVerdict(targetModel);
+      if (modelVerdict && modelVerdict !== "free") {
+        const isRetired = modelVerdict === "deprecated";
+        res.writeHead(404, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            error: {
+              message: isRetired
+                ? `Model '${targetModel}' has been retired upstream. Free models are listed at /v1/models.`
+                : `Model '${targetModel}' is not on the free tier, and this bridge has no account to run it with. Free models are listed at /v1/models.`,
+              type: "invalid_request_error",
+              param: "model",
+              code: isRetired ? "model_deprecated" : "model_not_free",
             },
           })
         );

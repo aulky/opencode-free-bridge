@@ -482,6 +482,46 @@ describe("server unit & integration tests", () => {
       assert.equal(evilRes.headers["access-control-allow-origin"], undefined);
     });
 
+    it("refuses a paid or retired model locally instead of forwarding it", async () => {
+      // Upstream answers a paid model with `401 AuthError: Missing API key.`
+      // This bridge has no account, so that response sends the user looking for
+      // a login that does not exist. The catalog already knows the price, so
+      // the request is refused here with a reason that points at /v1/models.
+      const realVerdict = identity.getCatalogVerdict;
+      identity.getCatalogVerdict = (id) => {
+        const lower = String(id).toLowerCase();
+        if (lower === "gpt-5.4") return "paid";
+        if (lower === "cat-jam-free") return "deprecated";
+        return undefined;
+      };
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        return { ok: true, status: 200, body: sseStreamFromLines(["data: [DONE]\n\n"]) };
+      };
+
+      try {
+        const paid = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "gpt-5.4",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(paid.status, 404);
+        assert.equal(paid.body.error.code, "model_not_free");
+        assert.match(paid.body.error.message, /no account/);
+
+        const retired = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "cat-jam-free",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(retired.status, 404);
+        assert.equal(retired.body.error.code, "model_deprecated");
+
+        assert.equal(calls, 0, "neither request may reach upstream");
+      } finally {
+        identity.getCatalogVerdict = realVerdict;
+      }
+    });
+
     it("lets the catalog, not the model's name, decide what is free", async () => {
       // The gateway's /models list is not the authority: it can still list a
       // model the catalog marks deprecated, and it can omit one the catalog
