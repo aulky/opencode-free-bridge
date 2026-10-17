@@ -959,7 +959,6 @@ function buildUpstreamHeaders(req, sessionId) {
     client: client === "desktop" || client === "cli" ? client : "cli",
     project: String(project),
     sessionId,
-    requestId: `msg_${crypto.randomBytes(10).toString("hex")}`,
   });
   return {
     "Authorization": "Bearer public",

@@ -627,7 +627,6 @@ describe("identity: gate header wiring", () => {
       client: "cli",
       project: "global",
       sessionId: "ses_abc",
-      requestId: "msg_0123456789abcdef0123",
     };
     const { headers, unsent } = identity.buildGateHeaders(ctx);
     assert.equal(headers["User-Agent"], ctx.userAgent);
@@ -637,7 +636,6 @@ describe("identity: gate header wiring", () => {
     assert.equal(headers["x-opencode-session-id"], "ses_abc");
     assert.equal(headers["x-session-affinity"], "ses_abc");
     assert.equal(headers["x-session-id"], "ses_abc");
-    assert.equal(headers["x-opencode-request"], ctx.requestId);
     assert.deepEqual(unsent, []);
   });
 
@@ -648,7 +646,6 @@ describe("identity: gate header wiring", () => {
       client: "cli",
       project: "global",
       sessionId: "ses_abc",
-      requestId: "msg_0123456789abcdef0123",
     });
     // The name is known from source but this bridge has no value for it: it is
     // reported rather than sent empty, which would be worse than omitting it.
