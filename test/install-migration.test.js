@@ -57,6 +57,18 @@ test("installer rewrites a service unit that points at node", () => {
   assert.match(src, /\.bak/);
 });
 
+test("installer writes a systemd unit systemd actually accepts", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // systemd does not strip quotes on WorkingDirectory=; it treats them as part
+  // of the path and fails with "path is not absolute". ExecStart= does parse
+  // quotes, so only the directory must stay bare.
+  assert.doesNotMatch(src, /^WorkingDirectory="/m, "WorkingDirectory must not be quoted");
+  assert.match(src, /^WorkingDirectory=\$BINDIR$/m);
+  // A failed restart must not be reported as success.
+  assert.match(src, /if ! systemctl restart opencode-free-bridge/);
+});
+
 test("installer finds bun installed outside PATH", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");

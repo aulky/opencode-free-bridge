@@ -240,7 +240,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(id -un)
-WorkingDirectory="$BINDIR"
+WorkingDirectory=$BINDIR
 Environment=PORT=$PORT
 Environment=HOST=$HOST
 ExecStart="$RUNTIME" "$BINDIR/server.js"
@@ -253,7 +253,10 @@ WantedBy=multi-user.target
 UNIT
       systemctl daemon-reload
       systemctl enable opencode-free-bridge >/dev/null 2>&1 || true
-      systemctl restart opencode-free-bridge
+      if ! systemctl restart opencode-free-bridge; then
+        warn "systemd refused to start opencode-free-bridge — inspect: systemctl status opencode-free-bridge"
+        return 1
+      fi
       say "systemd service installed and restarted"
       return 0
     elif systemctl --user status >/dev/null 2>&1; then
@@ -267,7 +270,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory="$BINDIR"
+WorkingDirectory=$BINDIR
 Environment=PORT=$PORT
 Environment=HOST=$HOST
 ExecStart="$RUNTIME" "$BINDIR/server.js"
@@ -279,7 +282,10 @@ WantedBy=default.target
 UNIT
       systemctl --user daemon-reload
       systemctl --user enable opencode-free-bridge >/dev/null 2>&1 || true
-      systemctl --user restart opencode-free-bridge
+      if ! systemctl --user restart opencode-free-bridge; then
+        warn "systemd --user refused to start opencode-free-bridge — inspect: systemctl --user status opencode-free-bridge"
+        return 1
+      fi
       say "systemd --user service installed and restarted"
       return 0
     else
