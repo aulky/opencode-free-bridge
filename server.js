@@ -1243,6 +1243,34 @@ function handleRequest(req, res) {
           }
         }
 
+        // Endpoint migration. The provider catalog is the authority for the wire
+        // base URL, so an upstream path move (the /zen/v1 → /inference/v1 move)
+        // shows up as a 404/410 at the old path — not as a gate rejection. A 404
+        // is otherwise indistinguishable from "this route does not exist", so
+        // re-derive from the catalog and retry once, but only when the derived
+        // URL actually differs. Replaying the same URL on a 404 would loop.
+        if (!upstreamRes.ok && (upstreamRes.status === 404 || upstreamRes.status === 410)) {
+          const staleUrl = upstreamUrl;
+          try {
+            await upstreamRes.text();
+          } catch {}
+          await identity.refresh({ force: true }).catch(() => null);
+          liveEndpoints = resolveEndpoints(targetModel);
+          const derivedUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
+          if (derivedUrl && derivedUrl !== staleUrl) {
+            console.warn(
+              `[opencode-free-bridge] Upstream endpoint moved (${upstreamRes.status}): ${staleUrl} → ${derivedUrl}; retrying once`
+            );
+            upstreamUrl = derivedUrl;
+            upstreamRes = await fetch(upstreamUrl, {
+              method: "POST",
+              headers: upstreamHeaders,
+              body: JSON.stringify(upstreamBody),
+              signal: abortController.signal,
+            });
+          }
+        }
+
         // Self-healing identity. A gate rejection is identified by the error
         // *body*, not the status line: a 403 is only the gate when its type or
         // message says so, while 426 is the version-floor handshake by itself.

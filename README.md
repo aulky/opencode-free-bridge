@@ -62,6 +62,10 @@ that exercises the gate path against the real service:
 | `empty-tools` | a tool profile that resolves to nothing | the bridge falls back to the shipped fingerprint instead of sending `tools: []` |
 | `session-shape` | a session-id prefix upstream does not recognise | `403 FreeTierError` → recipe re-derived → **fresh** id minted → stale id evicted from cache |
 | `legacy-shape` | the pre-1.5.0 access pattern (control) | the old shape is *accepted* — the gate is not about the endpoint or version string |
+| `endpoint-move` | a chat URL whose path no longer routes (404) | the catalog is re-read, the derived URL is retried once, and the client never sees the 404 |
+| `routing` | a chat URL repointed *after* boot | the endpoint is read per request, not frozen at startup |
+| `allowlist` | a tool renamed in the release's sources | the derived name reaches the wire in `full` scope and the retired name is dropped |
+| `retry-endpoint` | a gate rejection plus a catalog move | the self-heal retry lands on the refreshed endpoint |
 
 ```
   OK  bridge v1.5.0, 9 free models discovered
@@ -448,13 +452,16 @@ either way the wire shape could never converge on what the release ships.
 | User-Agent template + version | yes (`app.ts`, handshake) | followed on refresh |
 | header names | yes (`model-request.ts`) | followed; unknown values reported in `unsentHeaders` |
 | `read` / `shell` schemas and names | yes (`read.ts`, `shell.ts`) | followed; the set replaces the old one |
-| inference endpoint | **no** — `OPENCODE_CHAT_URL` / `OPENCODE_RESPONSES_URL` | must be updated in config |
+| inference endpoint | yes — provider catalog (`models.opencode.ai/api.json`) | followed on refresh; a `404` at the stale path triggers a re-derive + one retry |
 | header *values* | **no** — mapping in `buildGateHeaders` | must be added in code |
 | tool *parameter* semantics | partly — types/minimums/descriptions derived | a brand-new field type falls back to `string` |
 
-The endpoint is the one layer that cannot be read from the release source: it
-lives in the CLI's model routing config, not in the files this bridge reads. It
-is overridable by env var for exactly that case.
+The endpoint is not in the git source tree: the CLI reads it from the provider
+catalog (`models.opencode.ai/api.json`, the same file the real CLI loads at
+boot), so that is what the bridge reads. A migration therefore applies on the
+next refresh — and if the bridge is already pointed at a retired path, the `404`
+triggers a catalog re-read and a single retry. `OPENCODE_CHAT_URL` /
+`OPENCODE_RESPONSES_URL` still pin the value when you need to override it.
 
 **`403 FreeTierError` / `426 UpgradeRequired`**
 Normally self-healing: the bridge refreshes its identity and retries once. If it

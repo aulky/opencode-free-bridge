@@ -475,6 +475,83 @@ describe("server unit & integration tests", () => {
       assert.equal(evilRes.headers["access-control-allow-origin"], undefined);
     });
 
+    it("re-derives the endpoint and retries once when the path moves (404)", async () => {
+      // A path migration upstream surfaces as a 404 at the old URL, not as a
+      // gate rejection. The catalog is the authority for the base URL, so the
+      // bridge must re-derive and retry — the client should never see the 404
+      // that a stale endpoint produces.
+      const seen = [];
+      const realRefresh = identity.refresh;
+      const realGetEndpoints = identity.getEndpoints;
+      let moved = false;
+      identity.refresh = async () => {
+        moved = true;
+        return { updated: true, changed: ["chatUrl"] };
+      };
+      identity.getEndpoints = (model) => {
+        const base = realGetEndpoints(model);
+        if (!moved) return base;
+        return { ...base, chatUrl: "https://moved.example/v1/chat/completions" };
+      };
+
+      mockFetchImpl = async (url) => {
+        seen.push(String(url));
+        if (String(url).includes("/old/")) {
+          return { ok: false, status: 404, text: async () => "<!DOCTYPE html>not found" };
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: sseStreamFromLines([
+            'data: {"id":"x","choices":[{"index":0,"delta":{"content":"healed"},"finish_reason":null}]}\n\n',
+            'data: {"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+            "data: [DONE]\n\n",
+          ]),
+        };
+      };
+
+      try {
+        // Stage a stale endpoint the way a pre-migration release would.
+        identity.applyRecipe({ chatUrl: "https://opencode.ai/old/chat/completions" });
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(res.status, 200, "client must not see the stale-path 404");
+        assert.equal(res.body.choices[0].message.content, "healed");
+        assert.equal(seen.length, 2, "one rejected attempt plus one retry");
+        assert.match(seen[0], /\/old\/chat\/completions$/);
+        assert.match(seen[1], /moved\.example\/v1\/chat\/completions$/);
+      } finally {
+        identity.refresh = realRefresh;
+        identity.getEndpoints = realGetEndpoints;
+        identity.__reset();
+        identity.__setLastCheckTime(Date.now());
+      }
+    });
+
+    it("does not loop when a 404 is not an endpoint move", async () => {
+      // If the catalog derives the same URL, retrying would replay the same
+      // 404. The bridge must surface it instead.
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        return { ok: false, status: 404, text: async () => "not found" };
+      };
+      const realRefresh = identity.refresh;
+      identity.refresh = async () => ({ updated: false, changed: [] });
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(res.status, 404);
+        assert.equal(calls, 1, "a 404 with an unchanged endpoint must not be retried");
+      } finally {
+        identity.refresh = realRefresh;
+      }
+    });
+
     it("retries a 403 gate rejection after the identity learns something (body must be read first)", async () => {
       // Regression: the gate branch used to test `isFreeTierCliGateError(status, "", "")`
       // before reading the body. A 403 carries its type only in the body, so the

@@ -41,10 +41,18 @@ upstream no longer needs a bridge release.
   OpenAI-SDK models are routed to their pinned base; anthropic-only routes are
   left alone rather than silently misrouted (this bridge speaks the OpenAI
   protocols only).
+- **Endpoint moves heal from a 404/410**: A path migration upstream does not
+  answer `403`; the retired path stops routing and answers `404` (HTML). That
+  used to reach the client verbatim even though the catalog already named the
+  new base. The bridge now re-derives from the catalog on `404`/`410` and
+  retries once — but only when the derived URL actually differs, so a genuine
+  "route does not exist" is surfaced instead of replayed in a loop.
 - **Drills**: `routing` proves the endpoint is read per request (a fake server
   started *after* boot receives the request); `allowlist` proves a renamed tool
   reaches the wire in `full` scope; `retry-endpoint` proves the self-heal retry
-  lands on the endpoint learned by the refresh. `npm run drill` is now 7/7.
+  lands on the endpoint learned by the refresh; `endpoint-move` proves a `404`
+  at a stale path is healed and never reaches the client. `npm run drill` is now
+  8/8.
 - **Budget rejections no longer carry the update hint**: when the retry already
   used the freshest derived identity, a repeated `403 FreeTierError` is the
   per-IP allowance, not a stale bridge. Measured: identical, byte-for-byte CLI

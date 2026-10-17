@@ -13,6 +13,13 @@
  *                   bridge adopts that floor, refreshes from the handshake, and
  *                   replays the request.
  *
+ *   endpoint-move   A path migration upstream (the /zen/v1 → /inference/v1
+ *                   move) surfaces as a 404 at the old URL. The provider
+ *                   catalog is the authority for the base URL, so the bridge
+ *                   must re-derive and retry instead of handing the 404 to the
+ *                   client. This drill uses two local servers so it never
+ *                   depends on which path upstream currently serves.
+ *
  *   legacy-shape    The v1.5.0 fingerprint — old ai-sdk User-Agent, old tool
  *                   names, old session prefix — is replayed through the current
  *                   bridge to confirm the access pattern is *not* what gates
@@ -53,6 +60,7 @@ const DRILLS = [
   "routing",
   "allowlist",
   "retry-endpoint",
+  "endpoint-move",
 ];
 
 function ask(port, body) {
@@ -437,6 +445,85 @@ async function drillRetryEndpoint({ identity }) {
   return hits[0] === "old" && hits[1] === "new" && res.status === 200;
 }
 
+/**
+ * endpoint-move — a 404 at a stale path re-derives the endpoint and retries.
+ *
+ * This is the failure mode of an upstream path migration: the old URL stops
+ * routing and answers 404 (HTML, not a gate error). Without this heal the
+ * client would see the 404 even though the bridge knows a catalog URL. Two
+ * local servers stand in for the old and new paths, so the drill is
+ * deterministic and does not depend on what upstream currently serves.
+ */
+async function drillEndpointMove({ identity }) {
+  console.log("\nendpoint-move — a 404 at the stale path re-derives and retries");
+
+  const hits = [];
+  const gone = http.createServer((req, res) => {
+    hits.push("old");
+    res.writeHead(404, { "Content-Type": "text/html" });
+    res.end("<!DOCTYPE html><html><body>not found</body></html>");
+  });
+  const healthy = http.createServer((req, res) => {
+    hits.push("new");
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-fake",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: { content: "OK" }, finish_reason: null }],
+      })}\n\n`
+    );
+    res.write(
+      `data: ${JSON.stringify({
+        id: "chatcmpl-fake",
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      })}\n\n`
+    );
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+  await new Promise((r) => gone.listen(0, "127.0.0.1", r));
+  await new Promise((r) => healthy.listen(0, "127.0.0.1", r));
+  const gonePort = gone.address().port;
+  const healthyPort = healthy.address().port;
+
+  const before = identity.getEndpoints().chatUrl;
+  identity.applyRecipe({ chatUrl: `http://127.0.0.1:${gonePort}/old/chat/completions` });
+  identity.__setLastCheckTime(Date.now());
+
+  // Stand in for the catalog refresh: the drill stages the migrated URL the way
+  // refresh() adopts `chatUrl` from the provider catalog.
+  const realRefresh = identity.refresh;
+  identity.refresh = async () => {
+    identity.applyRecipe({ chatUrl: `http://127.0.0.1:${healthyPort}/v1/chat/completions` });
+    return { updated: true, changed: ["chatUrl"] };
+  };
+
+  let res;
+  try {
+    res = await ask(port(), {
+      model: "big-pickle",
+      messages: [{ role: "user", content: "Reply with exactly: OK" }],
+    });
+  } finally {
+    identity.refresh = realRefresh;
+    identity.applyRecipe({ chatUrl: before });
+    await new Promise((r) => gone.close(r));
+    await new Promise((r) => healthy.close(r));
+  }
+
+  console.log(`  attempts        : ${JSON.stringify(hits)}`);
+  console.log(`  client saw      : HTTP ${res.status} ${JSON.stringify(content(res))}`);
+
+  line(hits[0] === "old", "first attempt hit the stale path");
+  line(hits[1] === "new", "the 404 triggered a re-derived retry");
+  line(res.status === 200, "client received 200, not the 404");
+  line(content(res).length > 0, "client received real content");
+
+  return hits[0] === "old" && hits[1] === "new" && res.status === 200;
+}
+
 async function main() {
   const wanted = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const drills = wanted.length > 0 ? wanted : DRILLS;
@@ -470,6 +557,7 @@ async function main() {
       routing: drillRouting,
       allowlist: drillAllowlist,
       "retry-endpoint": drillRetryEndpoint,
+      "endpoint-move": drillEndpointMove,
     };
     const fn = DRILL_FNS[name];
     // A cached session id from a previous drill would be reused for an
