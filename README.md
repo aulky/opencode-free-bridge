@@ -63,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main
 
 What `install.sh` does:
 1. Finds `bun` across `PATH`, `$BUN_INSTALL/bin`, `~/.bun/bin`, `~/.local/bin`, `/usr/local/bin`, and `/opt/bun/bin`, or installs it via `https://bun.sh/install` (installing `unzip` first on minimal Linux images when needed).
-2. Downloads every file into a staging directory and validates it (in-process JS syntax compilation and JSON parsing) before touching anything that is already running.
+2. Downloads every file into a staging directory and validates it (in-process JS syntax compilation, JSON parsing, and `bash -n` for `tunnel-doctor.sh`) before touching anything that is already running.
 3. Checks port availability (`ss` or `lsof`), retires a pre-2.0 `opencode-bridge.service` that would hold port 20129, and stops its own running bridge when upgrading in place.
 4. Backs up the previous install under `~/.opencode-free-bridge/.backup-*`, then moves the staged files into place.
 5. Registers and starts the background service (`systemd` system or `--user` unit on Linux, `launchd` agent with `~/Library/Logs/opencode-free-bridge.log` on macOS).
@@ -299,7 +299,7 @@ curl -s http://127.0.0.1:20129/health
 ## Testing, Verification & Gate Drills
 
 ```bash
-bun test                        # 121 offline unit, contract, and regression tests
+bun test                        # 137 offline unit, contract, and regression tests
 bun run verify                  # live check: probes every discovered free model
 bun run verify:quick            # live check: stops at the first model that answers
 bun run drill                   # runs live + offline self-healing gate drills
@@ -379,6 +379,26 @@ export PATH="$HOME/.bun/bin:$PATH"     # or use the absolute path
 
 The installer prints the absolute path in its closing summary for this reason.
 The service itself is unaffected: its unit file records the full path.
+
+### `remote port forwarding failed for listen port 20136`
+
+The receiving host still has a **stale** listener from a tunnel whose sender rebooted or lost power. The TCP connection died without a FIN, so `sshd` keeps the forwarded port until keepalive notices — ten minutes with the default `ClientAliveInterval 300` × `ClientAliveCountMax 2`. The replacement tunnel then fails even though its own unit is healthy.
+
+```bash
+./tunnel-doctor.sh              # which forwards are stale (listener with no SSH transport)
+./tunnel-doctor.sh --reap       # kill only the stale sessions
+./tunnel-doctor.sh --check      # is the keepalive window short enough?
+```
+
+To close the window itself, on the **receiving** host:
+
+```bash
+# /etc/ssh/sshd_config.d/00-keepalive.conf   — the 00- prefix matters
+ClientAliveInterval 30
+ClientAliveCountMax 4        # dead peer detected in 120s
+```
+
+OpenSSH uses the **first** value it reads, so a later-sorting file (for example `99-*.conf`) is silently ignored. Verify with `sshd -T | grep -i clientalive` and `systemctl reload ssh`.
 
 ### Checking service logs
 

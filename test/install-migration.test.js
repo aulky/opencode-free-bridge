@@ -45,6 +45,28 @@ test("installer fetches every file the runtime needs", () => {
   }
 });
 
+test("installer ships tunnel-doctor.sh, and validates it before swapping files", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // A file that is committed but never fetched is invisible to every install
+  // made with the one-liner, which is how tunnel-doctor.sh first shipped.
+  assert.match(src, /fetch tunnel-doctor\.sh/, "installer does not fetch tunnel-doctor.sh");
+  assert.match(
+    src,
+    /mv -f "\$STAGE\/\$file" "\$BINDIR\/\$file"[\s\S]*tunnel-doctor\.sh|tunnel-doctor\.sh; do[\s\S]*mv -f/,
+    "tunnel-doctor.sh is fetched but never moved into BINDIR"
+  );
+  assert.match(src, /chmod \+x[^\n]*tunnel-doctor\.sh/, "tunnel-doctor.sh is installed without the execute bit");
+  // `new Function` cannot parse bash; only `bash -n` can, and it must run
+  // before the running bridge is stopped. Compare against the *call* site:
+  // indexOf("stop_own_bridge") would find the function definition at line 255.
+  const syntaxAt = src.indexOf("bash -n");
+  const stopAt = src.indexOf("\nstop_own_bridge\n");
+  assert.ok(syntaxAt > -1, "installer never syntax-checks tunnel-doctor.sh");
+  assert.ok(stopAt > -1, "installer never calls stop_own_bridge");
+  assert.ok(syntaxAt < stopAt, "tunnel-doctor.sh must be validated before the old bridge is stopped");
+});
+
 test("installer backs up an existing install before overwriting", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");
