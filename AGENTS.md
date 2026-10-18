@@ -15,6 +15,8 @@ This file gives AI coding agents (OpenCode, Claude Code, Cursor, Codex, Cline, A
 3. **Never hardcode model IDs or aliases.**
    - Model availability changes frequently upstream. Always query `GET http://127.0.0.1:20129/v1/models` to see active free models.
    - Retired models (such as `cat-jam-free`, `muse-spark-1.3-contributor-free`, `muse-spark-1.2-contributor-free`, `step-5-preview-free`) return HTTP `404` by design.
+4. **Upstream inference requires `stream: true`.**
+   - Upstream rejects non-streaming inference requests with `403 FreeTierError`. `server.js` always sends `stream: true` upstream and folds SSE back into JSON when a client requests `stream: false`. Any direct diagnostic probe (`verify.js`, `gate-drill.js`) must keep `stream: true`.
 
 ---
 
@@ -111,7 +113,7 @@ When a user reports an error, diagnose it using this decision table before chang
 | Symptom | Root Cause | Action to Take |
 |---|---|---|
 | `node server.js` exits with `opencode-free-bridge requires Bun` | Server was launched with Node.js instead of Bun | Launch with `bun server.js` (or run `bash install.sh` to rewrite the systemd/launchd service unit to use `bun`). |
-| `HTTP 403 FreeTierError` returned to client **after** logs show `refreshing identity and retrying once with full tool set` (and `verify.js` exits `2` with `GATE`) | Upstream per-IP free-tier quota is temporarily exhausted on this network | **Do not modify headers or code.** Confirm by running `bun gate-drill.js`: if `upstream control` says `HTTP 403 -> gate CLOSED`, the IP itself is throttled by `opencode.ai` (the official `opencode` CLI binary fails with the exact same 403 on this IP). Wait for cooldown or use another IP/VPS tunnel. |
+| `HTTP 403 FreeTierError` returned to client **after** logs show `refreshing identity and retrying once with full tool set` or `skipping retry because a full-shape retry already failed <30s ago` (and `verify.js` exits `2` with `GATE`) | Upstream per-IP free-tier quota is temporarily exhausted on this network | **Do not modify headers or code.** Confirm by running `bun gate-drill.js`: if `upstream control` says `HTTP 403 -> gate CLOSED`, the IP itself is throttled by `opencode.ai` (the official `opencode` CLI binary fails with the exact same 403 on this IP). The bridge automatically suppresses duplicate 403 retries and forced GitHub refreshes for 30s (`GATE_RETRY_COOLDOWN_MS`, `GATE_REFRESH_COOLDOWN_MS`) so it does not extend the IP penalty. Wait for cooldown or use another IP/VPS tunnel. |
 | `verify.js` exits `1` with `TLS fingerprint drift detected` or `Server is running on Node.js` | The runtime's TLS `ClientHello` does not match `transport-baseline.json` | Run `bun transport-fingerprint.js --check` to inspect cipher/extension differences, and ensure the service runs under a current Bun 1.4+ binary. |
 | `bun: command not found` in a fresh SSH session, but the service is healthy | `bun.sh/install` only edits an interactive shell's PATH | Use the absolute path (`~/.bun/bin/bun`) or export `PATH="$HOME/.bun/bin:$PATH"`. Do not reinstall. |
 | `HTTP 429` or `BUSY` in `verify.js` | Upstream model capacity limit | Switch to another model ID from `GET /v1/models`. |
@@ -125,12 +127,12 @@ When a user reports an error, diagnose it using this decision table before chang
 
 | File | Responsibility |
 |---|---|
-| `server.js` | HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`), Bun runtime guard, session affinity cache, client tool aliasing (`read` -> `read_client`), SSE stream normalization (`reasoning_content`, `usage`, `finish_reason`), 403/426/404 reactive retry loop, and 6-hour self-updater (`checkAndApplyUpdate`). |
-| `identity.js` | Adaptive OpenCode CLI synchronization: release handshake (`opencode.ai/update/api`), GitHub source fetcher (`identifier.ts`, `session-id.ts`, `app.ts`, `model-request.ts`, `tool/plugin/*.ts`, `codemode/tool.ts`), Effect Schema AST parser (`extractToolFromSource`), provider catalog parser & disk cache (`~/.opencode-free-bridge/cache/catalog.json`), and pooled CSPRNG session ID generator (`createSessionId`). |
+| `server.js` | HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`), Bun runtime guard, configurable DNS result order (`DNS_RESULT_ORDER`), session affinity cache, client tool aliasing (`read` -> `read_client`), SSE stream normalization (`reasoning_content`, `usage`, `finish_reason`), 403/426/404 reactive retry loop with 30s IP-cooldown retry suppression (`GATE_RETRY_COOLDOWN_MS`), and 6-hour self-updater (`checkAndApplyUpdate`). |
+| `identity.js` | Adaptive OpenCode CLI synchronization: release handshake (`opencode.ai/update/api`), GitHub source fetcher (`identifier.ts`, `session-id.ts`, `app.ts`, `model-request.ts`, `tool/plugin/*.ts`, `codemode/tool.ts`), Effect Schema AST parser (`extractToolFromSource`), provider catalog parser & disk cache (`~/.opencode-free-bridge/cache/catalog.json`), 30s forced-refresh cooldown (`GATE_REFRESH_COOLDOWN_MS`), and pooled CSPRNG session ID generator (`createSessionId`). |
 | `token-budget.js` | Additive token budget calculation (`max(requested, 1024) + 4096` for reasoning models, `max(requested, 512)` for standard models), driven by catalog `modelFacts`. |
 | `transport-fingerprint.js` | Captures the runtime's raw TLS `ClientHello` bytes against a local TCP listener and compares cipher suites and extension order against `transport-baseline.json`. |
 | `gate-drill.js` | End-to-end self-healing drill suite (4 live drills + 6 deterministic offline drills including `full-corrupt`). |
-| `verify.js` | Live model readiness checker (`bun verify.js` / `bun verify.js --quick`). |
+| `verify.js` | Live model readiness checker (`bun verify.js` / `bun verify.js --quick`); sends `stream: true` and halts immediately on `gate-closed` (`403 FreeTierError`) to avoid extending IP cooldowns. |
 | `install.sh` | Cross-platform installer and `node` -> `bun` service unit migrator for Linux (`systemd`) and macOS (`launchd`). |
 
 ### Mandatory verification before committing changes
