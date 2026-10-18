@@ -619,7 +619,7 @@ describe("server unit & integration tests", () => {
       assert.equal(res.body.choices, undefined, "no fake completion may be returned");
     });
 
-    it("forwards an in-stream error as an SSE error event (streaming client)", async () => {
+    it("returns HTTP 502 before committing SSE headers when the first stream event is an error, and emits SSE error event on mid-stream failure", async () => {
       mockFetchImpl = async () => ({
         ok: true,
         status: 200,
@@ -628,16 +628,32 @@ describe("server unit & integration tests", () => {
         ]),
       });
 
-      const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+      const preChunkRes = await httpRequest(port, "POST", "/v1/chat/completions", {
         model: "big-pickle",
         messages: [{ role: "user", content: "hi" }],
         stream: true,
       });
+      assert.equal(preChunkRes.status, 502);
+      assert.match(preChunkRes.body.error.message, /503/);
 
-      assert.equal(res.status, 200);
-      assert.match(res.raw, /"error"/);
-      assert.match(res.raw, /503/);
-      assert.match(res.raw, /\[DONE\]/);
+      mockFetchImpl = async () => ({
+        ok: true,
+        status: 200,
+        body: sseStreamFromLines([
+          'data: {"id":"x","choices":[{"index":0,"delta":{"content":"hel"},"finish_reason":null}]}\n\n',
+          'data: {"error":{"type":"server_error","message":"Streaming response failed: [503] Upstream unavailable"}}\n\n',
+        ]),
+      });
+
+      const midStreamRes = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      });
+      assert.equal(midStreamRes.status, 200);
+      assert.match(midStreamRes.raw, /"error"/);
+      assert.match(midStreamRes.raw, /503/);
+      assert.match(midStreamRes.raw, /\[DONE\]/);
     });
 
     it("does not emit trailing completion chunks or duplicate [DONE] after an in-stream error", async () => {
@@ -981,7 +997,12 @@ describe("server unit & integration tests", () => {
           messages: [{ role: "user", content: "first" }],
         });
         assert.equal(res1.status, 403);
+        assert.equal(res1.headers["x-opencode-gate"], "ip-throttled");
+        assert.ok(Number(res1.headers["retry-after"]) > 0);
         assert.equal(calls, 2);
+
+        const healthThrottled = await httpRequest(port, "GET", "/health");
+        assert.equal(healthThrottled.body.identity.gate.status, "throttled");
 
         // Second request during cooldown with no identity change: 1 attempt, no duplicate retry
         const res2 = await httpRequest(port, "POST", "/v1/chat/completions", {
@@ -989,8 +1010,22 @@ describe("server unit & integration tests", () => {
           messages: [{ role: "user", content: "second" }],
         });
         assert.equal(res2.status, 403);
+        assert.equal(res2.headers["x-opencode-gate"], "ip-throttled");
         assert.equal(calls, 3, "must not double-hit upstream while full-shape retry already failed on current identity");
 
+        // Optional IP_LIMIT_STATUS=429 translates confirmed IP-limit 403s into 429 for standard routers.
+        process.env.IP_LIMIT_STATUS = "429";
+        try {
+          const res429 = await httpRequest(port, "POST", "/v1/chat/completions", {
+            model: "big-pickle",
+            messages: [{ role: "user", content: "second-429" }],
+          });
+          assert.equal(res429.status, 429);
+          assert.equal(res429.headers["x-opencode-gate"], "ip-throttled");
+          assert.equal(calls, 4);
+        } finally {
+          delete process.env.IP_LIMIT_STATUS;
+        }
         // If identity actually learns an update, retry is re-enabled immediately
         shouldRetry = true;
         const res3 = await httpRequest(port, "POST", "/v1/chat/completions", {
@@ -998,7 +1033,7 @@ describe("server unit & integration tests", () => {
           messages: [{ role: "user", content: "third" }],
         });
         assert.equal(res3.status, 403);
-        assert.equal(calls, 5, "a learned identity change must retry immediately");
+        assert.equal(calls, 6, "a learned identity change must retry immediately");
       } finally {
         identity.onGateRejection = realOnGate;
       }
