@@ -736,7 +736,15 @@ describe("identity: gate header wiring", () => {
       userAgent: "opencode/latest/2.0.32/cli",
       sessionId: "ses_abc",
     });
-    assert.deepEqual(Object.keys(headers).sort(), ["User-Agent", "x-session-id"]);
+    // One canonical spelling per name, whatever case the recipe used. The gate
+    // anchors are pinned on top of the recipe (see GATE_ANCHOR_HEADER_NAMES),
+    // so the recipe's own names are asserted as a subset rather than a fixed
+    // list — the invariant under test is de-duplication, not the anchor set.
+    const keys = Object.keys(headers);
+    assert.equal(keys.filter((k) => k.toLowerCase() === "user-agent").length, 1);
+    assert.equal(keys.filter((k) => k.toLowerCase() === "x-session-id").length, 1);
+    assert.ok(keys.includes("User-Agent"));
+    assert.ok(keys.includes("x-session-id"));
   });
 });
 

@@ -204,6 +204,54 @@ const DEFAULT_TOOLS = Object.freeze({
 
 const CORE_TOOL_NAMES = ["read", "shell", "bash"];
 
+/**
+ * Tool names the free-tier gate requires *by name*, independent of what the
+ * derived profile happens to contain.
+ *
+ * Measured against upstream on 2026-10-18 by replaying byte-identical requests
+ * from a blocked egress and a clean one, varying one field at a time:
+ *
+ *   - 12 real tools                     -> 200
+ *   - the same 12 minus `read`          -> 403 FreeTierError
+ *   - the same 12 minus any other tool  -> 200
+ *   - `read` alone                      -> 200
+ *   - `read` + 11 fabricated tools      -> 200
+ *   - a fabricated tool *named* `read`  -> 200
+ *   - the real `read` renamed `read_file` -> 403
+ *
+ * So the check is the name, not the description or the schema: a made-up
+ * `read` with an empty schema passes, a renamed real one fails. That matters
+ * here because the profile is derived from upstream's own plugin sources — if
+ * upstream renames `read.ts` (or drops it), the derived wire shape loses the
+ * anchor and the gate answers with the *same* 403 it uses for an exhausted IP.
+ * Without this anchor the bridge would report a per-IP allowance problem while
+ * the actual cause is a shape this bridge produced.
+ *
+ * The shipped definition is used as the fallback, so the anchor survives a
+ * profile that no longer carries the name.
+ */
+const GATE_ANCHOR_TOOL_NAMES = ["read"];
+
+/**
+ * Header names the gate requires, independent of what the recipe lists.
+ *
+ * Measured the same way (clean egress, `read` tool present):
+ *
+ *   - no User-Agent                        -> 403
+ *   - `opencode` (no version)              -> 403
+ *   - `Mozilla/5.0 …`, `curl/8.18.0`       -> 403
+ *   - `opencode/9.9.9`, `OpenCode/2.0.32`  -> 200
+ *   - `x-opencode-session` alone           -> 200
+ *   - `x-session-affinity` alone           -> 200
+ *   - `x-opencode-session-id` alone        -> 403
+ *   - no `x-opencode-client`/`-project`    -> 200
+ *
+ * The recipe is derived from upstream's request builder, so it normally lists
+ * these. They are pinned anyway because a recipe change that drops one would
+ * produce a 403 indistinguishable from a blocked IP.
+ */
+const GATE_ANCHOR_HEADER_NAMES = ["user-agent", "x-opencode-session", "x-session-affinity"];
+
 let recipe = { ...DEFAULT_RECIPE };
 let toolProfile = null;
 let toolProfileSource = "default";
@@ -2257,8 +2305,16 @@ function getToolList(flat = false, scope = null, modelId = null) {
     ordered = coreNames.length > 0 ? coreNames : available;
   }
 
+  // Pin the gate anchors last, so the derived order is otherwise untouched.
+  // `profile[name]` may be missing when upstream renamed or dropped the tool:
+  // the shipped definition is then the only thing that keeps the wire shape
+  // acceptable. See GATE_ANCHOR_TOOL_NAMES for the measurements.
+  for (const name of GATE_ANCHOR_TOOL_NAMES) {
+    if (!ordered.includes(name)) ordered = [...ordered, name];
+  }
+
   return ordered.map((name) => {
-    const def = profile[name];
+    const def = profile[name] || DEFAULT_TOOLS[name];
     const description = withDynamicDescription(name, def.description);
     return flat
       ? {
@@ -2312,7 +2368,14 @@ function buildGateHeaders(ctx = {}) {
   };
   const headers = {};
   const unsent = [];
-  for (const name of getHeaderNames()) {
+  const names = getHeaderNames().slice();
+  // Pin the anchors even when the recipe stops listing them: the gate rejects
+  // a request without these with the same 403 it uses for a blocked IP, so a
+  // recipe regression would be indistinguishable from an exhausted allowance.
+  for (const anchor of GATE_ANCHOR_HEADER_NAMES) {
+    if (!names.some((n) => String(n).toLowerCase() === anchor)) names.push(anchor);
+  }
+  for (const name of names) {
     const lower = String(name).toLowerCase();
     const value = values[lower];
     // Header names are case-insensitive. Emit one canonical spelling per name
@@ -2496,6 +2559,8 @@ module.exports = {
   resolveModelAlias,
   getEndpoints,
   buildGateHeaders,
+  GATE_ANCHOR_TOOL_NAMES,
+  GATE_ANCHOR_HEADER_NAMES,
   getSessionPrefix,
   createSessionId,
   getToolList,

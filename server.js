@@ -211,6 +211,37 @@ function isValidV2UserAgent(ua) {
   return Boolean(match) && parseInt(match[1], 10) >= 2;
 }
 
+/**
+ * A User-Agent the free-tier gate accepts, or the identity's own.
+ *
+ * Measured (clean egress, `read` tool present): a request without a
+ * `User-Agent`, with a bare `opencode`, or with `Mozilla/5.0 …` / `curl/8.18.0`
+ * is refused with the same 403 FreeTierError that a blocked IP gets. Only the
+ * `opencode/<channel>/<semver>/<name>` shape passes, and the version is not
+ * checked for freshness (`opencode/9.9.9` was accepted).
+ *
+ * `OPENCODE_USER_AGENT` is an operator override, so it is honoured — but an
+ * override that the gate would reject is reported instead of silently
+ * producing a 403 that looks like an allowance problem.
+ */
+function gateSafeUserAgent() {
+  const override = process.env.OPENCODE_USER_AGENT;
+  if (override && /^opencode\/[A-Za-z0-9-]+\/\d+\.\d+\.\d+\/[A-Za-z0-9-]+$/i.test(String(override).trim())) {
+    return String(override).trim();
+  }
+  if (override) {
+    console.warn(
+      "[opencode-free-bridge] OPENCODE_USER_AGENT does not match the shape the free-tier gate accepts " +
+        "(opencode/<channel>/<semver>/<name>); using the derived identity instead"
+    );
+  }
+  const derived = syncUserAgent();
+  if (/^opencode\//i.test(derived)) return derived;
+  // Last resort: the derived identity itself is malformed. Keep the request
+  // shaped as an opencode client rather than sending something the gate refuses.
+  return "opencode/latest/0.0.0/cli";
+}
+
 // --- ID Generator (matches OpenCode v2 CLI format) ---
 // The shape (charset, total length, multiplier, prefix) comes from identity.js,
 // which derives it from opencode's own `packages/schema/src/identifier.ts`.
@@ -474,14 +505,20 @@ function getParamSig(params) {
   return sig;
 }
 
-function buildIpThrottleHeaders(freeTierMsg) {
+function buildIpThrottleHeaders(freeTierMsg, diagnostic = null) {
   if (!freeTierMsg) return { "Content-Type": "application/json" };
   const retryAfterSec = Math.max(1, Math.ceil((GATE_RETRY_COOLDOWN_MS || 30000) / 1000));
-  return {
+  const headers = {
     "Content-Type": "application/json",
     "Retry-After": String(retryAfterSec),
-    "X-OpenCode-Gate": "ip-throttled",
+    // `shape-ok` means the request carried every anchor the gate checks, so the
+    // refusal is about this egress. `shape-rejected` means the bridge produced
+    // a request the gate refuses — a bridge bug that returns the identical
+    // upstream error. Callers that alert on this can tell the two apart.
+    "X-OpenCode-Gate": diagnostic && diagnostic.shapeOk === false ? "shape-rejected" : "ip-throttled",
   };
+  if (diagnostic && diagnostic.logId) headers["X-OpenCode-Log-Id"] = diagnostic.logId;
+  return headers;
 }
 
 function resolveIpThrottleStatus(upstreamStatus, freeTierMsg) {
@@ -970,7 +1007,7 @@ function getProjectId() {
 
 function buildUpstreamHeaders(req, sessionId) {
   const downstreamUa = req?.headers?.["user-agent"] || "";
-  const ua = isValidV2UserAgent(downstreamUa) ? downstreamUa : currentUserAgent;
+  const ua = isValidV2UserAgent(downstreamUa) ? downstreamUa : gateSafeUserAgent();
   const client = req?.headers?.["x-opencode-client"];
   // `x-opencode-project` is not a constant: the CLI derives it as
   // `sha1("git-remote:" + host + path)` for a repo, `sha1("directory:" + path)`
@@ -1048,6 +1085,38 @@ const MAX_SESSIONS = 500;
 const SESSION_TTL_MS = 3 * 3600 * 1000;
 let lastFailedGateRetryTime = 0;
 let lastFailedGateRetryEpoch = -1;
+// The last gate rejection's correlation id and the shape audit that was true
+// when it happened. `x-opencode-log-id` is the only handle upstream gives for
+// a rejected request, so it is recorded rather than discarded — it is what a
+// support request or a bug report needs to be actionable.
+let lastGateDiagnostic = null;
+
+/**
+ * Which gate anchors the *actual* outgoing request carried.
+ *
+ * The gate requires a tool named `read` and an `opencode/*` User-Agent with a
+ * session header (see GATE_ANCHOR_TOOL_NAMES / GATE_ANCHOR_HEADER_NAMES in
+ * identity.js). When a 403 comes back, these are what distinguishes "this
+ * bridge sent an unacceptable shape" from "upstream refuses this egress".
+ * Reporting the distinction is the whole point: both produce an identical
+ * FreeTierError body.
+ */
+function auditGateShape(upstreamBody, headers) {
+  const tools = Array.isArray(upstreamBody?.tools) ? upstreamBody.tools : [];
+  const toolNames = tools.map((t) => t?.function?.name || t?.name).filter(Boolean);
+  const ua = String(headers?.["User-Agent"] || "");
+  const sessionHeaders = ["x-opencode-session", "x-session-affinity", "x-session-id"].filter(
+    (h) => headers?.[h]
+  );
+  return {
+    hasReadTool: toolNames.includes("read"),
+    toolCount: toolNames.length,
+    userAgentOk: /^opencode\/[A-Za-z0-9-]+\/\d+\.\d+\.\d+\/[A-Za-z0-9-]+$/i.test(ua),
+    userAgent: ua,
+    sessionHeaders,
+  };
+}
+
 const origSessionCacheClear = sessionCache.clear.bind(sessionCache);
 sessionCache.clear = () => {
   lastFailedGateRetryTime = 0;
@@ -1267,6 +1336,16 @@ function handleRequest(req, res) {
                 ? lastFailedGateRetryTime + GATE_RETRY_COOLDOWN_MS
                 : null,
             cooldownMs: GATE_RETRY_COOLDOWN_MS,
+            // The shape anchors the gate checks. Reported so a deployment can
+            // confirm it is sending them without waiting for a 403.
+            anchors: {
+              tools: identity.GATE_ANCHOR_TOOL_NAMES.slice(),
+              headers: identity.GATE_ANCHOR_HEADER_NAMES.slice(),
+            },
+            // The most recent gate rejection: what was sent, what was missing,
+            // and upstream's own correlation id. `shapeOk: false` means the
+            // bridge produced a request the gate refuses — not an IP problem.
+            lastRejection: lastGateDiagnostic,
           },
         },
       })
@@ -1405,6 +1484,7 @@ function handleRequest(req, res) {
 
       let useResponses = isResponsesModel(targetModel);
       const sessionId = getPersistentSessionId(req, body);
+      let retryHeaders = null;
       const upstreamHeaders = buildUpstreamHeaders(req, sessionId);
 
       const abortController = new AbortController();
@@ -1609,9 +1689,10 @@ function handleRequest(req, res) {
             // new URL — reusing the pre-refresh value would defeat the derivation.
             liveEndpoints = resolveEndpoints(targetModel);
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
+            retryHeaders = buildUpstreamHeaders(req, retrySessionId);
             upstreamRes = await fetch(upstreamUrl, {
               method: "POST",
-              headers: buildUpstreamHeaders(req, retrySessionId),
+              headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
               signal: abortController.signal,
             });
@@ -1677,21 +1758,59 @@ function handleRequest(req, res) {
               lastFailedGateRetryTime = Date.now();
               lastFailedGateRetryEpoch = identity.getState().epoch || 0;
             }
+
+            // The gate answers the same `403 FreeTierError` for a blocked egress
+            // and for a request whose shape it refuses, so the status line and
+            // message cannot tell the two apart. What can: whether the request
+            // that was actually sent carried the anchors the gate checks. Audit
+            // that here instead of asserting a cause. Measured anchors: a tool
+            // named `read`, and an `opencode/*` User-Agent with a session header.
+            const shape = auditGateShape(upstreamBody, retryHeaders || upstreamHeaders);
+            const shapeOk = shape.hasReadTool && shape.userAgentOk && shape.sessionHeaders.length > 0;
+            const missing = [];
+            if (!shape.hasReadTool) missing.push("tool `read`");
+            if (!shape.userAgentOk) missing.push("an `opencode/*` User-Agent");
+            if (shape.sessionHeaders.length === 0) missing.push("a session header");
+            // Correlation id for this rejection. Upstream returns it on every
+            // response, accepted or refused; it is the only handle a support
+            // request or a bug report can quote.
+            const upstreamLogId =
+              typeof upstreamRes.headers?.get === "function"
+                ? upstreamRes.headers.get("x-opencode-log-id")
+                : null;
+            lastGateDiagnostic = {
+              at: Date.now(),
+              status: retryStatus,
+              logId: upstreamLogId,
+              shape,
+              shapeOk,
+              missing,
+              model: targetModel,
+            };
+
+            const verdictText = capacity
+              ? "upstream accepted the transport and the request shape and answered with capacity pressure; the free-tier allowance or the model's capacity is exhausted. Retry later or switch model"
+              : retryFreeTierMsg
+                ? onNode
+                  ? "this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before suspecting an allowance limit"
+                  : shapeOk
+                    ? "the request carried every anchor the gate checks, so this is the egress: the per-IP free-tier allowance is spent or upstream refuses this network. The real CLI gets the same 403 from the same IP when it is"
+                    : `this bridge produced a shape the gate refuses — missing ${missing.join(", ")}. That is a bridge bug, not an IP allowance: the same 403 is returned for both, which is why it is audited here`
+                : `no further identity change to apply; ${UPDATE_HINT}`;
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${retryStatus}${
                 retryStatus !== gateStatus ? `, first attempt ${gateStatus}` : ""
-              }): ${retryMsg} — ${
-                capacity
-                  ? "upstream accepted the transport and the request shape and answered with capacity pressure; the free-tier allowance or the model's capacity is exhausted. Retry later or switch model"
-                  : retryFreeTierMsg
-                    ? onNode
-                      ? "request shape already matches upstream, but this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before suspecting an allowance limit"
-                      : "transport and request shape both match upstream. Either the per-IP free-tier allowance is spent, or upstream is refusing this network; the real CLI returns the same 403 from the same IP when it is (verified). A 429 would mean transport passed and only quota is left"
-                    : `no further identity change to apply; ${UPDATE_HINT}`
-              }`
+              }): ${retryMsg} — ${verdictText}` +
+                (upstreamLogId ? ` [x-opencode-log-id: ${upstreamLogId}]` : "")
             );
             const outStatus = resolveIpThrottleStatus(upstreamRes.status, retryFreeTierMsg && !capacity);
-            res.writeHead(outStatus, buildIpThrottleHeaders(retryFreeTierMsg && !capacity));
+            res.writeHead(
+              outStatus,
+              buildIpThrottleHeaders(retryFreeTierMsg && !capacity, {
+                shapeOk,
+                logId: upstreamLogId,
+              })
+            );
             return res.end(
               JSON.stringify({
                 error: {
@@ -2331,6 +2450,9 @@ module.exports = {
   identity,
   __getUserAgent: () => currentUserAgent,
   __syncUserAgent: syncUserAgent,
+  __getGateDiagnostic: () => lastGateDiagnostic,
+  __auditGateShape: auditGateShape,
+  gateSafeUserAgent,
   DISCOVERY_TTL_MS,
   CLI_VERSION_TTL_MS,
   __setLastDiscoveryTime: (v) => { lastDiscoveryTime = v; },
