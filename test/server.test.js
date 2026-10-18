@@ -1080,5 +1080,76 @@ describe("server unit & integration tests", () => {
       assert.equal(rateRes.status, 429);
       assert.equal(rateRes.body.error.message, "Endpoint is unavailable");
     });
+
+    it("retries once with a fresh session ID on transient upstream 5xx and recovers to 200", async () => {
+      const seenSessions = [];
+      let attempt = 0;
+      mockFetchImpl = async (_url, opts) => {
+        attempt++;
+        seenSessions.push(opts?.headers?.["x-opencode-session"]);
+        if (attempt === 1) {
+          return {
+            ok: false,
+            status: 500,
+            headers: new Map([["x-opencode-log-id", "01a14df2-first-500"]]),
+            text: async () => "",
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          body: sseStreamFromLines([
+            'data: {"id":"1","choices":[{"index":0,"delta":{"content":"RECOVERED"},"finish_reason":"stop"}]}\n\n',
+            "data: [DONE]\n\n",
+          ]),
+        };
+      };
+
+      const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.choices[0].message.content, "RECOVERED");
+      assert.equal(attempt, 2, "must retry once on upstream 5xx");
+      assert.equal(seenSessions.length, 2);
+      assert.notEqual(seenSessions[0], seenSessions[1], "5xx retry must mint a fresh session ID");
+    });
+
+    it("records lastUpstreamError in /health and forwards X-OpenCode-Log-Id when 5xx persists", async () => {
+      let attempt = 0;
+      mockFetchImpl = async () => {
+        attempt++;
+        return {
+          ok: false,
+          status: 500,
+          headers: new Map([
+            ["x-opencode-log-id", `01a14df2-persist-${attempt}`],
+            ["cf-ray", "a4c5e229db07709c-SEA"],
+            ["cf-placement", "remote-IAD"],
+          ]),
+          text: async () => "",
+        };
+      };
+
+      const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+      });
+      assert.equal(res.status, 500);
+      assert.equal(attempt, 2, "must stop after one 5xx retry");
+      assert.equal(res.headers["x-opencode-log-id"], "01a14df2-persist-2");
+      assert.equal(res.headers["x-opencode-gate"], "upstream-error");
+      assert.equal(res.body.error.log_id, "01a14df2-persist-2");
+
+      const health = await httpRequest(port, "GET", "/health");
+      const lastErr = health.body.identity.gate.lastUpstreamError;
+      assert.ok(lastErr, "/health must expose lastUpstreamError after persistent 5xx");
+      assert.equal(lastErr.status, 500);
+      assert.equal(lastErr.logId, "01a14df2-persist-2");
+      assert.equal(lastErr.cfRay, "a4c5e229db07709c-SEA");
+      assert.equal(lastErr.cfPlacement, "remote-IAD");
+      assert.equal(lastErr.model, "big-pickle");
+    });
   });
 });

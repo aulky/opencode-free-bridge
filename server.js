@@ -1115,6 +1115,7 @@ let lastFailedGateRetryEpoch = -1;
 // a rejected request, so it is recorded rather than discarded — it is what a
 // support request or a bug report needs to be actionable.
 let lastGateDiagnostic = null;
+let lastUpstreamError = null;
 
 /**
  * Which gate anchors the *actual* outgoing request carried.
@@ -1146,6 +1147,7 @@ const origSessionCacheClear = sessionCache.clear.bind(sessionCache);
 sessionCache.clear = () => {
   lastFailedGateRetryTime = 0;
   lastFailedGateRetryEpoch = -1;
+  lastUpstreamError = null;
   return origSessionCacheClear();
 };
 
@@ -1371,6 +1373,7 @@ function handleRequest(req, res) {
             // and upstream's own correlation id. `shapeOk: false` means the
             // bridge produced a request the gate refuses — not an IP problem.
             lastRejection: lastGateDiagnostic,
+            lastUpstreamError,
           },
         },
       })
@@ -1633,6 +1636,34 @@ function handleRequest(req, res) {
           }
         }
 
+        // Transient 5xx self-heal: upstream Workers intermittently drop empty-body
+        // HTTP 500/502/503/504 responses (e.g. cf-placement: remote-IAD) during
+        // free-inference degradation. Retry once with fresh trace/session headers.
+        if (!upstreamRes.ok && upstreamRes.status >= 500 && upstreamRes.status < 600) {
+          const first5xx = upstreamRes.status;
+          const firstLogId =
+            typeof upstreamRes.headers?.get === "function"
+              ? upstreamRes.headers.get("x-opencode-log-id")
+              : null;
+          try {
+            await upstreamRes.text();
+          } catch {}
+          const retry5xxSid = regenerateSessionId(req, body, sessionId);
+          const retry5xxHeaders = buildUpstreamHeaders(req, retry5xxSid);
+          console.warn(
+            `[opencode-free-bridge] Upstream returned ${first5xx}` +
+              (firstLogId ? ` [x-opencode-log-id: ${firstLogId}]` : "") +
+              `; retrying once with fresh session`
+          );
+          upstreamRes = await fetch(upstreamUrl, {
+            method: "POST",
+            headers: retry5xxHeaders,
+            body: JSON.stringify(upstreamBody),
+            signal: abortController.signal,
+          });
+          consumedErrorText = null;
+        }
+
         // Self-healing identity. A gate rejection is identified by the error
         // *body*, not the status line: a 403 is only the gate when its type or
         // message says so, while 426 is the version-floor handshake by itself.
@@ -1661,13 +1692,46 @@ function handleRequest(req, res) {
             `Upstream error ${upstreamRes.status}`;
 
           if (!isFreeTierCliGateError(upstreamRes.status, errType, rawMsg)) {
-            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            const upstreamLogId =
+              typeof upstreamRes.headers?.get === "function"
+                ? upstreamRes.headers.get("x-opencode-log-id")
+                : null;
+            const cfRay =
+              typeof upstreamRes.headers?.get === "function"
+                ? upstreamRes.headers.get("cf-ray")
+                : null;
+            const cfPlacement =
+              typeof upstreamRes.headers?.get === "function"
+                ? upstreamRes.headers.get("cf-placement")
+                : null;
+            if (upstreamRes.status >= 500) {
+              lastUpstreamError = {
+                at: Date.now(),
+                status: upstreamRes.status,
+                logId: upstreamLogId,
+                cfRay,
+                cfPlacement,
+                message: rawMsg,
+                model: targetModel,
+              };
+              console.warn(
+                `[opencode-free-bridge] Upstream server error (${upstreamRes.status}) on model ${targetModel}: ${rawMsg}` +
+                  (upstreamLogId ? ` [x-opencode-log-id: ${upstreamLogId}]` : "") +
+                  (cfRay ? ` [cf-ray: ${cfRay}]` : "") +
+                  (cfPlacement ? ` [cf-placement: ${cfPlacement}]` : "")
+              );
+            }
+            const errHeaders = { "Content-Type": "application/json" };
+            if (upstreamLogId) errHeaders["X-OpenCode-Log-Id"] = upstreamLogId;
+            if (upstreamRes.status >= 500) errHeaders["X-OpenCode-Gate"] = "upstream-error";
+            res.writeHead(upstreamRes.status, errHeaders);
             return res.end(
               JSON.stringify({
                 error: {
                   message: rawMsg,
                   type: errType || "upstream_error",
                   code: upstreamRes.status,
+                  ...(upstreamLogId ? { log_id: upstreamLogId } : {}),
                 },
               })
             );
@@ -2476,6 +2540,7 @@ module.exports = {
   __getUserAgent: () => currentUserAgent,
   __syncUserAgent: syncUserAgent,
   __getGateDiagnostic: () => lastGateDiagnostic,
+  __getLastUpstreamError: () => lastUpstreamError,
   __auditGateShape: auditGateShape,
   gateSafeUserAgent,
   DISCOVERY_TTL_MS,
