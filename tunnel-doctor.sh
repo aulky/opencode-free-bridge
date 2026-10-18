@@ -37,6 +37,9 @@
 # Exit codes: 0 healthy / reaped nothing needed, 1 problems found (report mode)
 # or keepalive too loose (--check), 2 usage error.
 #
+# By default it scans the whole 20120-20149 block (set TUNNEL_PORTS="20129 20136"
+# to narrow it). A hardcoded list silently skipped newly added nodes.
+#
 # Requires: ss, ps (iproute2 + procps). Must run as root on the receiving host.
 
 set -euo pipefail
@@ -56,7 +59,18 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "${#PORTS[@]}" -eq 0 ]; then
-  PORTS=(20129 20130 20131 20132 20133 20134 20135)
+  # Scan the whole 201xx block rather than a hardcoded 20129..20135 list: a new
+  # node's tunnel (20136 in this fleet) silently escaped the report, which is
+  # the one thing this script exists to catch. Override with TUNNEL_PORTS.
+  if [ -n "${TUNNEL_PORTS:-}" ]; then
+    # shellcheck disable=SC2206
+    PORTS=(${TUNNEL_PORTS})
+  else
+    PORTS=()
+    for p in $(seq 20120 20149); do
+      PORTS+=("$p")
+    done
+  fi
 fi
 
 # --- keepalive audit --------------------------------------------------------
