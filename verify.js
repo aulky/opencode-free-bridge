@@ -32,6 +32,38 @@ const ok = (s) => `${C.green}${s}${C.reset}`;
 const warn = (s) => `${C.yellow}${s}${C.reset}`;
 const bad = (s) => `${C.red}${s}${C.reset}`;
 
+/**
+ * Fold an SSE stream from the bridge into one Chat Completions object.
+ *
+ * Only the fields the verdict logic reads are rebuilt: `choices[0].message`
+ * (content plus reasoning_content) and `usage`. Tool-call deltas are not needed
+ * by a readiness probe, so they are ignored rather than reconstructed.
+ */
+function assembleSse(raw) {
+  let content = "";
+  let reasoning = "";
+  let finish = null;
+  let usage = null;
+  for (const line of raw.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const chunk = line.slice(5).trim();
+    if (!chunk || chunk === "[DONE]") continue;
+    let ev = null;
+    try { ev = JSON.parse(chunk); } catch { continue; }
+    // The bridge forwards an in-stream failure as an SSE error event.
+    if (ev?.error) return { error: ev.error };
+    const choice = ev?.choices?.[0];
+    if (choice?.delta?.content) content += choice.delta.content;
+    if (choice?.delta?.reasoning_content) reasoning += choice.delta.reasoning_content;
+    if (choice?.finish_reason) finish = choice.finish_reason;
+    if (ev?.usage) usage = ev.usage;
+  }
+  return {
+    choices: [{ message: { role: "assistant", content, reasoning_content: reasoning }, finish_reason: finish }],
+    usage,
+  };
+}
+
 function request(method, path, body, timeoutMs = QUICK ? 25000 : 120000) {
   return new Promise((resolve) => {
     const payload = body ? JSON.stringify(body) : null;
@@ -51,6 +83,10 @@ function request(method, path, body, timeoutMs = QUICK ? 25000 : 120000) {
         res.on("end", () => {
           let parsed = null;
           try { parsed = JSON.parse(data); } catch { /* non-JSON body */ }
+          // The bridge always streams upstream, so a `stream: true` probe comes
+          // back as SSE. Fold it into the same shape a non-streaming call would
+          // return, so the verdict logic below reads one form only.
+          if (!parsed && /^\s*data:/.test(data)) parsed = assembleSse(data);
           resolve({ status: res.statusCode, body: parsed, raw: data });
         });
       }
@@ -87,11 +123,19 @@ async function listModels() {
 
 async function probe(model) {
   const started = Date.now();
+  // `stream: true` is not cosmetic. Measured from one IP, one process, one
+  // header set: an upstream request without `stream` is refused with 403
+  // FreeTierError while the identical request with `stream: true` succeeds
+  // (6/6 vs 0/6, interleaved). Upstream treats a non-streaming call as
+  // "not the real client". A probe that omits it therefore measures nothing
+  // and reports the IP as blocked. The bridge always streams upstream and
+  // normalises the SSE back to JSON for non-streaming clients, so this
+  // matches what the bridge actually sends.
   const res = await request("POST", "/v1/chat/completions", {
     model,
     messages: [{ role: "user", content: QUICK ? "Say OK" : "Write a Python function `add(a,b)` that returns their sum. Output only code." }],
     max_tokens: PROBE_MAX_TOKENS,
-    stream: false,
+    stream: true,
   });
   const ms = Date.now() - started;
 

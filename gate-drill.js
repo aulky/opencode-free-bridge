@@ -67,7 +67,13 @@ const DRILLS = [
 
 function ask(port, body) {
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
+    // The live drills must exercise the shape upstream actually accepts. A
+    // request without `stream` is refused with 403 FreeTierError before its
+    // content is read (measured 6/6 vs 0/6 against the same IP), which would
+    // make every drill report the gate as closed for a reason the drill itself
+    // created. `stream` is forced here rather than at each call site so a new
+    // drill cannot reintroduce the mistake.
+    const payload = JSON.stringify({ ...body, stream: true });
     const req = http.request(
       {
         host: "127.0.0.1",
@@ -85,6 +91,9 @@ function ask(port, body) {
           try {
             json = JSON.parse(text);
           } catch {}
+          // A streaming answer arrives as SSE. Fold it into the completion
+          // shape `content()` expects so call sites stay protocol-agnostic.
+          if (!json && /^\s*data:/.test(text)) json = assembleSse(text);
           resolve({ status: res.statusCode, json, text });
         });
       }
@@ -94,6 +103,31 @@ function ask(port, body) {
     req.write(payload);
     req.end();
   });
+}
+
+/** Fold an SSE answer from the bridge into one completion object. */
+function assembleSse(raw) {
+  let content = "";
+  let reasoning = "";
+  let finish = null;
+  let usage = null;
+  for (const line of raw.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const chunk = line.slice(5).trim();
+    if (!chunk || chunk === "[DONE]") continue;
+    let ev = null;
+    try { ev = JSON.parse(chunk); } catch { continue; }
+    if (ev?.error) return { error: ev.error };
+    const choice = ev?.choices?.[0];
+    if (choice?.delta?.content) content += choice.delta.content;
+    if (choice?.delta?.reasoning_content) reasoning += choice.delta.reasoning_content;
+    if (choice?.finish_reason) finish = choice.finish_reason;
+    if (ev?.usage) usage = ev.usage;
+  }
+  return {
+    choices: [{ message: { role: "assistant", content, reasoning_content: reasoning }, finish_reason: finish }],
+    usage,
+  };
 }
 
 function content(res) {
@@ -590,6 +624,14 @@ async function probeUpstream(identity) {
   body.max_completion_tokens = body.max_tokens;
   delete body.max_tokens;
   body.store = false;
+  // `stream` must stay `true`. buildUpstreamPayload sets it, and this probe
+  // deliberately keeps the whole shape: measured from one IP and one header
+  // set, the same request without `stream` is refused with 403 FreeTierError
+  // while the streaming one succeeds (6/6 vs 0/6, interleaved). A probe that
+  // dropped it would report a healthy IP as gate-closed.
+  if (body.stream !== true) {
+    throw new Error("probeUpstream must send stream: true or the verdict is meaningless");
+  }
 
   try {
     const res = await fetch(resolveEndpoints(model).chatUrl, {
