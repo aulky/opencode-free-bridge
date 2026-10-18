@@ -276,6 +276,32 @@ test("self-updater in server.js parses JS and JSON in-process instead of spawnin
   }
 });
 
+test("every shipped file reaches installed hosts through both delivery paths", () => {
+  const root = path.join(__dirname, "..");
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const serverSrc = fs.readFileSync(path.join(root, "server.js"), "utf8");
+  const installSrc = fs.readFileSync(path.join(root, "install.sh"), "utf8");
+
+  const updateBlock = serverSrc.match(/const UPDATE_FILES = \[([\s\S]*?)\];/);
+  assert.ok(updateBlock, "server.js has no UPDATE_FILES list");
+  const updateFiles = [...updateBlock[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+
+  // These are the runtime files an installed bridge needs. A file that is in
+  // package.json but in neither delivery path ships to nobody, which is how
+  // tunnel-doctor.sh was committed yet missing from every host in the fleet.
+  const runtime = pkg.files.filter((f) => f !== "README.md" && f !== "AGENTS.md" && f !== "install.sh");
+  for (const f of runtime) {
+    assert.ok(updateFiles.includes(f), `${f} is in package.json files but not in UPDATE_FILES`);
+    assert.ok(installSrc.includes(f), `${f} is in package.json files but install.sh never fetches it`);
+  }
+
+  // A .sh entry is useless without a parser that understands it.
+  if (updateFiles.some((f) => f.endsWith(".sh"))) {
+    assert.match(serverSrc, /bash", \["-n"/, "self-updater fetches a shell script but never runs bash -n on it");
+    assert.match(serverSrc, /chmodSync\(tmpPath, 0o755\)/, "self-updater does not mark the shell script executable");
+  }
+});
+
 test("verify.js checks runtime and TLS baseline before blaming the IP for a closed gate", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "verify.js"), "utf8");
   assert.match(src, /health\.runtime\.startsWith\("node\/"\)/);

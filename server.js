@@ -49,6 +49,7 @@ const UPDATE_FILES = [
   "gate-drill.js",
   "transport-fingerprint.js",
   "transport-baseline.json",
+  "tunnel-doctor.sh",
   "server.js",
 ];
 let updateInFlight = null;
@@ -131,9 +132,33 @@ async function checkAndApplyUpdate() {
           } catch (err) {
             throw new Error(`invalid JSON in ${file}: ${err.message}`);
           }
+        } else if (file.endsWith(".sh")) {
+          // `new Function` cannot parse bash. Check the shebang here and let
+          // `bash -n` parse it below, once it is on disk.
+          if (!/^#!.*\b(ba)?sh\b/.test(text)) throw new Error(`${file} is not a shell script`);
         }
         const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
         fs.writeFileSync(tmpPath, text, "utf8");
+        if (file.endsWith(".sh")) {
+          let parsed = true;
+          try {
+            require("child_process").execFileSync("bash", ["-n", tmpPath], {
+              stdio: "ignore",
+              timeout: 5000,
+            });
+          } catch (err) {
+            // No bash on this host is not a syntax failure; the shebang check
+            // above is all we can do there. Anything else is a real rejection.
+            if (!err || err.code !== "ENOENT") {
+              try {
+                fs.unlinkSync(tmpPath);
+              } catch {}
+              parsed = false;
+              throw new Error(`syntax check failed for ${file}: ${err.message}`);
+            }
+          }
+          if (parsed) fs.chmodSync(tmpPath, 0o755);
+        }
         tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
       }
       for (const { tmpPath, targetPath } of tmpFiles) fs.renameSync(tmpPath, targetPath);
