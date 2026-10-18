@@ -104,6 +104,46 @@ If the user has another machine or VPS running `opencode-free-bridge` on port `2
 ssh -N -L 127.0.0.1:20130:127.0.0.1:20129 user@remote-vps
 ```
 
+For a **reverse** tunnel (`-R`, the sending host dials out to the host that runs the router), run it as a systemd unit so it survives a reboot, and point `-i` at a key that actually exists on that host:
+
+```ini
+[Service]
+ExecStart=/usr/bin/ssh -NT -o BatchMode=yes -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+  -i /root/.ssh/id_vps_master -p 48222 \
+  -R 127.0.0.1:20136:127.0.0.1:20129 root@router-host
+Restart=always
+RestartSec=5
+```
+
+#### Stale forwards after an unclean disconnect
+
+A reverse tunnel is held open by an `sshd-session` on the **receiving** host. When the sending host reboots or loses power, the TCP connection dies without a FIN and the receiving sshd keeps the listening socket until it notices. A replacement tunnel then fails with:
+
+```
+Error: remote port forwarding failed for listen port 20136
+```
+
+The default `ClientAliveInterval 300` × `ClientAliveCountMax 2` leaves that window at **ten minutes**. Two fixes, both worth having:
+
+1. **Tighten the keepalive** on the receiving host. OpenSSH uses the **first** value it reads, so the drop-in must sort *before* any existing one:
+
+   ```bash
+   # /etc/ssh/sshd_config.d/00-keepalive.conf   (note the 00- prefix)
+   ClientAliveInterval 30
+   ClientAliveCountMax 4      # dead peer detected after 120s
+   ```
+
+   Verify with `sshd -T | grep -i clientalive`, then `systemctl reload ssh`.
+
+2. **Reap the stale session** when it has already happened. `tunnel-doctor.sh` (shipped in this repo) distinguishes a *live* forward from a stale one by checking whether the sshd session holding the listener still has an established transport — a listener alone proves nothing:
+
+   ```bash
+   ./tunnel-doctor.sh                 # report
+   ./tunnel-doctor.sh --reap          # kill sessions with no transport
+   ./tunnel-doctor.sh --check         # audit the keepalive window
+   ```
+
 ---
 
 ## 4. Troubleshooting Guide for Agents
