@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 const dns = require("dns");
-dns.setDefaultResultOrder("ipv4first");
+dns.setDefaultResultOrder(process.env.DNS_RESULT_ORDER || "ipv4first");
 const http = require("http");
 const crypto = require("crypto");
 let VERSION = "1.5.0";
@@ -13,6 +13,10 @@ const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(10 * 1024 * 1024), 10);
+const GATE_RETRY_COOLDOWN_MS = parseInt(
+  process.env.GATE_RETRY_COOLDOWN_MS || "30000",
+  10
+);
 const CORS_ORIGIN = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORIGIN : "";
 // Wire endpoints. These are *defaults*; the live values come from identity.js,
 // which resolves them from the upstream provider catalog (`opencode.api` in
@@ -1017,6 +1021,14 @@ function extractResponsesFinishReason(ev, hasToolCalls) {
 const sessionCache = new Map();
 const MAX_SESSIONS = 500;
 const SESSION_TTL_MS = 3 * 3600 * 1000;
+let lastFailedGateRetryTime = 0;
+let lastFailedGateRetryEpoch = -1;
+const origSessionCacheClear = sessionCache.clear.bind(sessionCache);
+sessionCache.clear = () => {
+  lastFailedGateRetryTime = 0;
+  lastFailedGateRetryEpoch = -1;
+  return origSessionCacheClear();
+};
 
 function getPersistentSessionId(req, body) {
   const headers = req?.headers || {};
@@ -1528,31 +1540,44 @@ function handleRequest(req, res) {
           // when every header matches, while the same request with a freshly
           // minted id is accepted.
           syncUserAgent();
-          console.warn(
-            `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}, ${verdict.reason || "unknown"}); refreshing identity and retrying once with full tool set`
-          );
-          ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
-            body,
-            targetModel,
-            useResponses,
-            "full"
-          ));
           // Re-mint the session id. The one minted before this request was
           // produced by the recipe the gate just rejected; replaying it would
           // send the same rejected shape and fail identically. The cached
           // entry is dropped so the next request also gets a correct id.
           const retrySessionId = regenerateSessionId(req, body, sessionId);
-          // Re-resolve the endpoint *after* the refresh: a catalog change is one
-          // of the things the refresh can learn, and the retry must go to the
-          // new URL — reusing the pre-refresh value would defeat the derivation.
-          liveEndpoints = resolveEndpoints(targetModel);
-          upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
-          upstreamRes = await fetch(upstreamUrl, {
-            method: "POST",
-            headers: buildUpstreamHeaders(req, retrySessionId),
-            body: JSON.stringify(upstreamBody),
-            signal: abortController.signal,
-          });
+          const currentEpoch = identity.getState().epoch || 0;
+          const skipCooldownRetry =
+            !verdict.retry &&
+            lastFailedGateRetryTime > 0 &&
+            Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
+            lastFailedGateRetryEpoch === currentEpoch;
+
+          if (!skipCooldownRetry) {
+            console.warn(
+              `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}, ${verdict.reason || "unknown"}); refreshing identity and retrying once with full tool set`
+            );
+            ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
+              body,
+              targetModel,
+              useResponses,
+              "full"
+            ));
+            // Re-resolve the endpoint *after* the refresh: a catalog change is one
+            // of the things the refresh can learn, and the retry must go to the
+            // new URL — reusing the pre-refresh value would defeat the derivation.
+            liveEndpoints = resolveEndpoints(targetModel);
+            upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
+            upstreamRes = await fetch(upstreamUrl, {
+              method: "POST",
+              headers: buildUpstreamHeaders(req, retrySessionId),
+              body: JSON.stringify(upstreamBody),
+              signal: abortController.signal,
+            });
+          } else {
+            console.warn(
+              `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}); skipping retry because a full-shape retry already failed <${Math.round(GATE_RETRY_COOLDOWN_MS / 1000)}s ago on the current identity (IP cooldown active)`
+            );
+          }
 
           if (!upstreamRes.ok) {
             // The retry already used the freshest derived identity (endpoint,
@@ -1578,18 +1603,21 @@ function handleRequest(req, res) {
             // Read the retry's own body before logging. The first attempt's
             // message describes a shape this bridge has already replaced, so
             // reporting it here would describe a request nobody sent.
-            let retryText = "";
-            try {
-              retryText = await upstreamRes.text();
-            } catch {}
-            let retryJson = null;
-            try {
-              retryJson = JSON.parse(retryText);
-            } catch {}
+            let retryText = errText;
+            let retryJson = errJson;
+            if (!skipCooldownRetry) {
+              retryText = "";
+              try {
+                retryText = await upstreamRes.text();
+              } catch {}
+              retryJson = null;
+              try {
+                retryJson = JSON.parse(retryText);
+              } catch {}
+            }
             const retryType = retryJson?.error?.type || retryJson?.type || errType || "upstream_error";
             const retryMsg =
               retryJson?.error?.message || retryJson?.message || retryText || rawMsg;
-
             // Report the *retry* status, not the first attempt's: they differ
             // whenever upstream answers the refreshed shape differently (a 426
             // floor handshake followed by a 429 capacity answer is common), and
@@ -1601,6 +1629,12 @@ function handleRequest(req, res) {
             // exhausted. Calling that a gate rejection would send the user to
             // re-check headers that upstream already accepted.
             const capacity = retryStatus === 429;
+            if (capacity) {
+              lastFailedGateRetryTime = 0;
+            } else if (!skipCooldownRetry && isFreeTierCliGateError(retryStatus, retryType, retryMsg)) {
+              lastFailedGateRetryTime = Date.now();
+              lastFailedGateRetryEpoch = identity.getState().epoch || 0;
+            }
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${retryStatus}${
                 retryStatus !== gateStatus ? `, first attempt ${gateStatus}` : ""
@@ -1630,6 +1664,7 @@ function handleRequest(req, res) {
           }
         }
 
+        lastFailedGateRetryTime = 0;
         const completionId = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
         const created = Math.floor(Date.now() / 1000);
         reader = upstreamRes.body.getReader();

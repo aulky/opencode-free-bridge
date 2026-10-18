@@ -4,22 +4,14 @@ OpenAI-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier
 
 It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
 
-## What's New in v2.3 (v2.3.11)
+## Key Capabilities
 
-- **Bun transport parity (`v2.3.6+`):** The OpenCode CLI ships as a compiled Bun binary, and upstream's free-tier gate inspects the TLS `ClientHello` fingerprint (17 cipher suites, 12 TLS extensions in a fixed order). The bridge runs on Bun (`bun server.js`), refuses accidental Node.js startups unless `ALLOW_NODE=1` is set for offline tests, and ships `transport-fingerprint.js` to verify TLS parity against `transport-baseline.json`.
-- **Zero-dead-end installer (`v2.3.6` to `v2.3.11`):** `install.sh` finds or installs Bun (and `unzip` when missing on minimal Linux), stages and syntax-checks every file before touching a running bridge, retires legacy `opencode-bridge.service` units, rewrites `node` units to `bun`, configures `systemd` (Linux) or `launchd` with log redirection (macOS), verifies `/health` and the TLS fingerprint baseline, and exits non-zero if the service never answers.
-- **Full source and catalog derivation (`v2.2` to `v2.3.11`):** All hardcoded model tables (`MODEL_MAP`) and model-name substring heuristics have been removed. The bridge derives its client version, commit SHA, session ID format (`ses_` + 12 hex + 14 base62), 7 gate headers, 13 tool plugins (parsed from upstream's Effect Schema AST in GitHub source), inference endpoints (`chatUrl` and `responsesUrl`), active free models, shorthand family aliases, and reasoning token limits directly from OpenCode's update API, GitHub repository, and `models.opencode.ai/api.json`.
-- **On-disk catalog cache for instant cold starts (`v2.3.8` to `v2.3.11`):** After fetching `models.opencode.ai/api.json`, the bridge caches the catalog at `~/.opencode-free-bridge/cache/catalog.json` and loads it at module boot (`OPENCODE_CACHE_DIR=off` disables disk caching). Model aliases (`mimo`, `longcat`, `beam`), deprecated/paid model checks, and reasoning token budgets work on the very first request after startup and when offline.
-- **Multi-layer reactive self-healing (`v2.3.7` to `v2.3.11`):** When upstream rejects a request with `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a moved endpoint path, the bridge refreshes its recipe and catalog from upstream, evicts stale session IDs from cache, mints a new session ID, escalates to the full 12-tool profile, and retries once transparently before returning to the client.
-
-## Features
-
-- **Self-healing client identity:** Derives the OpenCode CLI wire identity at the current release commit SHA and updates automatically when upstream tightens the gate.
-- **Live catalog discovery:** Reads `models.opencode.ai/api.json` (and `/v1/models`) to expose only active free-tier models (`cost.input === 0`, non-deprecated) and reject retired or paid model IDs locally with a clear error.
-- **Dual-protocol support:** Routes requests to `/inference/openai/v1/chat/completions` or `/inference/openai/v1/responses` based on catalog metadata and automatic protocol-mismatch detection.
-- **Reasoning-aware token budgeting:** Applies an additive token floor (`max(requested, 1024) + 4096`) for reasoning models (determined from catalog `reasoning: true` metadata) so short prompts do not return empty content with `finish_reason: "length"`.
-- **Reasoning stream normalization:** Emits thinking tokens under `reasoning_content` for both streaming SSE and non-streaming JSON responses, and forwards client tool calls with automatic name de-collision (`read` -> `read_client` upstream, restored to `read` on the way back).
-- **Zero dependencies:** Uses only built-in runtime modules (`http`, `crypto`, `fs`, `path`, `net`, `tls`). No `npm install` step.
+- **Bun TLS transport parity:** The official OpenCode CLI ships as a compiled Bun binary, and upstream's free-tier gate inspects the TLS `ClientHello` fingerprint (17 cipher suites and 12 TLS extensions in exact order). The bridge runs on Bun (`bun server.js`), blocks accidental Node.js startups unless `ALLOW_NODE=1` is set for offline tests, and includes `transport-fingerprint.js` to verify TLS parity against `transport-baseline.json`.
+- **Full source & catalog derivation:** Zero hardcoded model tables (`MODEL_MAP`) or substring heuristics. Client version, commit SHA, session ID recipe (`ses_` + 12 hex + 14 base62), 7 gate headers, 13 tool plugins (parsed from upstream's Effect Schema AST in GitHub source, 12 active per model after `patch` vs `edit`/`write` swap), inference endpoints (`chatUrl` and `responsesUrl`), active free models, shorthand family aliases, and reasoning token limits are all derived from OpenCode's update API, GitHub repository, and `models.opencode.ai/api.json`.
+- **On-disk catalog cache for instant cold starts:** Caches `models.opencode.ai/api.json` at `~/.opencode-free-bridge/cache/catalog.json` and loads it at startup (`OPENCODE_CACHE_DIR=off` disables disk caching). Shorthand aliases (`mimo`, `longcat`, `beam`), deprecated/paid model checks, and reasoning token budgets work on the very first request and when offline.
+- **Reactive self-healing with IP-cooldown protection:** On `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a migrated endpoint path, the bridge refreshes its recipe and catalog, evicts stale session IDs, mints a fresh session ID, escalates to the full tool profile, and retries once transparently. If a full-shape retry still returns `403 FreeTierError` (indicating a per-IP upstream cooldown rather than a stale request shape), subsequent requests within the cooldown window (`30s` default) skip redundant GitHub fetches and duplicate retries so the bridge never amplifies an IP penalty.
+- **Dual-protocol & reasoning normalization:** Routes requests to `/inference/openai/v1/chat/completions` or `/inference/openai/v1/responses` automatically, enforces an additive token floor (`max(requested, 1024) + 4096`) for reasoning models, normalizes thinking tokens under `reasoning_content`, and de-collides client tool names (`read` -> `read_client` upstream, restored to `read` on return).
+- **Zero-dead-end installer & zero dependencies:** Uses only built-in runtime modules (`http`, `crypto`, `fs`, `path`, `net`, `tls`). `install.sh` finds or installs Bun, validates staged files before stopping an existing bridge, migrates legacy units, configures `systemd` (Linux) or `launchd` (macOS), and verifies `/health` + TLS parity before succeeding.
 
 ## Requirements: Bun >= 1.0
 
@@ -63,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main
 What `install.sh` does:
 1. Finds `bun` across `PATH`, `$BUN_INSTALL/bin`, `~/.bun/bin`, `~/.local/bin`, `/usr/local/bin`, and `/opt/bun/bin`, or installs it via `https://bun.sh/install` (installing `unzip` first on minimal Linux images when needed).
 2. Downloads every file into a staging directory and validates it (in-process JS syntax compilation and JSON parsing) before touching anything that is already running.
-3. Checks port availability (`ss` or `lsof`), retires a pre-2.3 `opencode-bridge.service` that would hold port 20129, and stops its own running bridge when upgrading in place.
+3. Checks port availability (`ss` or `lsof`), retires a pre-2.0 `opencode-bridge.service` that would hold port 20129, and stops its own running bridge when upgrading in place.
 4. Backs up the previous install under `~/.opencode-free-bridge/.backup-*`, then moves the staged files into place.
 5. Registers and starts the background service (`systemd` system or `--user` unit on Linux, `launchd` agent with `~/Library/Logs/opencode-free-bridge.log` on macOS).
 6. Waits up to 20 seconds for `/health`, runs the quick self-check, and checks the Bun TLS fingerprint against `transport-baseline.json`.
@@ -212,7 +204,8 @@ Client ──▶ Bridge (:20129, Bun) ──▶ https://opencode.ai/inference/op
                  │        deprecated/paid verdicts, and per-model reasoning/output limits
                  └─ 4. On 403 / 426 / 404:
                        -> refreshes recipe + catalog, evicts stale session ID, mints fresh
-                          ses_<12hex><14base62> ID, escalates to full 12-tool profile, retries once
+                          ses_<12hex><14base62> ID, escalates to full tool profile, retries once
+                          (throttled for 30s if full-shape retry is still refused by per-IP gate)
 ```
 
 ### What is derived dynamically vs. fixed
@@ -240,7 +233,7 @@ curl -s http://127.0.0.1:20129/health
 {
   "status": "ok",
   "provider": "opencode-free-bridge",
-  "version": "2.3.11",
+  "version": "2.0.0",
   "runtime": "bun/1.4.2",
   "discoveredModels": 10,
   "identity": {
@@ -297,7 +290,7 @@ curl -s http://127.0.0.1:20129/health
 ## Testing, Verification & Gate Drills
 
 ```bash
-bun test                        # 118 offline unit, contract, and regression tests
+bun test                        # 121 offline unit, contract, and regression tests
 bun run verify                  # live check: probes every discovered free model
 bun run verify:quick            # live check: stops at the first model that answers
 bun run drill                   # runs live + offline self-healing gate drills
@@ -334,7 +327,10 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `MAX_BODY_BYTES` | `10485760` | Maximum request body size in bytes (10 MiB) |
 | `IDENTITY_TTL_MS` | `900000` | Identity freshness TTL in milliseconds (15 minutes) |
 | `UPDATE_MODE` | `reactive` | `reactive` adopts new CLI releases only on `403`/`426` or `minimum: true`; `always` adopts every release on TTL expiry |
-| `TOOL_PROFILE_SCOPE` | `core` | `core` sends the minimal gate anchor (`read`, `shell`) on first attempt and escalates to `full` (all 12 tools) on retry; `full` sends all 12 tools on every request |
+| `GATE_RETRY_COOLDOWN_MS` | `30000` | Cooldown window (ms) after a failed full-shape `403` retry during which duplicate retries are suppressed until identity changes |
+| `GATE_REFRESH_COOLDOWN_MS` | `30000` | Cooldown window (ms) between forced GitHub/catalog refreshes during a `403` burst |
+| `DNS_RESULT_ORDER` | `ipv4first` | DNS resolution order passed to `dns.setDefaultResultOrder` (`ipv4first`, `ipv6first`, `verbatim`) |
+| `TOOL_PROFILE_SCOPE` | `core` | `core` sends the minimal gate anchor (`read`, `shell`) on first attempt and escalates to `full` (all model-applicable tools) on retry; `full` sends the full tool profile on every request |
 | `OPENCODE_CHANNEL` | `latest` | OpenCode release channel (`latest`, `beta`, `dev`) |
 | `OPENCODE_MAJOR` | _(unset)_ | Pin a major version line (for example `2`) |
 | `OPENCODE_USER_AGENT` | _(derived)_ | Override `User-Agent` and disable dynamic identity derivation |
@@ -349,9 +345,9 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 
 ### `403 FreeTierError` persists even after retry
 
-When the bridge receives `403 FreeTierError`, it automatically refreshes its recipe from OpenCode's update API and GitHub source tree, re-mints the session ID, escalates to the full 12-tool profile, and retries once.
+When the bridge receives `403 FreeTierError`, it refreshes its recipe from OpenCode's update API and GitHub source tree, re-mints the session ID, escalates to the full tool profile, and retries once.
 
-If the retry also returns `403 FreeTierError` and `/health` shows `"lastError": null` with the current CLI version (for example `opencode/latest/2.0.32/cli`), **your current IP has exhausted its temporary free-tier allowance upstream**. Running the official OpenCode CLI binary (`opencode run -m opencode/big-pickle "hi"`) from the same IP at the same moment returns the exact same `403 FreeTierError`. Wait for the per-IP window to reset or route through another host/SSH tunnel.
+If that retry also returns `403 FreeTierError` and `/health` shows `"lastError": null` with the current CLI version (for example `opencode/latest/2.0.32/cli`), **your current IP is in a temporary free-tier cooldown upstream**. To prevent extending the penalty, the bridge suppresses duplicate `403` retries and forced GitHub refreshes for `30s` (`GATE_RETRY_COOLDOWN_MS`). Running the official OpenCode CLI binary (`opencode run -m opencode/big-pickle "hi"`) from the same IP at the same moment returns the exact same `403 FreeTierError`. Wait for the per-IP window to reset or route through another host/SSH tunnel.
 
 ### `429 RateLimitError` / `BUSY` in `verify.js`
 

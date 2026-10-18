@@ -53,6 +53,10 @@ const SOURCE_TIMEOUT_MS = parseInt(
   process.env.IDENTITY_SOURCE_TIMEOUT_MS || "8000",
   10
 );
+const GATE_REFRESH_COOLDOWN_MS = parseInt(
+  process.env.GATE_REFRESH_COOLDOWN_MS || "30000",
+  10
+);
 
 function getUpdateMode() {
   const mode = (process.env.UPDATE_MODE || "reactive").toLowerCase().trim();
@@ -245,6 +249,8 @@ let versionFloor = null;
 let lastRefreshError = null;
 let lastSourceTag = null;
 let optionalHeaders = [];
+let lastForcedRefreshTime = 0;
+let stateEpoch = 0;
 
 function stableStringify(val) {
   if (!val || typeof val !== "object") return JSON.stringify(val);
@@ -1650,6 +1656,8 @@ function applyRecipe(update = {}, tag = null) {
 
   if (changed.length > 0) {
     recipe = next;
+    stateEpoch++;
+    lastForcedRefreshTime = 0;
   }
   if (tag) lastSourceTag = tag;
   return changed;
@@ -1843,6 +1851,9 @@ async function refresh({ force = false, recheck = false } = {}) {
       Object.assign(update, catalog);
 
       const changed = applyRecipe(update, ref);
+      if (isForced && sourceRead && !release.stale) {
+        lastForcedRefreshTime = Date.now();
+      }
       return {
         updated: changed.length > 0,
         changed,
@@ -1900,6 +1911,24 @@ async function onGateRejection(status, errType, errMsg, attempted = false) {
     if (compareVersions(recipe.version, floor) < 0) {
       applyRecipe({ version: floor }, lastSourceTag);
     }
+  }
+
+  // Avoid hammering GitHub's API (60 req/hr unauthenticated) and the catalog on
+  // every request during a per-IP 403 cooldown burst: if a forced refresh
+  // already succeeded within GATE_REFRESH_COOLDOWN_MS and no version floor was
+  // reported, reuse the current state.
+  if (
+    !floor &&
+    lastForcedRefreshTime > 0 &&
+    Date.now() - lastForcedRefreshTime < GATE_REFRESH_COOLDOWN_MS
+  ) {
+    return {
+      retry: false,
+      reason: "no-change",
+      cooldown: true,
+      status,
+      errType,
+    };
   }
 
   const result = await refresh({ force: true });
@@ -2246,6 +2275,8 @@ function getState() {
     userAgent: getUserAgent(),
     updateMode: getUpdateMode(),
     lastCheckTime,
+    lastForcedRefreshTime,
+    epoch: stateEpoch,
     ttlMs: IDENTITY_TTL_MS,
     versionFloor,
     lastRefreshError,
@@ -2288,6 +2319,8 @@ function __reset() {
   lastRelease = null;
   lastAvailable = null;
   lastCheckTime = 0;
+  lastForcedRefreshTime = 0;
+  stateEpoch++;
   refreshInFlight = null;
   versionFloor = null;
   lastRefreshError = null;
@@ -2299,17 +2332,23 @@ function __reset() {
 
 function __setLastCheckTime(v) {
   lastCheckTime = v;
+  lastForcedRefreshTime = 0;
+  stateEpoch++;
 }
 
 /** Test hook: stage a session prefix without going through recipe validation. */
 function __setSessionPrefix(prefix) {
   recipe = { ...recipe, sessionPrefix: String(prefix) };
+  lastForcedRefreshTime = 0;
+  stateEpoch++;
 }
 
 function __setToolProfile(tools, source = "test") {
   toolProfile = tools;
   toolProfileSource = source;
   toolProfileVersion = recipe.version;
+  lastForcedRefreshTime = 0;
+  stateEpoch++;
 }
 
 // Warm-start from the on-disk catalog cache at module load so shorthand aliases,

@@ -9,7 +9,7 @@
 #      403 on Node and curl.
 #   2. downloads the bridge into a staging directory and validates it before
 #      touching anything that is already running
-#   3. retires a pre-2.3 `opencode-bridge.service` that would fight for the port
+#   3. retires a pre-2.0 `opencode-bridge.service` that would fight for the port
 #   4. copies the bridge and its tools into an install dir (server.js,
 #      identity.js, token-budget.js, verify.js, gate-drill.js and the
 #      transport-fingerprint files), backing up any existing install first
@@ -191,7 +191,7 @@ migrate_service_runtime() {
 migrate_service_runtime
 
 # ------------------------------------------------------- legacy retirement ---
-# Releases before v2.3 registered `opencode-bridge.service`, not
+# Releases before v2.0 registered `opencode-bridge.service`, not
 # `opencode-free-bridge.service`. Both bind the same port, so leaving the old
 # unit enabled makes the new service fail with EADDRINUSE and restart-loop
 # forever. A user who finds this repo and re-runs the installer on a machine

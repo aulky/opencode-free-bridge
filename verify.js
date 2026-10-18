@@ -203,7 +203,6 @@ async function probe(model) {
   for (const model of toProbe) {
     const r = await probe(model);
     results.push({ model, ...r });
-    if (QUICK && r.state === "ok") break;
     const time = `${(r.ms / 1000).toFixed(1)}s`.padStart(6);
     if (r.state === "ok") {
       console.log(`  ${ok("OK")}   ${model.padEnd(36)} ${time}  ${C.dim}${r.chars} chars, ${r.outTokens} tokens${C.reset}`);
@@ -220,6 +219,8 @@ async function probe(model) {
     } else {
       console.log(`  ${bad("FAIL")} ${model.padEnd(36)} ${time}  ${C.dim}${r.detail}${C.reset}`);
     }
+    if (QUICK && r.state === "ok") break;
+    if (r.state === "gate-closed") break;
   }
 
   const counts = results.reduce((acc, r) => ((acc[r.state] = (acc[r.state] || 0) + 1), acc), {});

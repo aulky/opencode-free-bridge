@@ -167,7 +167,7 @@ test("installer stages and validates downloads before stopping the old bridge", 
   assert.ok(syntaxAt < retireCall, "validation must happen before the old bridge is stopped");
 });
 
-test("installer retires the pre-2.3 unit that owns the same port", () => {
+test("installer retires the pre-2.0 unit that owns the same port", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");
   // Old releases shipped opencode-bridge.service. Leaving it enabled makes the

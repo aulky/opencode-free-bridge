@@ -957,6 +957,53 @@ describe("server unit & integration tests", () => {
       }
     });
 
+    it("suppresses redundant 403 retries during an active IP cooldown until identity changes", async () => {
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        return {
+          ok: false,
+          status: 403,
+          text: async () =>
+            JSON.stringify({ error: { type: "FreeTierError", message: "free tier" } }),
+        };
+      };
+      const realOnGate = identity.onGateRejection;
+      let shouldRetry = false;
+      identity.onGateRejection = async () => ({
+        retry: shouldRetry,
+        reason: shouldRetry ? "test-update" : "no-change",
+      });
+      try {
+        // First request: 1 initial attempt + 1 full-shape retry = 2 calls
+        const res1 = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "first" }],
+        });
+        assert.equal(res1.status, 403);
+        assert.equal(calls, 2);
+
+        // Second request during cooldown with no identity change: 1 attempt, no duplicate retry
+        const res2 = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "second" }],
+        });
+        assert.equal(res2.status, 403);
+        assert.equal(calls, 3, "must not double-hit upstream while full-shape retry already failed on current identity");
+
+        // If identity actually learns an update, retry is re-enabled immediately
+        shouldRetry = true;
+        const res3 = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "third" }],
+        });
+        assert.equal(res3.status, 403);
+        assert.equal(calls, 5, "a learned identity change must retry immediately");
+      } finally {
+        identity.onGateRejection = realOnGate;
+      }
+    });
+
     it("omits the update hint when the refreshed identity is already rejected (budget gate)", async () => {
       mockFetchImpl = async () => ({
         ok: false,

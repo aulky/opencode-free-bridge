@@ -591,6 +591,23 @@ describe("identity: self-healing on gate rejection", () => {
     assert.equal(verdict.retry, true);
     assert.equal(identity.getRecipe().version, "2.0.99");
   });
+
+  it("throttles repeated forced refreshes during a 403 burst unless a version floor is reported", async () => {
+    const calls = mockUpstream({ versions: [identity.getRecipe().version] });
+    await identity.refresh({ force: true });
+    identity.__setLastCheckTime(Date.now());
+
+    const countBefore = calls.length;
+    const first = await identity.onGateRejection(403, "FreeTierError", "free tier");
+    assert.equal(first.retry, false);
+    const countAfterFirst = calls.length;
+    assert.ok(countAfterFirst > countBefore);
+
+    const second = await identity.onGateRejection(403, "FreeTierError", "free tier");
+    assert.equal(second.retry, false);
+    assert.equal(second.cooldown, true);
+    assert.equal(calls.length, countAfterFirst, "must not re-fetch GitHub/catalog during 403 cooldown");
+  });
 });
 
 describe("identity: adaptive endpoints", () => {
