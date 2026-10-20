@@ -24,6 +24,20 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORI
 // 9Router's Cloudflare/Vercel/Deno/Netlify relays speak). The relay performs
 // the final fetch, so upstream sees the relay's egress IP. Empty = direct.
 const UPSTREAM_RELAY_URL = (process.env.UPSTREAM_RELAY_URL || "").trim();
+
+/**
+ * Origin-only label for `/health`. The configured relay URL may carry
+ * credentials or a token in the query string; those must not be handed to any
+ * client that can reach the local health endpoint.
+ */
+function relayLabel(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "configured";
+  }
+}
+
 // Wire endpoints. These are *defaults*; the live values come from identity.js,
 // which resolves them from the upstream provider catalog (`opencode.api` in
 // models.opencode.ai/api.json) at refresh time. Reading them per request means
@@ -1415,7 +1429,9 @@ function handleRequest(req, res) {
         // Egress mode. `direct` means inference requests go straight to
         // opencode.ai; `relay` means they are sent through UPSTREAM_RELAY_URL,
         // so upstream sees that relay's IP instead of this host's.
-        egress: UPSTREAM_RELAY_URL ? { mode: "relay", relay: UPSTREAM_RELAY_URL } : { mode: "direct" },
+        egress: UPSTREAM_RELAY_URL
+          ? { mode: "relay", relay: relayLabel(UPSTREAM_RELAY_URL) }
+          : { mode: "direct" },
         identity: {
           userAgent: idState.userAgent,
           updateMode: idState.updateMode,

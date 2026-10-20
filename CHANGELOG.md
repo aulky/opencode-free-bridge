@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.3] — 2026-10-20
 
 ### IP-level abuse blocks are terminal, not a stale identity
 
@@ -34,6 +34,16 @@ a misleading "update opencode-free-bridge" hint to the refusal.
   on the second attempt.
 - **Docs:** README and AGENTS troubleshooting sections now route abuse blocks to
   upstream support instead of reinstall/update advice.
+
+### Optional egress relay
+
+`UPSTREAM_RELAY_URL` sends inference through a relay implementing the 9Router
+`x-relay-target` / `x-relay-path` contract, so upstream sees the relay's egress
+IP instead of this host's. It covers the initial request and every retry; model
+discovery and identity sync stay direct. Empty (the default) keeps direct
+egress. `/health` reports `egress.mode` and the relay's origin only (credentials
+and query strings are not exposed), and changing the variable requires a
+restart.
 
 ---
 

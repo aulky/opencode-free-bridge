@@ -347,8 +347,27 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `OPENCODE_CACHE_DIR` | `~/.opencode-free-bridge/cache` | Directory for the on-disk `catalog.json` cache (`off` disables disk caching) |
 | `OPENCODE_CHAT_URL` | _(derived)_ | Override the upstream Chat Completions endpoint URL |
 | `OPENCODE_RESPONSES_URL` | _(derived)_ | Override the upstream Responses API endpoint URL |
+| `UPSTREAM_RELAY_URL` | _(unset)_ | Route inference through an egress relay (`x-relay-target` / `x-relay-path` contract); empty = direct. See [Optional egress relay](#optional-egress-relay) |
 | `AUTO_UPDATE` | `1` | Poll GitHub for bridge updates every 6 hours (automatically skipped inside a `.git` checkout; set `0` to disable) |
 | `ALLOW_NODE` | _(unset)_ | Set `ALLOW_NODE=1` to bypass the startup Bun check for offline tests |
+
+### Optional egress relay
+
+Set `UPSTREAM_RELAY_URL` to a relay that speaks the same contract as 9Router's
+Cloudflare/Vercel/Deno/Netlify relays. The bridge POSTs to the relay with
+`x-relay-target: <origin>` and `x-relay-path: <path>`, and the relay replays the
+request at that origin; upstream therefore sees the relay's egress IP.
+
+```bash
+UPSTREAM_RELAY_URL="https://relay.example.workers.dev" bun server.js
+```
+
+The relay covers inference requests and their retries; model discovery and
+identity synchronization stay direct. `/health` reports `egress.mode` (`direct`
+or `relay`) and the relay's origin, without credentials or query strings. Use a
+trusted HTTPS relay: it receives the request headers (including
+`Authorization: Bearer public`) and the full prompt. Changing the variable
+requires a restart.
 
 ## Troubleshooting
 
