@@ -2026,11 +2026,41 @@ function ensureFresh() {
 }
 
 /**
+ * Upstream's IP-level abuse block.
+ *
+ * Known variants (all HTTP 403, `error.type: FreeTierError`):
+ *
+ *   - "OpenCode's free models aren't available from your current network
+ *      because we've detected abusive traffic from this IP address. ..."
+ *   - "Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic"
+ *   - "Abuse of traffic" (short form)
+ *
+ * Unlike the shape gate ("OpenCode's free tier can only be used from within
+ * OpenCode"), no identity change can clear this: the gateway keys it to the
+ * egress network, and the official CLI gets the same answer from the same IP.
+ * Retrying only extends the penalty, so callers must not refresh or replay.
+ */
+function isIpAbuseRejection(status, errMsg) {
+  if (status !== 403) return false;
+  const m = String(errMsg || "").toLowerCase();
+  return (
+    m.includes("abusive traffic") ||
+    m.includes("abuse traffic") ||
+    m.includes("abuse of traffic")
+  );
+}
+
+/**
  * Reactive self-heal when upstream rejects our request with a CLI gate error
  * (403 FreeTierError or 426 UpgradeRequired).
  */
 async function onGateRejection(status, errType, errMsg, attempted = false) {
   if (attempted) return { retry: false, reason: "already-retried" };
+  // A network-level block is terminal: refreshing the recipe cannot change
+  // which IP the request leaves from, so skip the GitHub/catalog fetch.
+  if (isIpAbuseRejection(status, errMsg)) {
+    return { retry: false, reason: "ip-abuse", terminal: true };
+  }
 
   const versionBefore = recipe.version;
   const toolsBefore = stableStringify(getTools());
@@ -2545,6 +2575,7 @@ module.exports = {
   refresh,
   ensureFresh,
   onGateRejection,
+  isIpAbuseRejection,
   createId,
   getUserAgent,
   getRecipe,

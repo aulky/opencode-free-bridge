@@ -9,8 +9,8 @@ It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible
 - **Bun TLS transport parity:** The official OpenCode CLI ships as a compiled Bun binary, and upstream's free-tier gate inspects the TLS `ClientHello` fingerprint (17 cipher suites and 12 TLS extensions in exact order). The bridge runs on Bun (`bun server.js`), blocks accidental Node.js startups unless `ALLOW_NODE=1` is set for offline tests, and ships `transport-fingerprint.js` to verify TLS parity against `transport-baseline.json`.
 - **Full source & catalog derivation:** All hardcoded model tables (`MODEL_MAP`) and model-name substring heuristics have been removed. Client version, commit SHA, session ID recipe (`ses_` + 12 hex + 14 base62), 7 gate headers, 13 tool plugins (parsed from upstream's Effect Schema AST in GitHub source, 12 active per model after `patch` vs `edit`/`write` swap), inference endpoints (`chatUrl` and `responsesUrl`), active free models, shorthand family aliases, and reasoning token limits are derived directly from OpenCode's update API, GitHub repository, and `models.opencode.ai/api.json`.
 - **On-disk catalog cache for instant cold starts:** Caches `models.opencode.ai/api.json` at `~/.opencode-free-bridge/cache/catalog.json` and loads it at startup (`OPENCODE_CACHE_DIR=off` disables disk caching). Shorthand aliases (`mimo`, `longcat`, `beam`), deprecated/paid model checks, and reasoning token budgets work on the very first request and when offline.
-- **Multi-layer reactive self-healing with IP-cooldown protection:** On `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a migrated endpoint path, the bridge refreshes its recipe and catalog, evicts stale session IDs, mints a fresh session ID, escalates to the full tool profile, and retries once transparently. If a full-shape retry still returns `403 FreeTierError` (indicating a per-IP upstream cooldown rather than a stale request shape), subsequent requests within the 30s cooldown window (`GATE_RETRY_COOLDOWN_MS`, `GATE_REFRESH_COOLDOWN_MS`) skip redundant GitHub fetches and duplicate retries so the bridge never amplifies an IP penalty.
-- **Gate anchors, so a shape bug can never masquerade as an IP block:** Upstream returns one `403 FreeTierError` — *"OpenCode's free tier can only be used from within OpenCode"* — for at least four unrelated causes: a refused egress IP, a request without a tool named `read`, a User-Agent that is not `opencode/<channel>/<semver>/<name>`, and a request without a session header. Measured by replaying byte-identical requests from a refused egress and a clean one, varying one field at a time: `read` + 11 fabricated tools → `200`, the real `read` renamed → `403`, a fabricated tool *named* `read` → `200`. The bridge therefore pins those anchors (`GATE_ANCHOR_TOOL_NAMES`, `GATE_ANCHOR_HEADER_NAMES`) independently of what the derived recipe and tool profile contain, audits the outgoing request when a `403` arrives, and reports `X-OpenCode-Gate: shape-rejected` plus the missing anchors instead of blaming the network. Upstream's `x-opencode-log-id` is recorded and exposed at `/health` (`identity.gate.lastRejection`) for correlation.
+- **Multi-layer reactive self-healing with IP-cooldown protection:** On `403 FreeTierError`, `426 UpgradeRequired`, or `404` on a migrated endpoint path, the bridge refreshes its recipe and catalog, evicts stale session IDs, mints a fresh session ID, escalates to the full tool profile, and retries once transparently. If a full-shape retry still returns `403 FreeTierError` (indicating a per-IP upstream cooldown rather than a stale request shape), subsequent requests within the 30s cooldown window (`GATE_RETRY_COOLDOWN_MS`, `GATE_REFRESH_COOLDOWN_MS`) skip redundant GitHub fetches and duplicate retries so the bridge never amplifies an IP penalty. **Exception:** the gateway's explicit IP-level abuse block (*"detected abusive traffic from this IP address"* / `Detect Abuse Traffic`) is terminal — the bridge answers it verbatim with `X-OpenCode-Gate: ip-abuse` and performs no refresh, session re-mint, or retry, because no client-side change can clear a flag keyed to the egress network.
+- **Gate anchors, so a shape bug can never masquerade as an IP block:** Upstream returns one `403 FreeTierError` — *"OpenCode's free tier can only be used from within OpenCode"* — for at least four unrelated causes: a refused egress IP, a request without a tool named `read`, a User-Agent that is not `opencode/<channel>/<semver>/<name>`, and a request without a session header. Measured by replaying byte-identical requests from a refused egress and a clean one, varying one field at a time: `read` + 11 fabricated tools → `200`, the real `read` renamed → `403`, a fabricated tool *named* `read` → `200`. The bridge therefore pins those anchors (`GATE_ANCHOR_TOOL_NAMES`, `GATE_ANCHOR_HEADER_NAMES`) independently of what the derived recipe and tool profile contain, audits the outgoing request when a `403` arrives, and reports `X-OpenCode-Gate: shape-rejected` plus the missing anchors instead of blaming the network. A second, unambiguous message (*"detected abusive traffic from this IP address"* or `Detect Abuse Traffic`) identifies a network-level block and is answered immediately as `ip-abuse`; only the ambiguous free-tier message goes through the shape audit at all. Upstream's `x-opencode-log-id` is recorded and exposed at `/health` (`identity.gate.lastRejection`) for correlation.
 - **Zero-dead-end universal installer:** `install.sh` finds or installs Bun (and `unzip` when missing on minimal Linux), stages and validates every file before touching a running bridge, retires legacy `opencode-bridge.service` units, rewrites `node` units to `bun`, configures `systemd` (Linux) or `launchd` (macOS), and verifies `/health` and the TLS fingerprint baseline before succeeding.
 
 ## Features
@@ -299,14 +299,14 @@ curl -s http://127.0.0.1:20129/health
 ## Testing, Verification & Gate Drills
 
 ```bash
-bun test                        # 137 offline unit, contract, and regression tests
+bun test                        # 145 offline unit, contract, and regression tests
 bun run verify                  # live check: probes every discovered free model
 bun run verify:quick            # live check: stops at the first model that answers
 bun run drill                   # runs live + offline self-healing gate drills
 bun run fingerprint:check       # checks Bun TLS ClientHello against transport-baseline.json
 ```
 
-`verify.js` exits `0` when a model answers, `2` when the bridge is healthy and its TLS fingerprint matches the baseline but upstream refuses this IP's free-tier allowance, and `1` for a real failure (bridge unreachable, running on Node.js, or TLS fingerprint drift). The `2` case is what a throttled network looks like: the official OpenCode CLI gets the same `403 FreeTierError` from the same IP at the same moment, so it is not a reason to reinstall or edit headers.
+`verify.js` exits `0` when a model answers, `2` when the bridge is healthy and its TLS fingerprint matches the baseline but upstream refuses this IP (free-tier allowance or an explicit abuse block), and `1` for a real failure (bridge unreachable, running on Node.js, or TLS fingerprint drift). The `2` case is what a throttled or flagged network looks like: the official OpenCode CLI gets the same `403 FreeTierError` from the same IP at the same moment, so it is not a reason to reinstall or edit headers. The bridge labels the refusal (`X-OpenCode-Gate: ip-throttled | ip-abuse | shape-rejected`), so `verify.js` no longer depends on upstream keeping identical wording.
 
 `gate-drill.js` deliberately corrupts the bridge's state and verifies that a single client request triggers self-healing and still returns `HTTP 200`:
 
@@ -352,9 +352,24 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 
 ## Troubleshooting
 
+### `403` with "detected abusive traffic" / `Detect Abuse Traffic` (IP-level block)
+
+This is not the shape gate and not a stale bridge. The gateway has flagged the
+network's egress IP for abusive traffic; the message says it is unrelated to the
+account. The bridge treats it as terminal: it does **not** refresh the identity,
+re-mint the session id, or retry, and returns the refusal verbatim with
+`X-OpenCode-Gate: ip-abuse`. `/health` reports `identity.gate.status:
+"ip-blocked"` and `identity.gate.lastRejection.kind: "ip-abuse"`.
+
+The official OpenCode CLI gets the same answer from the same network. Only
+upstream can clear the flag (`help@anoma.ly`, with the time it started and the
+`x-opencode-log-id` from the response). Until then, change egress (route through
+another host or SSH tunnel), subscribe to OpenCode Go, or wait. Reinstalling the
+bridge or editing headers will not help.
+
 ### `403 FreeTierError` persists even after retry
 
-When the bridge receives `403 FreeTierError`, it refreshes its recipe from OpenCode's update API and GitHub source tree, re-mints the session ID, escalates to the full tool profile, and retries once.
+When the bridge receives `403 FreeTierError`, it refreshes its recipe from OpenCode's update API and GitHub source tree, re-mints the session ID, escalates to the full tool profile, and retries once. If the message names an explicit IP-level abuse block (`abusive traffic` / `Detect Abuse Traffic`), this path is skipped entirely — see the section above.
 
 If that retry also returns `403 FreeTierError` and `/health` shows `"lastError": null` with the current CLI version (for example `opencode/latest/2.0.32/cli`), **your current IP is in a temporary free-tier cooldown upstream**. To prevent extending the penalty, the bridge suppresses duplicate `403` retries and forced GitHub refreshes for `30s` (`GATE_RETRY_COOLDOWN_MS`). Running the official OpenCode CLI binary (`opencode run -m opencode/big-pickle "hi"`) from the same IP at the same moment returns the exact same `403 FreeTierError`. Wait for the per-IP window to reset or route through another host/SSH tunnel.
 

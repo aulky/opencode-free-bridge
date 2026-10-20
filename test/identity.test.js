@@ -584,6 +584,25 @@ describe("identity: self-healing on gate rejection", () => {
     assert.equal(verdict.reason, "already-retried");
   });
 
+  it("treats an IP-level abuse block as terminal without refreshing", async () => {
+    // Upstream returns `403 FreeTierError` for this too, so a type-only check
+    // would force a GitHub/catalog refresh that cannot change the egress IP.
+    const messages = [
+      "OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address. This isn't related to your account.",
+      "Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic",
+      "Abuse of traffic",
+    ];
+    for (const message of messages) {
+      const calls = mockUpstream({ versions: ["2.0.99"] });
+      const before = calls.length;
+      const verdict = await identity.onGateRejection(403, "FreeTierError", message);
+      assert.equal(verdict.retry, false, message);
+      assert.equal(verdict.reason, "ip-abuse", message);
+      assert.equal(verdict.terminal, true, message);
+      assert.equal(calls.length, before, `must not refresh for: ${message}`);
+    }
+  });
+
   it("recovers when the feed names a newer version", async () => {
     mockUpstream({ versions: ["2.0.99"] });
     identity.__setLastCheckTime(Date.now());

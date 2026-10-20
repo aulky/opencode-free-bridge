@@ -973,6 +973,117 @@ describe("server unit & integration tests", () => {
       }
     });
 
+    it("does not refresh or retry when upstream reports an IP-level abuse block", async () => {
+      const abuse =
+        "OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address. This isn't related to your account. If you're on a VPN or proxy, turn it off and try again, or subscribe to OpenCode Go at https://opencode.ai/go to keep building.";
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        return {
+          ok: false,
+          status: 403,
+          headers: { get: (h) => (String(h).toLowerCase() === "x-opencode-log-id" ? "log-abuse-1" : null) },
+          text: async () =>
+            JSON.stringify({ type: "error", error: { type: "FreeTierError", message: abuse } }),
+        };
+      };
+      const realOnGate = identity.onGateRejection;
+      let gateCalls = 0;
+      identity.onGateRejection = async () => {
+        gateCalls++;
+        return { retry: true, reason: "test-update" };
+      };
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(calls, 1, "an IP-level block must not be replayed upstream");
+        assert.equal(gateCalls, 0, "an IP-level block must not trigger an identity refresh");
+        assert.equal(res.status, 403);
+        assert.equal(res.headers["x-opencode-gate"], "ip-abuse");
+        assert.equal(res.headers["x-opencode-log-id"], "log-abuse-1");
+        assert.equal(res.body.error.message, abuse, "the refusal must reach the client verbatim");
+        assert.doesNotMatch(res.body.error.message, /install\.sh \| bash/);
+
+        const health = await httpRequest(port, "GET", "/health");
+        assert.equal(health.body.identity.gate.status, "ip-blocked");
+        assert.equal(health.body.identity.gate.lastRejection.kind, "ip-abuse");
+      } finally {
+        identity.onGateRejection = realOnGate;
+        sessionCache.clear();
+      }
+    });
+
+    it("recognises the gateway's short abuse phrasing too", async () => {
+      const abuse = "Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic";
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        return {
+          ok: false,
+          status: 403,
+          text: async () =>
+            JSON.stringify({ type: "error", error: { type: "FreeTierError", message: abuse } }),
+        };
+      };
+      const realOnGate = identity.onGateRejection;
+      let gateCalls = 0;
+      identity.onGateRejection = async () => {
+        gateCalls++;
+        return { retry: true, reason: "test-update" };
+      };
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(calls, 1, "the short abuse phrasing must be terminal too");
+        assert.equal(gateCalls, 0);
+        assert.equal(res.status, 403);
+        assert.equal(res.headers["x-opencode-gate"], "ip-abuse");
+        assert.equal(res.body.error.message, abuse);
+      } finally {
+        identity.onGateRejection = realOnGate;
+        sessionCache.clear();
+      }
+    });
+
+    it("treats an abuse block discovered on the retry as terminal, without an update hint", async () => {
+      const abuse =
+        "OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address.";
+      let calls = 0;
+      mockFetchImpl = async () => {
+        calls++;
+        const message =
+          calls === 1
+            ? "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building."
+            : abuse;
+        return {
+          ok: false,
+          status: 403,
+          text: async () =>
+            JSON.stringify({ type: "error", error: { type: "FreeTierError", message } }),
+        };
+      };
+      const realOnGate = identity.onGateRejection;
+      identity.onGateRejection = async () => ({ retry: true, reason: "test-update" });
+      try {
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "big-pickle",
+          messages: [{ role: "user", content: "hi" }],
+        });
+        assert.equal(calls, 2, "the first attempt was a shape gate, so it still retries once");
+        assert.equal(res.status, 403);
+        assert.equal(res.headers["x-opencode-gate"], "ip-abuse");
+        assert.equal(res.body.error.message, abuse);
+        assert.doesNotMatch(res.body.error.message, /install\.sh \| bash/);
+      } finally {
+        identity.onGateRejection = realOnGate;
+        sessionCache.clear();
+      }
+    });
+
     it("suppresses redundant 403 retries during an active IP cooldown until identity changes", async () => {
       let calls = 0;
       mockFetchImpl = async () => {

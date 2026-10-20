@@ -608,8 +608,9 @@ else
 fi
 case "$CHECK_RC" in
   0) ;;
-  2) warn "the bridge is installed and healthy, but upstream refused this IP's free-tier allowance"
-     warn "the official OpenCode CLI gets the same refusal from this network; re-check later with the command below" ;;
+  2) warn "the bridge is installed and healthy, but upstream refused this IP (free-tier allowance or an abuse block)"
+     warn "the official OpenCode CLI gets the same refusal from this network; the self-check above says which one"
+     warn "re-check later with the command below" ;;
   124) warn "self-check hit the 120s cap; the bridge is installed, run the check again when upstream is responsive" ;;
   *) warn "self-check reported a problem; inspect the log with the command below" ;;
 esac

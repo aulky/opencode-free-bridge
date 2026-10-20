@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased]
+
+### IP-level abuse blocks are terminal, not a stale identity
+
+Upstream now returns a second, explicit `403 FreeTierError` message for a
+network-level flag (*"OpenCode's free models aren't available from your current
+network because we've detected abusive traffic from this IP address"*, and the
+earlier `Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic`). The
+bridge treated it like the shape gate: forced a GitHub/catalog refresh, re-minted
+the session id, and replayed the request once. No identity change can clear a
+flag keyed to the egress IP, so the retry only extended the penalty and appended
+a misleading "update opencode-free-bridge" hint to the refusal.
+
+- **Terminal classifier (`identity.js`):** `isIpAbuseRejection` matches the
+  known phrasings; `onGateRejection` returns `{retry:false, reason:"ip-abuse",
+  terminal:true}` before consulting the refresh cooldown.
+- **No refresh, no retry (`server.js`):** the gate branch short-circuits on the
+  first abuse message and returns it verbatim with
+  `X-OpenCode-Gate: ip-abuse` and upstream's `x-opencode-log-id`. The retry path
+  applies the same rule when the first attempt carried the ambiguous shape
+  message.
+- **Accurate diagnosis:** `/health` reports `identity.gate.status: "ip-blocked"`
+  plus `ipBlockedSince` and `lastRejection.kind`, and a later success clears it.
+  The generic gate diagnostic is labelled `kind: "free-tier-gate"`.
+- **`verify.js`:** reads `X-OpenCode-Gate` (`ip-throttled` / `ip-abuse` →
+  `gate-closed`, exit `2`; `shape-rejected` → failure) and falls back to the
+  abuse wording. A correctly installed bridge is no longer reported as broken,
+  and the installer repeats the right verdict.
+- **Tests:** both abuse phrasings assert exactly one upstream call, zero
+  `onGateRejection` calls, a verbatim body, and the `ip-abuse` header; identity
+  tests assert no refresh; the retry path is covered when the block appears only
+  on the second attempt.
+- **Docs:** README and AGENTS troubleshooting sections now route abuse blocks to
+  upstream support instead of reinstall/update advice.
+
+---
+
 ## [2.0.1] — 2026-10-18
 
 ### Tunnel lifecycle tooling actually reaches installed hosts

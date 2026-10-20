@@ -87,7 +87,7 @@ function request(method, path, body, timeoutMs = QUICK ? 25000 : 120000) {
           // back as SSE. Fold it into the same shape a non-streaming call would
           // return, so the verdict logic below reads one form only.
           if (!parsed && /^\s*data:/.test(data)) parsed = assembleSse(data);
-          resolve({ status: res.statusCode, body: parsed, raw: data });
+          resolve({ status: res.statusCode, headers: res.headers, body: parsed, raw: data });
         });
       }
     );
@@ -142,11 +142,22 @@ async function probe(model) {
   if (res.status === 429) return { state: "ratelimited", ms };
   if (res.status === 403) {
     const msg = String(res.body?.error?.message || res.error || "");
-    // The gateway refuses a perfectly healthy request with the same
-    // `403 FreeTierError` when this IP's allowance is spent. Reporting that as
-    // "FAIL / not answering" tells a new user their install is broken when it
-    // is not, so it gets its own state and its own exit code.
-    if (/free tier can only be used|FreeTierError/i.test(msg)) {
+    // The bridge labels the refusal, so the verdict does not depend on wording
+    // that upstream can rephrase:
+    //   ip-throttled   per-IP free-tier allowance spent
+    //   ip-abuse       gateway flagged this network (abusive traffic)
+    //   shape-rejected the bridge built a request the gate refuses (real fault)
+    // Both IP states are upstream refusals, not a broken install, so they share
+    // the GATE state and exit code 2.
+    const gate = String(res.headers?.["x-opencode-gate"] || "");
+    if (gate === "shape-rejected") {
+      return { state: "failed", ms, detail: `gate rejected the bridge's request shape: ${msg.slice(0, 70)}` };
+    }
+    if (
+      gate === "ip-throttled" ||
+      gate === "ip-abuse" ||
+      /free tier can only be used|free models aren[’']t available|abusive traffic|abuse traffic|abuse of traffic|FreeTierError/i.test(msg)
+    ) {
       return { state: "gate-closed", ms, detail: String(msg).slice(0, 90) };
     }
   }
@@ -209,7 +220,7 @@ async function probe(model) {
     } else if (r.state === "ratelimited") {
       console.log(`  ${warn("BUSY")} ${model.padEnd(36)} ${time}  ${C.dim}upstream rate limit, retry later${C.reset}`);
     } else if (r.state === "gate-closed") {
-      console.log(`  ${warn("GATE")} ${model.padEnd(36)} ${time}  ${C.dim}this IP is outside the free-tier allowance${C.reset}`);
+      console.log(`  ${warn("GATE")} ${model.padEnd(36)} ${time}  ${C.dim}upstream refuses this IP (allowance or abuse block)${C.reset}`);
     } else if (r.state === "upgrade-required") {
       console.log(`  ${bad("UPGR")} ${model.padEnd(36)} ${time}  ${C.dim}${r.detail}${C.reset}`);
     } else if (r.state === "thinking-only") {
@@ -272,7 +283,8 @@ async function probe(model) {
     console.log(`\n  ${warn("Bridge is healthy, but upstream refused this IP.")}`);
     console.log(`  ${C.dim}The gateway answered every probe with its own free-tier refusal, not a bridge error.${C.reset}`);
     console.log(`  ${C.dim}The official OpenCode CLI gets the same answer from this network right now.${C.reset}`);
-    console.log(`  ${C.dim}Wait for the allowance window to reset, or run the bridge on another host.${C.reset}`);
+    console.log(`  ${C.dim}If the message names abusive traffic, the network is flagged: email help@anoma.ly; only upstream can clear it.${C.reset}`);
+    console.log(`  ${C.dim}Otherwise wait for the allowance window to reset, or run the bridge on another host.${C.reset}`);
     console.log(`  ${C.dim}Re-check later: ${C.reset}${C.cyan}bun verify.js --quick${C.reset}\n`);
     process.exit(2);
   }

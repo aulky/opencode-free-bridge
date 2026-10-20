@@ -18,6 +18,12 @@ const GATE_RETRY_COOLDOWN_MS = parseInt(
   10
 );
 const CORS_ORIGIN = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORIGIN : "";
+// Optional egress relay. When set, every upstream inference request is sent to
+// this relay URL instead of directly to opencode.ai, with the real origin and
+// path carried in x-relay-target / x-relay-path (the same header contract
+// 9Router's Cloudflare/Vercel/Deno/Netlify relays speak). The relay performs
+// the final fetch, so upstream sees the relay's egress IP. Empty = direct.
+const UPSTREAM_RELAY_URL = (process.env.UPSTREAM_RELAY_URL || "").trim();
 // Wire endpoints. These are *defaults*; the live values come from identity.js,
 // which resolves them from the upstream provider catalog (`opencode.api` in
 // models.opencode.ai/api.json) at refresh time. Reading them per request means
@@ -227,6 +233,26 @@ let currentUserAgent = process.env.OPENCODE_USER_AGENT || identity.getUserAgent(
 function syncUserAgent() {
   if (!process.env.OPENCODE_USER_AGENT) currentUserAgent = identity.getUserAgent();
   return currentUserAgent;
+}
+
+/**
+ * Send an inference request to `url`, optionally through the configured egress
+ * relay. The relay contract is the one 9Router's deployable relays speak:
+ * POST <relay> with `x-relay-target: <origin>` and `x-relay-path: <path>`, and
+ * the relay replays method/headers/body at that origin. The origin and path
+ * never travel in the URL, so a relay deployed at a bare workers.dev hostname
+ * works unchanged.
+ *
+ * The request body is serialized once by the caller and passed as a string, so
+ * every retry path can replay it.
+ */
+function upstreamFetch(url, init) {
+  if (!UPSTREAM_RELAY_URL) return fetch(url, init);
+  const parsed = new URL(url);
+  const headers = { ...(init.headers || {}) };
+  headers["x-relay-target"] = parsed.origin;
+  headers["x-relay-path"] = parsed.pathname + parsed.search;
+  return fetch(UPSTREAM_RELAY_URL, { ...init, headers });
 }
 
 function isValidV2UserAgent(ua) {
@@ -1110,6 +1136,11 @@ const MAX_SESSIONS = 500;
 const SESSION_TTL_MS = 3 * 3600 * 1000;
 let lastFailedGateRetryTime = 0;
 let lastFailedGateRetryEpoch = -1;
+// Last IP-level abuse block seen from upstream, if any. Kept apart from the
+// retry cooldown because the two have different causes and different advice:
+// the cooldown is a per-IP allowance window, the block is the gateway refusing
+// this network outright.
+let lastIpAbuseAt = 0;
 // The last gate rejection's correlation id and the shape audit that was true
 // when it happened. `x-opencode-log-id` is the only handle upstream gives for
 // a rejected request, so it is recorded rather than discarded — it is what a
@@ -1130,9 +1161,14 @@ let lastUpstreamError = null;
 function auditGateShape(upstreamBody, headers) {
   const tools = Array.isArray(upstreamBody?.tools) ? upstreamBody.tools : [];
   const toolNames = tools.map((t) => t?.function?.name || t?.name).filter(Boolean);
-  const ua = String(headers?.["User-Agent"] || "");
+  // Header names are compared case-insensitively: the audit must not report a
+  // missing anchor just because the same header arrived with different casing.
+  const headerKey = (name) =>
+    Object.keys(headers || {}).find((k) => k.toLowerCase() === name);
+  const hasHeader = (name) => headerKey(name) !== undefined;
+  const ua = String(headers?.[headerKey("user-agent")] || "");
   const sessionHeaders = ["x-opencode-session", "x-session-affinity", "x-session-id"].filter(
-    (h) => headers?.[h]
+    hasHeader
   );
   return {
     hasReadTool: toolNames.includes("read"),
@@ -1143,10 +1179,57 @@ function auditGateShape(upstreamBody, headers) {
   };
 }
 
+function upstreamLogIdOf(upstreamRes) {
+  return typeof upstreamRes?.headers?.get === "function"
+    ? upstreamRes.headers.get("x-opencode-log-id")
+    : null;
+}
+
+/**
+ * Answer an upstream IP-level abuse block.
+ *
+ * Terminal by construction: the block is keyed to the egress network, so the
+ * identity layer is not consulted, no session id is re-minted, and the request
+ * is not replayed — measured (and confirmed by upstream's own issue tracker)
+ * as a network flag that no client shape can clear. The refusal reaches the
+ * client verbatim; `X-OpenCode-Gate: ip-abuse` lets callers and `verify.js`
+ * tell it apart from the shape gate without parsing the message.
+ */
+function respondIpAbuse(res, status, errType, errMsg, logId, model) {
+  lastIpAbuseAt = Date.now();
+  lastGateDiagnostic = {
+    at: lastIpAbuseAt,
+    kind: "ip-abuse",
+    status,
+    logId: logId || null,
+    message: errMsg,
+    model,
+  };
+  console.warn(
+    `[opencode-free-bridge] Upstream IP-abuse block (${status}): ${errMsg} — not refreshing or retrying; the gateway keys this to this network's IP, so no identity change can clear it` +
+      (logId ? ` [x-opencode-log-id: ${logId}]` : "")
+  );
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "X-OpenCode-Gate": "ip-abuse",
+    ...(logId ? { "X-OpenCode-Log-Id": logId } : {}),
+  });
+  return res.end(
+    JSON.stringify({
+      error: {
+        message: errMsg,
+        type: errType || "FreeTierError",
+        code: status,
+      },
+    })
+  );
+}
+
 const origSessionCacheClear = sessionCache.clear.bind(sessionCache);
 sessionCache.clear = () => {
   lastFailedGateRetryTime = 0;
   lastFailedGateRetryEpoch = -1;
+  lastIpAbuseAt = 0;
   lastUpstreamError = null;
   return origSessionCacheClear();
 };
@@ -1318,6 +1401,10 @@ function handleRequest(req, res) {
   if (pathname === "" || pathname === "/" || pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     const idState = identity.getState();
+    const gateThrottled =
+      lastFailedGateRetryTime > 0 &&
+      Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
+      lastFailedGateRetryEpoch === (idState.epoch || 0);
     return res.end(
       JSON.stringify({
         status: "ok",
@@ -1325,6 +1412,10 @@ function handleRequest(req, res) {
         version: VERSION,
         runtime: typeof Bun !== "undefined" ? `bun/${Bun.version}` : `node/${process.versions.node}`,
         discoveredModels: activeModels.length,
+        // Egress mode. `direct` means inference requests go straight to
+        // opencode.ai; `relay` means they are sent through UPSTREAM_RELAY_URL,
+        // so upstream sees that relay's IP instead of this host's.
+        egress: UPSTREAM_RELAY_URL ? { mode: "relay", relay: UPSTREAM_RELAY_URL } : { mode: "direct" },
         identity: {
           userAgent: idState.userAgent,
           updateMode: idState.updateMode,
@@ -1350,18 +1441,14 @@ function handleRequest(req, res) {
           toolNames: idState.toolNames,
           tools: idState.tools,
           gate: {
-            status:
-              lastFailedGateRetryTime > 0 &&
-              Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
-              lastFailedGateRetryEpoch === (idState.epoch || 0)
-                ? "throttled"
-                : "open",
-            throttledUntil:
-              lastFailedGateRetryTime > 0 &&
-              Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
-              lastFailedGateRetryEpoch === (idState.epoch || 0)
-                ? lastFailedGateRetryTime + GATE_RETRY_COOLDOWN_MS
-                : null,
+            status: lastIpAbuseAt > 0 ? "ip-blocked" : gateThrottled ? "throttled" : "open",
+            // The gateway keys an abuse block to the egress network, so there is
+            // no known expiry to advertise. `ipBlockedSince` is the last time
+            // upstream returned that refusal.
+            ipBlockedSince: lastIpAbuseAt || null,
+            throttledUntil: gateThrottled
+              ? lastFailedGateRetryTime + GATE_RETRY_COOLDOWN_MS
+              : null,
             cooldownMs: GATE_RETRY_COOLDOWN_MS,
             // The shape anchors the gate checks. Reported so a deployment can
             // confirm it is sending them without waiting for a 403.
@@ -1537,7 +1624,7 @@ function handleRequest(req, res) {
         let liveEndpoints = resolveEndpoints(targetModel);
         let upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
 
-        let upstreamRes = await fetch(upstreamUrl, {
+        let upstreamRes = await upstreamFetch(upstreamUrl, {
           method: "POST",
           headers: upstreamHeaders,
           body: JSON.stringify(upstreamBody),
@@ -1565,7 +1652,7 @@ function handleRequest(req, res) {
             markProtocolSupport(targetModel, useResponses);
             ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses));
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
-            upstreamRes = await fetch(upstreamUrl, {
+            upstreamRes = await upstreamFetch(upstreamUrl, {
               method: "POST",
               headers: upstreamHeaders,
               body: JSON.stringify(upstreamBody),
@@ -1623,7 +1710,7 @@ function handleRequest(req, res) {
                 `[opencode-free-bridge] Upstream endpoint moved (${upstreamRes.status}): ${staleUrl} → ${derivedUrl}; retrying once`
               );
               upstreamUrl = derivedUrl;
-              upstreamRes = await fetch(upstreamUrl, {
+              upstreamRes = await upstreamFetch(upstreamUrl, {
                 method: "POST",
                 headers: upstreamHeaders,
                 body: JSON.stringify(upstreamBody),
@@ -1655,7 +1742,7 @@ function handleRequest(req, res) {
               (firstLogId ? ` [x-opencode-log-id: ${firstLogId}]` : "") +
               `; retrying once with fresh session`
           );
-          upstreamRes = await fetch(upstreamUrl, {
+          upstreamRes = await upstreamFetch(upstreamUrl, {
             method: "POST",
             headers: retry5xxHeaders,
             body: JSON.stringify(upstreamBody),
@@ -1690,6 +1777,24 @@ function handleRequest(req, res) {
             errJson?.message ||
             errText ||
             `Upstream error ${upstreamRes.status}`;
+
+          // Terminal branch. Upstream names an IP-level abuse block in the
+          // message, and that is a different failure from the shape gate: the
+          // gateway has flagged this network, so refreshing the recipe, minting
+          // a new session id, or replaying the request cannot change the
+          // answer. Measured against the gateway's own reports: the official
+          // CLI gets the same refusal from the same IP. Return it verbatim and
+          // leave the identity layer untouched.
+          if (identity.isIpAbuseRejection(upstreamRes.status, rawMsg)) {
+            return respondIpAbuse(
+              res,
+              upstreamRes.status,
+              errType,
+              rawMsg,
+              upstreamLogIdOf(upstreamRes),
+              targetModel
+            );
+          }
 
           if (!isFreeTierCliGateError(upstreamRes.status, errType, rawMsg)) {
             const upstreamLogId =
@@ -1779,7 +1884,7 @@ function handleRequest(req, res) {
             liveEndpoints = resolveEndpoints(targetModel);
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
             retryHeaders = buildUpstreamHeaders(req, retrySessionId);
-            upstreamRes = await fetch(upstreamUrl, {
+            upstreamRes = await upstreamFetch(upstreamUrl, {
               method: "POST",
               headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
@@ -1835,7 +1940,25 @@ function handleRequest(req, res) {
             // floor handshake followed by a 429 capacity answer is common), and
             // logging the old status misattributes the final verdict.
             const retryStatus = upstreamRes.status;
-            const retryFreeTierMsg = /freetiererror|free tier|only available in opencode/i.test(retryMsg);
+            // The retry can reveal the block even when the first attempt still
+            // carried the shape message (upstream mixes the two while a flag is
+            // being applied). That is still terminal: answer it verbatim and do
+            // not run the shape audit or append an update hint.
+            if (identity.isIpAbuseRejection(retryStatus, retryMsg)) {
+              if (!skipCooldownRetry) {
+                lastFailedGateRetryTime = Date.now();
+                lastFailedGateRetryEpoch = identity.getState().epoch || 0;
+              }
+              return respondIpAbuse(
+                res,
+                retryStatus,
+                retryType,
+                retryMsg,
+                upstreamLogIdOf(upstreamRes),
+                targetModel
+              );
+            }
+            const retryFreeTierMsg = /freetiererror|free tier|free models|only available in opencode/i.test(retryMsg);
             const onNode = typeof Bun === "undefined";
             // A 429 means transport and shape both passed and only capacity is
             // exhausted. Calling that a gate rejection would send the user to
@@ -1863,12 +1986,10 @@ function handleRequest(req, res) {
             // Correlation id for this rejection. Upstream returns it on every
             // response, accepted or refused; it is the only handle a support
             // request or a bug report can quote.
-            const upstreamLogId =
-              typeof upstreamRes.headers?.get === "function"
-                ? upstreamRes.headers.get("x-opencode-log-id")
-                : null;
+            const upstreamLogId = upstreamLogIdOf(upstreamRes);
             lastGateDiagnostic = {
               at: Date.now(),
+              kind: "free-tier-gate",
               status: retryStatus,
               logId: upstreamLogId,
               shape,
@@ -1887,7 +2008,11 @@ function handleRequest(req, res) {
                     : `this bridge produced a shape the gate refuses — missing ${missing.join(", ")}. That is a bridge bug, not an IP allowance: the same 403 is returned for both, which is why it is audited here`
                 : `no further identity change to apply; ${UPDATE_HINT}`;
             console.warn(
-              `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${retryStatus}${
+              `[opencode-free-bridge] Upstream CLI gate rejected ${
+                skipCooldownRetry
+                  ? "the request (no retry: cooldown active)"
+                  : "the retry with the refreshed identity"
+              } (${retryStatus}${
                 retryStatus !== gateStatus ? `, first attempt ${gateStatus}` : ""
               }): ${retryMsg} — ${verdictText}` +
                 (upstreamLogId ? ` [x-opencode-log-id: ${upstreamLogId}]` : "")
@@ -1916,6 +2041,7 @@ function handleRequest(req, res) {
         }
 
         lastFailedGateRetryTime = 0;
+        lastIpAbuseAt = 0;
         const completionId = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
         const created = Math.floor(Date.now() / 1000);
         reader = upstreamRes.body.getReader();
