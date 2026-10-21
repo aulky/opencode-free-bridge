@@ -28,8 +28,9 @@ in the history of this repository as the base of the merge.
   in-place self-update is reverted by the next `docker compose build`. Upgrade
   with `docker compose build --pull && docker compose up -d`.
 - **`.dockerignore`.** Keeps `.git`, `.github`, and `test/` out of the build
-  context. A `.git` directory inside the image changes how `x-opencode-project`
-  is derived and defeats the self-updater's `git-checkout` guard.
+  context. A `.git` directory inside the image defeats the self-updater's
+  `git-checkout` guard, and it is not something a published image should
+  carry.
 - **Hardened runtime:** `cap_drop: [ALL]` next to `no-new-privileges`, and a
   `HEALTHCHECK` in the Dockerfile so a plain `docker run` is health-checked too.
 - **Docs:** README gains a Docker install section, AGENTS.md a container
@@ -39,6 +40,19 @@ The container files ship in the repository, not in the npm tarball: they are
 build inputs for a checkout, not runtime files a host install needs, so they
 stay out of `package.json` `files` (which the self-updater and `install.sh`
 both have to deliver).
+
+### A note on the contributor graph
+
+GitHub's contributor graph for this repository also lists
+[@MBMoulidharan](https://github.com/MBMoulidharan) with one commit. That is
+the same person as [@rustam76](https://github.com/rustam76) — two accounts
+registered ninety minutes apart on 2019-04-12, with user IDs
+`49561459` and `49564359` (the digits transposed). All three commits of PR #1
+are attributed to `rustam76` by GitHub itself
+(`gh api repos/azrinaldi/opencode-free-bridge/commits/3b857a23` reports
+`author.login: rustam76`); the extra graph entry is GitHub's own heuristic
+mis-mapping the `noreply` email prefix `49564359` onto the neighbouring
+account id. No commit in this repository is authored by `MBMoulidharan`.
 
 ---
 

@@ -193,7 +193,7 @@ When a user reports an error, diagnose it using this decision table before chang
 | `install.sh` | Cross-platform installer and `node` -> `bun` service unit migrator for Linux (`systemd`) and macOS (`launchd`). |
 | `Dockerfile` | Container image for the bridge: pinned `oven/bun:1.4.3-slim` base (the Bun version is pinned because the free-tier gate checks the TLS ClientHello), non-root `bun` user, writable `/app` so the in-place self-updater can stage its temp files, and `OPENCODE_CACHE_DIR=/data/cache` for the catalog cache. |
 | `docker-compose.yaml` | Single-service container deployment: restart policy, loopback-only port publish (`127.0.0.1:20129:20129` — the bridge has no auth), persistent `bridge-cache` volume, `no-new-privileges` + `cap_drop: [ALL]`, health check, and `AUTO_UPDATE=0` (the image is the unit of deployment). |
-| `.dockerignore` | Keeps `.git`, `.github`, and `test/` out of the build context: a `.git` directory inside the image changes how `x-opencode-project` is derived and defeats the self-updater's `git-checkout` guard. |
+| `.dockerignore` | Keeps `.git`, `.github`, and `test/` out of the build context: a `.git` directory inside the image defeats the self-updater's `git-checkout` guard, and a published image should not carry one. |
 
 ### Mandatory verification before committing changes
 
