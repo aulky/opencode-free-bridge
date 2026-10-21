@@ -50,6 +50,22 @@ export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
 bun server.js
 ```
 
+### Option C: Container deployment (Docker / Docker Compose)
+
+```bash
+docker compose up -d          # builds the image and starts the bridge
+docker compose build --pull && docker compose up -d   # upgrade
+```
+
+The compose file publishes `127.0.0.1:20129` on loopback only, persists the
+catalog cache in the `bridge-cache` volume, and runs the image as the non-root
+`bun` user. The base image is pinned to `oven/bun:1.4.3-slim` because the
+free-tier gate checks the TLS ClientHello — verify it inside the image with
+`docker compose exec bridge bun transport-fingerprint.js --check`.
+
+`AUTO_UPDATE` is `0` in the compose file: the image is the unit of deployment,
+so an in-place self-update would be reverted by the next build.
+
 ### Verify the server is healthy
 
 ```bash
@@ -175,6 +191,9 @@ When a user reports an error, diagnose it using this decision table before chang
 | `gate-drill.js` | End-to-end self-healing drill suite (4 live drills + 6 deterministic offline drills including `full-corrupt`). |
 | `verify.js` | Live model readiness checker (`bun verify.js` / `bun verify.js --quick`); sends `stream: true` and halts immediately on `gate-closed` (`403` with `X-OpenCode-Gate: ip-throttled` or `ip-abuse`, or the free-tier/abuse message) to avoid extending IP cooldowns. |
 | `install.sh` | Cross-platform installer and `node` -> `bun` service unit migrator for Linux (`systemd`) and macOS (`launchd`). |
+| `Dockerfile` | Container image for the bridge: pinned `oven/bun:1.4.3-slim` base (the Bun version is pinned because the free-tier gate checks the TLS ClientHello), non-root `bun` user, writable `/app` so the in-place self-updater can stage its temp files, and `OPENCODE_CACHE_DIR=/data/cache` for the catalog cache. |
+| `docker-compose.yaml` | Single-service container deployment: restart policy, loopback-only port publish (`127.0.0.1:20129:20129` — the bridge has no auth), persistent `bridge-cache` volume, `no-new-privileges` + `cap_drop: [ALL]`, health check, and `AUTO_UPDATE=0` (the image is the unit of deployment). |
+| `.dockerignore` | Keeps `.git`, `.github`, and `test/` out of the build context: a `.git` directory inside the image changes how `x-opencode-project` is derived and defeats the self-updater's `git-checkout` guard. |
 
 ### Mandatory verification before committing changes
 

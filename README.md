@@ -21,6 +21,7 @@ It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible
 - **Reasoning-aware token budgeting:** Applies an additive token floor (`max(requested, 1024) + 4096`) for reasoning models (determined from catalog `reasoning: true` metadata) so short prompts do not return empty content with `finish_reason: "length"`.
 - **Reasoning stream normalization:** Emits thinking tokens under `reasoning_content` for both streaming SSE and non-streaming JSON responses, and forwards client tool calls with automatic name de-collision (`read` -> `read_client` upstream, restored to `read` on return).
 - **Zero dependencies:** Uses only built-in runtime modules (`http`, `crypto`, `fs`, `path`, `net`, `tls`). No `npm install` step.
+- **Container deployment:** Ships a `Dockerfile` and `docker-compose.yaml` (contributed in PR #1 by @rustam76, completed in v2.1.0). The image pins `oven/bun:1.4.3-slim` — the Bun version is pinned because the free-tier gate inspects the TLS `ClientHello` — runs as the non-root `bun` user, and publishes the port on loopback only.
 
 ## Requirements: Bun >= 1.0
 
@@ -95,6 +96,56 @@ bun server.js
 ```
 
 The server listens on `http://127.0.0.1:20129` by default.
+
+### Docker
+
+The repository ships a `Dockerfile` and a `docker-compose.yaml` for container
+deployments (single host, no orchestrator needed):
+
+```bash
+git clone https://github.com/azrinaldi/opencode-free-bridge.git
+cd opencode-free-bridge
+docker compose up -d
+```
+
+The bridge is then reachable at `http://127.0.0.1:20129/v1` (API key `public`),
+exactly like a native install, and the model catalog cache survives restarts in
+the `bridge-cache` volume.
+
+What the container setup does:
+
+- Runs on `oven/bun:1.4.3-slim` as the non-root `bun` user. The Bun version is
+  pinned because the free-tier gate inspects the TLS ClientHello: the image
+  must produce the same fingerprint as the OpenCode CLI, which
+  `transport-baseline.json` records.
+- Publishes the port on **loopback only**. The bridge has no authentication
+  (the API key is literally `public`), so publishing on `0.0.0.0` would expose
+  an open relay to the whole network. For remote access, put a reverse proxy
+  or an SSH tunnel in front of it.
+- Persists the on-disk catalog cache in the `bridge-cache` volume
+  (`OPENCODE_CACHE_DIR=/data/cache`), so a restart does not re-fetch the
+  upstream model catalog.
+- Runs with `no-new-privileges` and all Linux capabilities dropped.
+
+The image is the unit of deployment, so `AUTO_UPDATE` defaults to `0` in the
+compose file: an in-place self-update is reverted by the next
+`docker compose build`. Upgrade with:
+
+```bash
+docker compose build --pull && docker compose up -d
+```
+
+Plain `docker run` works too — set `HOST=0.0.0.0` and publish the port
+yourself:
+
+```bash
+docker build -t opencode-free-bridge .
+docker run -d --name opencode-free-bridge \
+  -p 127.0.0.1:20129:20129 \
+  -e OPENCODE_CACHE_DIR=/data/cache \
+  -v opencode-free-bridge-cache:/data/cache \
+  opencode-free-bridge
+```
 
 ## Usage & Client Setup
 

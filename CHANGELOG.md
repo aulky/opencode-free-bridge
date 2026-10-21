@@ -1,5 +1,47 @@
 # Changelog
 
+## [2.1.0] — 2026-10-21
+
+### Container deployment
+
+The bridge can now run in a container. `Dockerfile` and `docker-compose.yaml`
+were contributed in PR #1 by [@rustam76](https://github.com/rustam76); this
+release completes them so the container is actually usable. Their commits stay
+in the history of this repository as the base of the merge.
+
+- **Pinned base image (`oven/bun:1.4.3-slim`).** The free-tier gate inspects
+  the TLS ClientHello, so the Bun version in the image is not interchangeable
+  with any other. The pinned tag is the version the fingerprint baseline was
+  measured on, and `bun transport-fingerprint.js --check` passes inside the
+  image.
+- **Writable `/app` (`chown -R bun:bun /data /app`).** `COPY --chown` chowns
+  the copied files but not the directory that holds them, so `/app` stayed
+  root-owned while the process ran as `bun`. The self-updater stages its temp
+  files next to their targets inside `__dirname`, so every in-place update
+  died with `EACCES: permission denied`.
+- **Loopback-only port publish.** The compose file only had `expose:`, which
+  publishes inside the compose network, so the documented base URL
+  (`http://127.0.0.1:20129/v1`) was unreachable from the host. It now publishes
+  `127.0.0.1:20129:20129` — loopback on purpose, because the bridge has no
+  authentication and a `0.0.0.0` publish would be an open relay.
+- **`AUTO_UPDATE=0` by default.** The image is the unit of deployment, so an
+  in-place self-update is reverted by the next `docker compose build`. Upgrade
+  with `docker compose build --pull && docker compose up -d`.
+- **`.dockerignore`.** Keeps `.git`, `.github`, and `test/` out of the build
+  context. A `.git` directory inside the image changes how `x-opencode-project`
+  is derived and defeats the self-updater's `git-checkout` guard.
+- **Hardened runtime:** `cap_drop: [ALL]` next to `no-new-privileges`, and a
+  `HEALTHCHECK` in the Dockerfile so a plain `docker run` is health-checked too.
+- **Docs:** README gains a Docker install section, AGENTS.md a container
+  install option and rows for the new files.
+
+The container files ship in the repository, not in the npm tarball: they are
+build inputs for a checkout, not runtime files a host install needs, so they
+stay out of `package.json` `files` (which the self-updater and `install.sh`
+both have to deliver).
+
+---
+
 ## [2.0.3] — 2026-10-20
 
 ### IP-level abuse blocks are terminal, not a stale identity
