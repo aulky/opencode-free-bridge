@@ -43,16 +43,19 @@ both have to deliver).
 
 ### A note on the contributor graph
 
-GitHub's contributor graph for this repository also lists
-[@MBMoulidharan](https://github.com/MBMoulidharan) with one commit. That is
-the same person as [@rustam76](https://github.com/rustam76) — two accounts
-registered ninety minutes apart on 2019-04-12, with user IDs
-`49561459` and `49564359` (the digits transposed). All three commits of PR #1
-are attributed to `rustam76` by GitHub itself
-(`gh api repos/azrinaldi/opencode-free-bridge/commits/3b857a23` reports
-`author.login: rustam76`); the extra graph entry is GitHub's own heuristic
-mis-mapping the `noreply` email prefix `49564359` onto the neighbouring
-account id. No commit in this repository is authored by `MBMoulidharan`.
+[@MBMoulidharan](https://github.com/MBMoulidharan) is the same person as
+[@rustam76](https://github.com/rustam76) — two accounts registered ninety
+minutes apart on 2019-04-12, with user IDs `49561459` and `49564359` (the
+digits transposed). Only `rustam76` authored anything here: all three commits
+of PR #1 are attributed to `rustam76` by GitHub itself.
+
+A `Co-Authored-By` trailer on the merge and the follow-up commit briefly
+carried `49561459+rustam76@users.noreply.github.com` — a transposed typo —
+and GitHub maps the numeric prefix of a `noreply` address to the account with
+that id, so the credit landed on `MBMoulidharan` and produced a second entry
+in the contributor graph. The trailer is corrected in the current history.
+Forks taken before the correction still carry the old commits, so their graphs
+show the same extra entry until they re-sync.
 
 ---
 
