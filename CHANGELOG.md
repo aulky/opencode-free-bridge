@@ -59,6 +59,47 @@ show the same extra entry until they re-sync.
 
 ---
 
+## [2.2.0] — 2026-10-21
+
+### Egress proxy, configured from the browser
+
+`http://127.0.0.1:20129/` now serves a panel instead of the health document, and
+the panel sets an HTTP proxy for **every** outbound request the bridge makes:
+inference, model discovery, identity/update sync, and the self-updater. Upstream
+sees the proxy's IP, not this machine's.
+
+- **`proxy.js`:** validates `http://`/`https://` URLs (percent-encoded
+  credentials supported), refuses SOCKS with Bun's own reason
+  (`UnsupportedProxyProtocol`), persists to `~/.opencode-free-bridge/proxy.json`
+  at mode `0600`, and exposes `netFetch()` — one egress point used by `server.js`
+  and `identity.js`. `UPSTREAM_PROXY_URL` is an operator override that also locks
+  runtime edits.
+- **`panel.js`:** HTML panel plus `/api/proxy` (GET status, POST set/clear) and
+  `/api/proxy/test` (probe). Status, `/api/proxy`, and `/health` expose `host:port`
+  only; credentials never leave the process.
+- **Test before trusting it:** the probe fetches the models endpoint through the
+  candidate and reports the exit IP from `cdn-cgi/trace`, so a working tunnel with
+  a refused egress (403) is distinguishable from a broken proxy.
+- **No restart:** the URL is read per request.
+- **`/health`:** `egress.mode` is now what actually carries traffic (`proxy`,
+  `relay`, `direct`), with `egress.proxy` describing the proxy state.
+  `verify.js` prints the egress line before probing.
+- **Relay interaction:** with both configured, the request still targets
+  `UPSTREAM_RELAY_URL` and that connection is dialled through the proxy.
+- **Delivery:** `proxy.js` and `panel.js` added to `package.json` `files`,
+  `UPDATE_FILES`, and `install.sh` (fetch, syntax check, install, backup), so the
+  self-updater cannot leave an install missing the modules `server.js` requires.
+
+### `install.sh` installs the checkout it runs from
+
+`bash install.sh` inside a clone always downloaded from GitHub, so a file added
+in the working tree but not yet pushed failed the install with a bare
+`curl: (22) The requested URL returned error: 404` that named neither the file
+nor the cause. `SOURCE=auto` now installs the local working tree when the script
+runs from a checkout, the remote path names the file it could not fetch and
+points at `SOURCE=local` as the way out, and `SOURCE=remote` restores the old
+behaviour. The `curl | bash` route is unchanged.
+
 ## [2.0.3] — 2026-10-20
 
 ### IP-level abuse blocks are terminal, not a stale identity

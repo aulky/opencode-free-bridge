@@ -302,6 +302,22 @@ test("every shipped file reaches installed hosts through both delivery paths", (
   }
 });
 
+test("installer installs the local checkout instead of 404ing on unpushed files", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // Running install.sh from a clone means installing that working tree. It used
+  // to always download from GitHub, so a file that existed only locally failed
+  // with a bare `curl: (22) ... 404` after the release list gained proxy.js.
+  assert.match(src, /SOURCE="\$\{SOURCE:-auto\}"/);
+  assert.match(src, /cp -p "\$SRC_DIR\/\$file"/, "local source must copy the checkout file");
+  assert.match(src, /Source: local checkout/, "the installer must say where files came from");
+  // The remote path must name the file it failed on and the way out.
+  assert.match(src, /could not download \$file from \$RAW/);
+  assert.match(src, /SOURCE=local/);
+  // And the health probe must still run after either path.
+  assert.match(src, /probe_health/);
+});
+
 test("verify.js checks runtime and TLS baseline before blaming the IP for a closed gate", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "verify.js"), "utf8");
   assert.match(src, /health\.runtime\.startsWith\("node\/"\)/);

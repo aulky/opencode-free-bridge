@@ -607,7 +607,9 @@ async function drillEndpointMove({ identity }) {
  *
  * The probe is a direct request, not one through the bridge, shaped the way the
  * real CLI shapes it (`max_completion_tokens`, `store: false`, full tool set).
- * 200 or 429 means the gate is open (429 is capacity, not refusal).
+ * 200 or 429 means the gate is open (429 is capacity, not refusal). It honours
+ * the configured egress proxy, so its verdict describes the IP upstream would
+ * actually see.
  */
 async function probeUpstream(identity) {
   const { buildUpstreamPayload, buildUpstreamHeaders, resolveEndpoints } = require("./server");
@@ -634,7 +636,7 @@ async function probeUpstream(identity) {
   }
 
   try {
-    const res = await fetch(resolveEndpoints(model).chatUrl, {
+    const res = await require("./proxy").netFetch(resolveEndpoints(model).chatUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(body),

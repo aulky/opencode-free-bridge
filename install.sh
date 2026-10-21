@@ -26,6 +26,7 @@
 #   BINDIR     where the files go     (default ~/.opencode-free-bridge)
 #   NO_SERVICE skip service install   (default: install the service)
 #   REPO       source repo            (default azrinaldi/opencode-free-bridge)
+#   SOURCE     auto | local | remote (default auto: local when run from a clone)
 set -euo pipefail
 
 PORT="${PORT:-20129}"
@@ -33,6 +34,14 @@ HOST="${HOST:-127.0.0.1}"
 BINDIR="${BINDIR:-$HOME/.opencode-free-bridge}"
 REPO="${REPO:-azrinaldi/opencode-free-bridge}"
 BRANCH="${BRANCH:-main}"
+# Directory of this script when it exists on disk. The `curl | bash` route has no
+# file at all, so the local path is only taken when BASH_SOURCE names a real
+# install.sh; otherwise `SOURCE=auto` falls through to the remote download.
+SOURCE_PATH="${BASH_SOURCE[0]:-}"
+SCRIPT_DIR=""
+if [ -n "$SOURCE_PATH" ] && [ -f "$SOURCE_PATH" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
+fi
 
 say()  { printf '\033[1;32m[opencode-free-bridge]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[opencode-free-bridge]\033[0m %s\n' "$*" >&2; }
@@ -151,7 +160,7 @@ if [ -n "$PREV_VERSION" ]; then
   say "Found existing install: v$PREV_VERSION in $BINDIR"
   BACKUP="$BINDIR/.backup-v$PREV_VERSION-$(date +%Y%m%d%H%M%S)"
   mkdir -p "$BACKUP"
-  for f in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json package.json tunnel-doctor.sh; do
+  for f in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json package.json tunnel-doctor.sh proxy.js panel.js; do
     [ -f "$BINDIR/$f" ] && cp -p "$BINDIR/$f" "$BACKUP/$f" 2>/dev/null || true
   done
   say "Backed up to $BACKUP"
@@ -322,11 +331,35 @@ retire_legacy_service() {
 }
 
 # ------------------------------------------------------------------ fetch ---
-# Everything is downloaded and syntax-checked in a staging directory *before*
-# the running bridge is touched. A network failure halfway through an upgrade
-# therefore leaves the old bridge serving traffic instead of leaving the user
-# with a stopped service and a half-written install.
+# Everything is staged and syntax-checked *before* the running bridge is
+# touched. A network failure halfway through an upgrade therefore leaves the old
+# bridge serving traffic instead of leaving the user with a stopped service and
+# a half-written install.
+#
+# Source selection: a clone of this repo installs its own working tree. That is
+# what `bash install.sh` inside a checkout means, and it is the only way to
+# install a commit that has not been pushed yet (the curl route fetched from
+# GitHub and 404'd on files that existed only locally). Set SOURCE=remote to
+# force the download path from inside a clone.
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+SOURCE="${SOURCE:-auto}"
+SRC_DIR=""
+if [ "$SOURCE" = "auto" ]; then
+  if [ -f "$SCRIPT_DIR/server.js" ] && [ -f "$SCRIPT_DIR/package.json" ]; then
+    SOURCE="local"
+  else
+    SOURCE="remote"
+  fi
+fi
+if [ "$SOURCE" = "local" ]; then
+  SRC_DIR="$SCRIPT_DIR"
+  say "Source: local checkout ($SRC_DIR)"
+elif [ "$SOURCE" = "remote" ]; then
+  say "Source: ${RAW}"
+else
+  die "Invalid SOURCE: $SOURCE (expected auto, local, or remote)"
+fi
+
 mkdir -p "$BINDIR"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ofb-stage.XXXXXX")"
 cleanup_stage() { rm -rf "$STAGE" 2>/dev/null || true; }
@@ -336,20 +369,30 @@ say "Installing into $BINDIR"
 fetch() {
   local file="$1"
   local tmp="$STAGE/$file"
+  if [ "$SOURCE" = "local" ]; then
+    [ -f "$SRC_DIR/$file" ] || die "$file is missing from the local checkout ($SRC_DIR)"
+    cp -p "$SRC_DIR/$file" "$tmp"
+    return 0
+  fi
   # raw.githubusercontent.com sits behind a CDN that can serve the previous
   # commit for a while after a push. A stale install.sh is harmless (it already
   # ran) but a stale server.js next to a fresh identity.js is not. The query
   # string is ignored by the server and defeats the cache.
   local url="$RAW/$file?cb=$(date +%s)"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 -H 'Cache-Control: no-cache' -o "$tmp" "$url"
+    # A bare `curl: (22)` names neither the file nor the reason. Say which one,
+    # because the usual cause is a release that lists a file it never pushed.
+    curl -fsSL --retry 3 -H 'Cache-Control: no-cache' -o "$tmp" "$url" \
+      || die "could not download $file from $RAW (HTTP error above). The release may be missing this file; retry with SOURCE=local from a checkout."
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp" "$url"
+    wget -qO "$tmp" "$url" \
+      || die "could not download $file from $RAW. The release may be missing this file; retry with SOURCE=local from a checkout."
   else
     die "neither curl nor wget is available"
   fi
   [ -s "$tmp" ] || die "downloaded $file is empty"
 }
+
 
 fetch package.json
 fetch server.js
@@ -360,6 +403,8 @@ fetch gate-drill.js
 fetch transport-fingerprint.js
 fetch transport-baseline.json
 fetch tunnel-doctor.sh
+fetch proxy.js
+fetch panel.js
 
 # A syntactically broken release must never replace a working install.
 #
@@ -375,7 +420,7 @@ syntax_check() {
   ' "$1"
 }
 
-for js in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js; do
+for js in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js proxy.js panel.js; do
   syntax_check "$STAGE/$js" >/dev/null 2>&1 || die "$js failed a syntax check; the running bridge was left untouched"
 done
 for json in package.json transport-baseline.json; do
@@ -406,7 +451,7 @@ if [ -n "$(port_holder)" ]; then
   die "cannot bind port $PORT"
 fi
 
-for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json tunnel-doctor.sh; do
+for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json tunnel-doctor.sh proxy.js panel.js; do
   [ -f "$STAGE/$file" ] && mv -f "$STAGE/$file" "$BINDIR/$file"
 done
 chmod +x "$BINDIR/server.js" "$BINDIR/identity.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" "$BINDIR/transport-fingerprint.js" "$BINDIR/tunnel-doctor.sh" 2>/dev/null || true

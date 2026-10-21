@@ -30,11 +30,15 @@ Run the installer script. It finds or installs `bun` (installing `unzip` first o
 curl -fsSL https://raw.githubusercontent.com/azrinaldi/opencode-free-bridge/main/install.sh | bash
 ```
 
-If you are already inside a local clone of this repository, you can also run:
+If you are already inside a local clone of this repository, run:
 
 ```bash
 bash install.sh
 ```
+
+That installs the **working tree**, not GitHub, so an unpushed commit can be
+installed and tested. `SOURCE=remote bash install.sh` forces the download path;
+`SOURCE=local` refuses to fall back to it.
 
 Custom port or install directory:
 
@@ -97,6 +101,22 @@ Use these connection details in any OpenAI-compatible tool:
 - **API Key:** `public` (or any non-empty string)
 - **Chat Completions Endpoint:** `POST http://127.0.0.1:20129/v1/chat/completions`
 - **Models Endpoint:** `GET http://127.0.0.1:20129/v1/models`
+
+### Egress proxy (panel)
+
+`GET http://127.0.0.1:20129/` serves an HTML panel: enter `http://[user:pass@]host:port`, press
+*Simpan dan pakai*, and every outbound request (inference, model discovery, identity sync,
+self-update) is tunnelled through that proxy. *Uji koneksi* probes the models endpoint through the
+candidate and reports the exit IP; *Matikan proxy* returns to direct egress. No restart needed.
+
+- HTTP/HTTPS only. SOCKS5 is refused (Bun: `UnsupportedProxyProtocol`). TLS still comes from Bun,
+  so `transport-baseline.json` stays valid.
+- Credentials persist in `~/.opencode-free-bridge/proxy.json` (mode `0600`) and are never returned
+  by the panel, `/api/proxy`, or `/health`.
+- API: `GET /api/proxy` (status), `POST /api/proxy` `{"url":"…"}` (set; `""` clears),
+  `POST /api/proxy/test` `{"url":"…"}` (probe). Operator override: `UPSTREAM_PROXY_URL`, which
+  locks the panel.
+- `/health` → `egress.mode` (`proxy` / `relay` / `direct`) and `egress.proxy` (host:port only).
 
 ### Current active free models (also supports family shorthands)
 
@@ -177,6 +197,9 @@ When a user reports an error, diagnose it using this decision table before chang
 | `HTTP 404 Model '<id>' has been retired upstream` | Client requested a deprecated model (e.g. `cat-jam-free`, `muse-spark-*`, `step-5-preview-free`) | Fetch `GET /v1/models` and update the client configuration to use an active model ID. |
 | `HTTP 404 Model '<id>' is not on the free tier` | Client requested a paid model (e.g. `gpt-5.4`, `claude-sonnet-4-5`) | The bridge only serves zero-cost models (`cost.input === 0`). Pick a model from `GET /v1/models`. |
 | Port conflict (`port 20129 is occupied by another process`) during `install.sh` | Another non-bridge process is listening on port 20129 | Stop the conflicting process or install on another port (`PORT=20130 bash install.sh`). Legacy `opencode-bridge.service` and the bridge's own process are retired/replaced automatically. |
+| Proxy set in the panel, but `/health` still shows `egress.mode: "direct"` | The setting is read per request; a locked panel (`locked: true`) means `UPSTREAM_PROXY_URL` in the environment owns it | Read `egress.proxy.source` (`file` / `env` / `none`) and `egress.proxy.error`. To change an env-locked proxy, edit the service unit and restart. |
+| *Uji koneksi* reports `403` from the proxy | The proxy tunnel works but upstream refuses that egress IP | Pick a different proxy; the IP is refused, not the request shape. Run `bun verify.js --quick` after switching to confirm. |
+| Panel rejects `socks5://…` | Bun fetch supports HTTP/HTTPS proxies only and throws `UnsupportedProxyProtocol` for SOCKS | Use `http://host:port` (Clash/v2ray expose a mixed HTTP port), or terminate SOCKS in a local HTTP proxy. |
 
 ---
 
@@ -184,9 +207,11 @@ When a user reports an error, diagnose it using this decision table before chang
 
 | File | Responsibility |
 |---|---|
-| `server.js` | HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`), Bun runtime guard, configurable DNS result order (`DNS_RESULT_ORDER`), session affinity cache, client tool aliasing (`read` -> `read_client`), SSE stream normalization (`reasoning_content`, `usage`, `finish_reason`), 403/426/404 reactive retry loop with 30s IP-cooldown retry suppression (`GATE_RETRY_COOLDOWN_MS`), terminal IP-abuse branch (`X-OpenCode-Gate: ip-abuse`, no refresh/retry), optional `UPSTREAM_RELAY_URL` egress relay (`x-relay-target` / `x-relay-path`), and 6-hour self-updater (`checkAndApplyUpdate`). |
+| `server.js` | HTTP server (panel at `/`, `/v1/chat/completions`, `/v1/models`, `/health`, `/api/proxy`), Bun runtime guard, configurable DNS result order (`DNS_RESULT_ORDER`), session affinity cache, client tool aliasing (`read` -> `read_client`), SSE stream normalization (`reasoning_content`, `usage`, `finish_reason`), 403/426/404 reactive retry loop with 30s IP-cooldown retry suppression (`GATE_RETRY_COOLDOWN_MS`), terminal IP-abuse branch (`X-OpenCode-Gate: ip-abuse`, no refresh/retry), egress proxy (`proxy.netFetch` on inference, discovery, and self-update) plus the optional `UPSTREAM_RELAY_URL` relay (`x-relay-target` / `x-relay-path`), and 6-hour self-updater (`checkAndApplyUpdate`). |
 | `identity.js` | Adaptive OpenCode CLI synchronization: release handshake (`opencode.ai/update/api`), GitHub source fetcher (`identifier.ts`, `session-id.ts`, `app.ts`, `model-request.ts`, `tool/plugin/*.ts`, `codemode/tool.ts`), Effect Schema AST parser (`extractToolFromSource`), provider catalog parser & disk cache (`~/.opencode-free-bridge/cache/catalog.json`), 30s forced-refresh cooldown (`GATE_REFRESH_COOLDOWN_MS`), terminal `isIpAbuseRejection` guard, and pooled CSPRNG session ID generator (`createSessionId`). |
 | `token-budget.js` | Additive token budget calculation (`max(requested, 1024) + 4096` for reasoning models, `max(requested, 512)` for standard models), driven by catalog `modelFacts`. |
+| `proxy.js` | Egress proxy: URL validation (HTTP/HTTPS only, percent-encoded credentials), persistence in `<state dir>/proxy.json` (mode `0600`), `UPSTREAM_PROXY_URL` override with panel lock, `withProxy`/`netFetch` used by every outbound call in `server.js` and `identity.js`, and `testProxy` (upstream probe + `cdn-cgi/trace` exit IP). |
+| `panel.js` | The HTML panel served at `/`: same-origin form that reads and writes `/api/proxy`, shows live status without credentials, and escapes every config value. |
 | `transport-fingerprint.js` | Captures the runtime's raw TLS `ClientHello` bytes against a local TCP listener and compares cipher suites and extension order against `transport-baseline.json`. |
 | `gate-drill.js` | End-to-end self-healing drill suite (4 live drills + 6 deterministic offline drills including `full-corrupt`). |
 | `verify.js` | Live model readiness checker (`bun verify.js` / `bun verify.js --quick`); sends `stream: true` and halts immediately on `gate-closed` (`403` with `X-OpenCode-Gate: ip-throttled` or `ip-abuse`, or the free-tier/abuse message) to avoid extending IP cooldowns. |

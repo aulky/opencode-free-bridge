@@ -27,6 +27,11 @@
  */
 
 const crypto = require("crypto");
+// Identity sync is egress too: the update handshake, GitHub source reads, and
+// the provider catalog all travel through the same proxy the panel configures.
+// `proxy.netFetch` is a thin wrapper over `fetch`, so tests that replace
+// `global.fetch` keep intercepting every call.
+const proxy = require("./proxy");
 
 const UPDATE_API_BASE =
   process.env.OPENCODE_UPDATE_API_BASE || "https://opencode.ai/update/api";
@@ -369,7 +374,7 @@ function sourceRef(release) {
 }
 
 async function fetchJson(url, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
-  const res = await fetch(url, {
+  const res = await proxy.netFetch(url, {
     signal: AbortSignal.timeout(timeoutMs),
     headers: { accept: "application/json" },
   });
@@ -378,7 +383,7 @@ async function fetchJson(url, timeoutMs = HANDSHAKE_TIMEOUT_MS) {
 }
 
 async function fetchText(url, timeoutMs = SOURCE_TIMEOUT_MS) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  const res = await proxy.netFetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.text();
 }
@@ -394,7 +399,7 @@ async function fetchText(url, timeoutMs = SOURCE_TIMEOUT_MS) {
  */
 async function listSourceDir(dir, ref, timeoutMs = SOURCE_TIMEOUT_MS) {
   try {
-    const res = await fetch(
+    const res = await proxy.netFetch(
       `${GITHUB_API}/repos/${REPO}/contents/${dir}?ref=${encodeURIComponent(ref)}`,
       { signal: AbortSignal.timeout(timeoutMs), headers: { accept: "application/vnd.github+json" } }
     );

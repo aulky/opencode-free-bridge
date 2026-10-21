@@ -8,6 +8,10 @@ try {
   VERSION = require("./package.json").version || VERSION;
 } catch {}
 const { effectiveMaxTokens } = require("./token-budget");
+// Egress proxy and the panel that configures it. Loaded before anything else
+// touches the network so the first request already honours a saved proxy.
+const proxy = require("./proxy");
+const { renderPanel } = require("./panel");
 
 const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -70,6 +74,8 @@ const UPDATE_FILES = [
   "transport-fingerprint.js",
   "transport-baseline.json",
   "tunnel-doctor.sh",
+  "proxy.js",
+  "panel.js",
   "server.js",
 ];
 let updateInFlight = null;
@@ -120,7 +126,7 @@ async function checkAndApplyUpdate() {
     const tmpFiles = [];
     const cb = Date.now();
     try {
-      const pkgRes = await fetch(`${UPDATE_BASE_URL}/package.json?cb=${cb}`, {
+      const pkgRes = await proxy.netFetch(`${UPDATE_BASE_URL}/package.json?cb=${cb}`, {
         headers: { "Cache-Control": "no-cache" },
         signal: AbortSignal.timeout(8000),
       });
@@ -133,7 +139,7 @@ async function checkAndApplyUpdate() {
       }
 
       for (const file of UPDATE_FILES) {
-        const res = await fetch(`${UPDATE_BASE_URL}/${file}?cb=${cb}`, {
+        const res = await proxy.netFetch(`${UPDATE_BASE_URL}/${file}?cb=${cb}`, {
           headers: { "Cache-Control": "no-cache" },
           signal: AbortSignal.timeout(15000),
         });
@@ -259,14 +265,17 @@ function syncUserAgent() {
  *
  * The request body is serialized once by the caller and passed as a string, so
  * every retry path can replay it.
+ *
+ * A configured egress proxy applies to whichever URL is finally fetched, so a
+ * relay deployment can itself be dialled through the proxy.
  */
 function upstreamFetch(url, init) {
-  if (!UPSTREAM_RELAY_URL) return fetch(url, init);
+  if (!UPSTREAM_RELAY_URL) return proxy.netFetch(url, init);
   const parsed = new URL(url);
   const headers = { ...(init.headers || {}) };
   headers["x-relay-target"] = parsed.origin;
   headers["x-relay-path"] = parsed.pathname + parsed.search;
-  return fetch(UPSTREAM_RELAY_URL, { ...init, headers });
+  return proxy.netFetch(UPSTREAM_RELAY_URL, { ...init, headers });
 }
 
 function isValidV2UserAgent(ua) {
@@ -375,7 +384,7 @@ async function discoverModels() {
     refreshCliVersion().catch(() => {});
     checkAndApplyUpdate().catch(() => {});
     try {
-    const res = await fetch(resolveEndpoints().modelsUrl, {
+    const res = await proxy.netFetch(resolveEndpoints().modelsUrl, {
       headers: {
         "Authorization": "Bearer public",
         "User-Agent": currentUserAgent,
@@ -1308,6 +1317,51 @@ function getPersistentSessionId(req, body) {
   return newSessionId;
 }
 
+/**
+ * `/api/proxy` — read and change the egress proxy; `/api/proxy/test` — prove a
+ * candidate reaches upstream before it is trusted.
+ *
+ * The panel is the only caller, so the contract stays small: JSON in, JSON out,
+ * one error field. Credentials are accepted on write and never echoed on read.
+ */
+async function handleProxyApi(req, res, pathname) {
+  const send = (status, body) => {
+    res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(body));
+  };
+
+  if (pathname === "/api/proxy" && (req.method === "GET" || req.method === "HEAD")) {
+    return send(200, proxy.describe());
+  }
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return send(405, { error: "Gunakan GET untuk status atau POST untuk mengubah." });
+  }
+
+  let payload = {};
+  try {
+    const text = await readRequestBody(req, 16 * 1024);
+    payload = text ? JSON.parse(text) : {};
+  } catch (err) {
+    return send(err.statusCode === 413 ? 413 : 400, { error: `Body tidak valid: ${err.message}` });
+  }
+  if (!payload || typeof payload !== "object" || typeof payload.url !== "string") {
+    return send(400, { error: "Body harus berupa objek dengan field string 'url'." });
+  }
+
+  if (pathname === "/api/proxy/test") {
+    const result = await proxy.testProxy(payload.url, { probeUrl: resolveEndpoints().modelsUrl });
+    return send(result.ok ? 200 : 502, result);
+  }
+
+  const result = proxy.setProxyUrl(payload.url);
+  if (!result.ok) return send(400, { error: result.error });
+  console.log(
+    `[opencode-free-bridge] Egress ${result.mode === "proxy" ? `via proxy ${result.proxy}` : "direct"}`
+  );
+  return send(200, result);
+}
+
 function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
   // Early reject: if the client declares a huge body, refuse without reading
   // a single byte instead of buffering up to the limit first.
@@ -1411,10 +1465,22 @@ function handleRequest(req, res) {
   const rawPath = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
   const pathname = rawPath.length > 1 && rawPath.endsWith("/") ? rawPath.replace(/\/+$/, "") : rawPath;
 
+  // Panel: the human-facing page. JSON consumers keep using /health, which is
+  // why "/" is no longer an alias for the health document.
+  if (req.method === "GET" && (pathname === "" || pathname === "/")) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    return res.end(renderPanel(proxy.describe(), { version: VERSION, port: PORT }));
+  }
+
+  if (pathname === "/api/proxy" || pathname === "/api/proxy/test") {
+    return handleProxyApi(req, res, pathname);
+  }
+
   // Health check
-  if (pathname === "" || pathname === "/" || pathname === "/health") {
+  if (pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     const idState = identity.getState();
+    const proxyState = proxy.describe();
     const gateThrottled =
       lastFailedGateRetryTime > 0 &&
       Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
@@ -1426,12 +1492,16 @@ function handleRequest(req, res) {
         version: VERSION,
         runtime: typeof Bun !== "undefined" ? `bun/${Bun.version}` : `node/${process.versions.node}`,
         discoveredModels: activeModels.length,
-        // Egress mode. `direct` means inference requests go straight to
-        // opencode.ai; `relay` means they are sent through UPSTREAM_RELAY_URL,
-        // so upstream sees that relay's IP instead of this host's.
-        egress: UPSTREAM_RELAY_URL
-          ? { mode: "relay", relay: relayLabel(UPSTREAM_RELAY_URL) }
-          : { mode: "direct" },
+        // Egress in force. `mode` is what actually carries the request: the
+        // proxy when one is configured, otherwise the relay, otherwise direct.
+        // `proxy.mode` only reports whether a proxy exists, so a relay-only
+        // deployment still reads as `relay` here. Credentials are never
+        // included; `proxy.proxy` is host:port only.
+        egress: {
+          mode: proxyState.mode === "proxy" ? "proxy" : UPSTREAM_RELAY_URL ? "relay" : "direct",
+          ...(UPSTREAM_RELAY_URL ? { relay: relayLabel(UPSTREAM_RELAY_URL) } : {}),
+          proxy: proxyState,
+        },
         identity: {
           userAgent: idState.userAgent,
           updateMode: idState.updateMode,
