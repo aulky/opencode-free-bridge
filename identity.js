@@ -31,7 +31,17 @@ const crypto = require("crypto");
 // the provider catalog all travel through the same proxy the panel configures.
 // `proxy.netFetch` is a thin wrapper over `fetch`, so tests that replace
 // `global.fetch` keep intercepting every call.
-const proxy = require("./proxy");
+//
+// Loaded tolerantly: a 2.1.0 install updated by its own (older) updater can be
+// missing `proxy.js`, and identity sync must degrade to direct egress rather
+// than crash the process that would otherwise repair itself.
+let proxy;
+try {
+  proxy = require("./proxy");
+} catch (err) {
+  if (err.code !== "MODULE_NOT_FOUND" || !String(err.message).includes("'./proxy'")) throw err;
+  proxy = { netFetch: (url, init) => fetch(url, init) };
+}
 
 const UPDATE_API_BASE =
   process.env.OPENCODE_UPDATE_API_BASE || "https://opencode.ai/update/api";

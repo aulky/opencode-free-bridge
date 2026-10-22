@@ -154,7 +154,21 @@ describe("egress proxy", () => {
     assert.equal(seen.init.method, "GET");
   });
 
+  // `testProxy` refuses to run on Node because Node's fetch silently ignores
+  // the `proxy` init option: the probe would report "ok" while the request went
+  // out directly. That refusal is the correct behaviour, so the live-probe
+  // assertions only apply where the option is actually honoured.
+  const PROBE_RUNTIME = typeof Bun !== "undefined";
+
+  it("refuses to probe on a runtime whose fetch ignores the proxy option", async () => {
+    if (PROBE_RUNTIME) return;
+    const verdict = await proxy.testProxy("http://127.0.0.1:8080");
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.error, /Bun/);
+  });
+
   it("reports a proxy that cannot reach upstream, and the exit IP when it can", async () => {
+    if (!PROBE_RUNTIME) return;
     const original = global.fetch;
     try {
       global.fetch = async (url, init) => {
@@ -247,6 +261,7 @@ describe("proxy HTTP surface", () => {
   });
 
   it("answers /api/proxy/test with the probe verdict", async () => {
+    if (typeof Bun === "undefined") return;
     const original = global.fetch;
     try {
       global.fetch = async (url) => {
@@ -261,6 +276,44 @@ describe("proxy HTTP surface", () => {
     } finally {
       global.fetch = original;
     }
+  });
+
+  it("refuses cross-site writes and non-JSON bodies (CSRF)", async () => {
+    emptyStateDir();
+    proxy.__reload();
+
+    // A foreign page can send text/plain without a preflight; the bridge must
+    // refuse it on content type alone.
+    const formPost = await request(port, "POST", "/api/proxy", { url: "http://attacker.example:8080" }, {
+      "Content-Type": "text/plain",
+    });
+    assert.equal(formPost.status, 415);
+    assert.equal(proxy.getProxyUrl(), "");
+
+    const crossSite = await request(port, "POST", "/api/proxy", { url: "http://attacker.example:8080" }, {
+      Origin: "https://evil.example",
+      "Sec-Fetch-Site": "cross-site",
+    });
+    assert.equal(crossSite.status, 403);
+    assert.equal(proxy.getProxyUrl(), "");
+
+    const foreignHost = await request(port, "GET", "/api/proxy", undefined, {
+      Host: "evil.example",
+    });
+    assert.equal(foreignHost.status, 403);
+
+    // The panel itself must not render for a rebound name either.
+    const panelViaForeignHost = await request(port, "GET", "/", undefined, { Host: "evil.example" });
+    assert.equal(panelViaForeignHost.status, 403);
+
+    // The same-origin panel still works.
+    const sameOrigin = await request(port, "POST", "/api/proxy", { url: "http://127.0.0.1:3128" }, {
+      Origin: `http://127.0.0.1:${port}`,
+      "Sec-Fetch-Site": "same-origin",
+    });
+    assert.equal(sameOrigin.status, 200);
+    assert.equal(proxy.getProxyUrl(), "http://127.0.0.1:3128");
+    proxy.setProxyUrl("");
   });
 });
 

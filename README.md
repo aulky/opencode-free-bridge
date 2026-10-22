@@ -131,6 +131,9 @@ What the container setup does:
 - Persists the on-disk catalog cache in the `bridge-cache` volume
   (`OPENCODE_CACHE_DIR=/data/cache`), so a restart does not re-fetch the
   upstream model catalog.
+- Persists the panel's egress-proxy setting in the `bridge-state` volume
+  (`OPENCODE_BRIDGE_STATE_DIR=/data/state`). Without it, the container
+  filesystem is thrown away on recreate and the proxy would silently revert.
 - Runs with `no-new-privileges` and all Linux capabilities dropped.
 
 The image is the unit of deployment, so `AUTO_UPDATE` defaults to `0` in the
@@ -149,7 +152,9 @@ docker build -t opencode-free-bridge .
 docker run -d --name opencode-free-bridge \
   -p 127.0.0.1:20129:20129 \
   -e OPENCODE_CACHE_DIR=/data/cache \
+  -e OPENCODE_BRIDGE_STATE_DIR=/data/state \
   -v opencode-free-bridge-cache:/data/cache \
+  -v opencode-free-bridge-state:/data/state \
   opencode-free-bridge
 ```
 
@@ -356,7 +361,7 @@ curl -s http://127.0.0.1:20129/health
 ## Testing, Verification & Gate Drills
 
 ```bash
-bun test                        # 158 offline unit, contract, and regression tests
+bun test                        # 165 offline unit, contract, and regression tests
 bun run verify                  # live check: probes every discovered free model
 bun run verify:quick            # live check: stops at the first model that answers
 bun run drill                   # runs live + offline self-healing gate drills
@@ -406,6 +411,7 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `OPENCODE_RESPONSES_URL` | _(derived)_ | Override the upstream Responses API endpoint URL |
 | `UPSTREAM_RELAY_URL` | _(unset)_ | Route inference through an egress relay (`x-relay-target` / `x-relay-path` contract); empty = direct. See [Optional egress relay](#optional-egress-relay) |
 | `UPSTREAM_PROXY_URL` | _(unset)_ | Operator-level default for the egress proxy (`http://[user:pass@]host:port`). When set it wins over the panel and locks runtime edits. See [Egress proxy](#egress-proxy) |
+| `PANEL_ALLOWED_HOSTS` | _(unset)_ | Extra `Host` names the panel and `/api/proxy` accept (comma-separated), for a reverse proxy in front of the bridge. Loopback names and the configured `HOST` are always accepted |
 | `AUTO_UPDATE` | `1` | Poll GitHub for bridge updates every 6 hours (automatically skipped inside a `.git` checkout; set `0` to disable) |
 | `ALLOW_NODE` | _(unset)_ | Set `ALLOW_NODE=1` to bypass the startup Bun check for offline tests |
 
@@ -449,6 +455,15 @@ identity sync, and the self-updater.
   to direct egress.
 - **Operator override:** `UPSTREAM_PROXY_URL` beats the panel and locks runtime
   edits to it.
+- **Only from this machine:** the panel and `/api/proxy` accept `Host` names of
+  loopback (or the configured bind address) plus anything in
+  `PANEL_ALLOWED_HOSTS`, reject cross-site requests, and require
+  `Content-Type: application/json` for writes. That blocks a random website from
+  re-pointing your egress and blocks DNS rebinding. Put a reverse proxy in front
+  and add its name to `PANEL_ALLOWED_HOSTS` if you reach the panel that way.
+- **Container:** the compose file mounts the `bridge-state` volume at
+  `/data/state` (`OPENCODE_BRIDGE_STATE_DIR`) so the setting survives a
+  recreate. Plain `docker run` needs that env var and volume too.
 
 `/health` reports `egress.mode` (`proxy`, `relay`, or `direct`) plus
 `egress.proxy` with the same credential-free description.

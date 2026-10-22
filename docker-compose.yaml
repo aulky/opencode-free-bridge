@@ -8,12 +8,16 @@ services:
       PORT: "20129"
       HOST: "0.0.0.0"
       OPENCODE_CACHE_DIR: /data/cache
+      # The panel writes the egress proxy here. Without this the setting is lost
+      # on every `docker compose up -d` recreate (the container FS is ephemeral).
+      OPENCODE_BRIDGE_STATE_DIR: /data/state
       # The image is the unit of deployment: an in-place self-update is
       # reverted by the next `docker compose build`. Upgrade with
       # `docker compose build --pull && docker compose up -d` instead.
       AUTO_UPDATE: "0"
     volumes:
       - bridge-cache:/data/cache
+      - bridge-state:/data/state
     # Loopback only. The bridge has no authentication (the API key is
     # literally "public"), so publishing on 0.0.0.0 would expose an open
     # relay to the whole network.
@@ -36,3 +40,4 @@ services:
 
 volumes:
   bridge-cache:
+  bridge-state:

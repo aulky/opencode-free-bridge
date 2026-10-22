@@ -1,5 +1,98 @@
 # Changelog
 
+## [2.2.1] — 2026-10-22
+
+Hardening for the egress proxy shipped in 2.2.0. The feature worked, but three
+defects made it unsafe to leave as-is.
+
+### An upgrade from 2.1.0 could crash the bridge
+
+2.1.0's self-updater had no `proxy.js`/`panel.js` in `UPDATE_FILES`. Updating
+such an install to 2.2.0 wrote a `server.js` that required those modules,
+restarted, and died with `Cannot find module './proxy'` — a crash loop with no
+recovery except reinstalling. Reproduced end to end before fixing.
+
+- `server.js` and `identity.js` now load `proxy`/`panel` tolerantly: a missing
+  own module degrades to direct egress instead of throwing at require time.
+  Only a missing *own* module is tolerated; a real error inside the file still
+  surfaces.
+- The updater reads the **incoming** `server.js`, extracts its relative
+  requires, and stages any module the running file list does not name. An old
+  `UPDATE_FILES` can no longer install a server it cannot boot.
+- On boot, `repairMissingModules()` re-fetches modules that `server.js` requires
+  but that are absent, so an already-broken 2.2.0 install heals on restart
+  instead of needing `install.sh`. Best-effort and non-blocking.
+
+### The panel API was writable from any website (CSRF)
+
+`POST /api/proxy` accepted `text/plain`, which browsers send cross-origin
+without a preflight, and it never looked at `Origin`, `Sec-Fetch-Site`, or
+`Host`. Any page the operator visited could point the bridge's egress — and its
+self-updater — at an attacker's proxy, or switch it off.
+
+- Writes require `Content-Type: application/json` (415 otherwise).
+- Cross-site requests are refused (403) on `Sec-Fetch-Site` and on a foreign
+  `Origin`.
+- The `Host` header must be a loopback name, the configured bind address, or an
+  entry in `PANEL_ALLOWED_HOSTS`, which closes DNS rebinding.
+- The panel is served with `X-Frame-Options: DENY`, and `HEAD /` works again
+  instead of returning 404.
+
+### Container lost the proxy setting
+
+`proxy.json` was written to `~/.opencode-free-bridge` inside the container,
+which is discarded on recreate. The image now sets
+`OPENCODE_BRIDGE_STATE_DIR=/data/state` and compose mounts a `bridge-state`
+volume there.
+
+### Node compatibility
+
+`testProxy` correctly refuses to run on Node (Node's fetch ignores the `proxy`
+option, so a probe would report success while going out directly), but two
+tests asserted the Bun behaviour unconditionally. They now assert the refusal
+on Node and the probe verdict on Bun.
+
+## [2.2.0] — 2026-10-21
+
+### Egress proxy, configured from the browser
+
+`http://127.0.0.1:20129/` now serves a panel instead of the health document, and
+the panel sets an HTTP proxy for **every** outbound request the bridge makes:
+inference, model discovery, identity/update sync, and the self-updater. Upstream
+sees the proxy's IP, not this machine's.
+
+- **`proxy.js`:** validates `http://`/`https://` URLs (percent-encoded
+  credentials supported), refuses SOCKS with Bun's own reason
+  (`UnsupportedProxyProtocol`), persists to `~/.opencode-free-bridge/proxy.json`
+  at mode `0600`, and exposes `netFetch()` — one egress point used by `server.js`
+  and `identity.js`. `UPSTREAM_PROXY_URL` is an operator override that also locks
+  runtime edits.
+- **`panel.js`:** HTML panel plus `/api/proxy` (GET status, POST set/clear) and
+  `/api/proxy/test` (probe). Status, `/api/proxy`, and `/health` expose `host:port`
+  only; credentials never leave the process.
+- **Test before trusting it:** the probe fetches the models endpoint through the
+  candidate and reports the exit IP from `cdn-cgi/trace`, so a working tunnel with
+  a refused egress (403) is distinguishable from a broken proxy.
+- **No restart:** the URL is read per request.
+- **`/health`:** `egress.mode` is now what actually carries traffic (`proxy`,
+  `relay`, `direct`), with `egress.proxy` describing the proxy state.
+  `verify.js` prints the egress line before probing.
+- **Relay interaction:** with both configured, the request still targets
+  `UPSTREAM_RELAY_URL` and that connection is dialled through the proxy.
+- **Delivery:** `proxy.js` and `panel.js` added to `package.json` `files`,
+  `UPDATE_FILES`, and `install.sh` (fetch, syntax check, install, backup), so the
+  self-updater cannot leave an install missing the modules `server.js` requires.
+
+### `install.sh` installs the checkout it runs from
+
+`bash install.sh` inside a clone always downloaded from GitHub, so a file added
+in the working tree but not yet pushed failed the install with a bare
+`curl: (22) The requested URL returned error: 404` that named neither the file
+nor the cause. `SOURCE=auto` now installs the local working tree when the script
+runs from a checkout, the remote path names the file it could not fetch and
+points at `SOURCE=local` as the way out, and `SOURCE=remote` restores the old
+behaviour. The `curl | bash` route is unchanged.
+
 ## [2.1.0] — 2026-10-21
 
 ### Container deployment
@@ -58,47 +151,6 @@ Forks taken before the correction still carry the old commits, so their graphs
 show the same extra entry until they re-sync.
 
 ---
-
-## [2.2.0] — 2026-10-21
-
-### Egress proxy, configured from the browser
-
-`http://127.0.0.1:20129/` now serves a panel instead of the health document, and
-the panel sets an HTTP proxy for **every** outbound request the bridge makes:
-inference, model discovery, identity/update sync, and the self-updater. Upstream
-sees the proxy's IP, not this machine's.
-
-- **`proxy.js`:** validates `http://`/`https://` URLs (percent-encoded
-  credentials supported), refuses SOCKS with Bun's own reason
-  (`UnsupportedProxyProtocol`), persists to `~/.opencode-free-bridge/proxy.json`
-  at mode `0600`, and exposes `netFetch()` — one egress point used by `server.js`
-  and `identity.js`. `UPSTREAM_PROXY_URL` is an operator override that also locks
-  runtime edits.
-- **`panel.js`:** HTML panel plus `/api/proxy` (GET status, POST set/clear) and
-  `/api/proxy/test` (probe). Status, `/api/proxy`, and `/health` expose `host:port`
-  only; credentials never leave the process.
-- **Test before trusting it:** the probe fetches the models endpoint through the
-  candidate and reports the exit IP from `cdn-cgi/trace`, so a working tunnel with
-  a refused egress (403) is distinguishable from a broken proxy.
-- **No restart:** the URL is read per request.
-- **`/health`:** `egress.mode` is now what actually carries traffic (`proxy`,
-  `relay`, `direct`), with `egress.proxy` describing the proxy state.
-  `verify.js` prints the egress line before probing.
-- **Relay interaction:** with both configured, the request still targets
-  `UPSTREAM_RELAY_URL` and that connection is dialled through the proxy.
-- **Delivery:** `proxy.js` and `panel.js` added to `package.json` `files`,
-  `UPDATE_FILES`, and `install.sh` (fetch, syntax check, install, backup), so the
-  self-updater cannot leave an install missing the modules `server.js` requires.
-
-### `install.sh` installs the checkout it runs from
-
-`bash install.sh` inside a clone always downloaded from GitHub, so a file added
-in the working tree but not yet pushed failed the install with a bare
-`curl: (22) The requested URL returned error: 404` that named neither the file
-nor the cause. `SOURCE=auto` now installs the local working tree when the script
-runs from a checkout, the remote path names the file it could not fetch and
-points at `SOURCE=local` as the way out, and `SOURCE=remote` restores the old
-behaviour. The `curl | bash` route is unchanged.
 
 ## [2.0.3] — 2026-10-20
 

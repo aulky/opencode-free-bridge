@@ -8,10 +8,139 @@ try {
   VERSION = require("./package.json").version || VERSION;
 } catch {}
 const { effectiveMaxTokens } = require("./token-budget");
+
+/**
+ * Load a sibling module, or a fallback when the file is not on disk yet.
+ *
+ * This exists because of a real upgrade path: 2.1.0's self-updater had no
+ * `proxy.js`/`panel.js` in its file list, so updating that install to 2.2.0
+ * wrote a `server.js` that required modules the updater never fetched. A hard
+ * `require` turned that into a crash loop (`Cannot find module './proxy'`)
+ * after the restart, with no way back except reinstalling. A missing optional
+ * module must degrade to direct egress, never prevent the process from booting.
+ *
+ * Only a missing *own* module is tolerated. If `proxy.js` exists but requires
+ * something absent, that is a broken install and the error must surface.
+ */
+function loadLocalModule(name, fallback) {
+  try {
+    return require(`./${name}`);
+  } catch (err) {
+    if (err.code !== "MODULE_NOT_FOUND" || !String(err.message).includes(`'./${name}'`)) throw err;
+    return fallback;
+  }
+}
+
+const PROXY_FALLBACK = {
+  getProxyUrl: () => "",
+  withProxy: (init) => init,
+  netFetch: (url, init) => fetch(url, init),
+  describe: () => ({
+    mode: "direct",
+    proxy: null,
+    hasCredentials: false,
+    source: "none",
+    locked: false,
+    configPath: null,
+    error: "proxy.js belum terpasang; egress langsung. Jalankan ulang install.sh.",
+  }),
+  setProxyUrl: () => ({
+    ok: false,
+    error: "proxy.js belum terpasang. Jalankan ulang install.sh atau tunggu perbaikan otomatis.",
+  }),
+  testProxy: async () => ({ ok: false, error: "proxy.js belum terpasang." }),
+};
+
+const PANEL_FALLBACK = {
+  renderPanel: () =>
+    "<!doctype html><meta charset=\"utf-8\"><title>opencode-free-bridge</title>" +
+    "<body style=\"font:16px/1.5 system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem\">" +
+    "<h1>Instalasi belum lengkap</h1>" +
+    "<p><code>proxy.js</code> dan <code>panel.js</code> tidak ditemukan di direktori ini. " +
+    "Bridge tetap berjalan dengan egress langsung. Jalankan ulang " +
+    "<code>install.sh</code> untuk memasang panel.</p></body>",
+};
+
 // Egress proxy and the panel that configures it. Loaded before anything else
 // touches the network so the first request already honours a saved proxy.
-const proxy = require("./proxy");
-const { renderPanel } = require("./panel");
+let proxy = loadLocalModule("proxy", PROXY_FALLBACK);
+let panel = loadLocalModule("panel", PANEL_FALLBACK);
+
+/**
+ * Local modules this server requires by relative path. The self-updater uses
+ * this to refuse an update that would install a `server.js` whose imports are
+ * not part of the release, and boot uses it to repair a half-installed tree.
+ */
+function localRequires(source) {
+  const names = new Set();
+  // Strip comments first: the doc comment above names `require("./x")` as an
+  // example, and scanning it produced a bogus `x.js` dependency.
+  const text = String(source || "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+  // `require("./x")` and the tolerant `loadLocalModule("x", …)` loader both
+  // name a file that must be present for this server to work.
+  for (const re of [/\brequire\(\s*["']\.\/([A-Za-z0-9._-]+)["']\s*\)/g, /\bloadLocalModule\(\s*["']([A-Za-z0-9._-]+)["']/g]) {
+    let match;
+    while ((match = re.exec(text))) {
+      if (match[1].endsWith(".json")) continue;
+      const name = match[1].endsWith(".js") ? match[1] : `${match[1]}.js`;
+      names.add(name);
+    }
+  }
+  return [...names];
+}
+
+/**
+ * Fetch files that `server.js` requires but that are not on disk.
+ *
+ * 2.1.0 shipped a self-updater whose file list predated `proxy.js`/`panel.js`,
+ * so an update to 2.2.0 wrote a server that could not boot. That install now
+ * starts with the fallbacks above; this repairs it on the next boot instead of
+ * leaving the panel permanently unavailable. Best-effort: a failure keeps the
+ * fallback, never blocks startup.
+ */
+async function repairMissingModules(dir = __dirname) {
+  const fs = require("fs");
+  const path = require("path");
+  const required = new Set(localRequires(fs.readFileSync(path.join(dir, "server.js"), "utf8")));
+  for (const name of ["proxy.js", "panel.js"]) required.add(name);
+  const missing = [...required].filter((f) => !fs.existsSync(path.join(dir, f)));
+  const repaired = [];
+  const failed = [];
+  for (const file of missing) {
+    try {
+      const res = await fetch(`${UPDATE_BASE_URL}/${file}?cb=${Date.now()}`, {
+        headers: { "Cache-Control": "no-cache" },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (!text || text.length < 20) throw new Error("empty response");
+      new Function(text.replace(/^#!.*\n/, ""));
+      const tmp = path.join(dir, `.${file}.repair.${process.pid}`);
+      fs.writeFileSync(tmp, text, "utf8");
+      fs.renameSync(tmp, path.join(dir, file));
+      repaired.push(file);
+    } catch (err) {
+      failed.push(`${file}: ${err.message}`);
+    }
+  }
+  if (repaired.length && path.resolve(dir) === path.resolve(__dirname)) {
+    proxy = loadLocalModule("proxy", PROXY_FALLBACK);
+    panel = loadLocalModule("panel", PANEL_FALLBACK);
+    console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
+  } else if (repaired.length) {
+    console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
+  }
+  if (failed.length) {
+    console.warn(
+      `[opencode-free-bridge] Could not repair ${failed.join(", ")}; ` +
+        "running with direct egress. Re-run install.sh to fix this install."
+    );
+  }
+  return { repaired, failed };
+}
 
 const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -187,6 +316,38 @@ async function checkAndApplyUpdate() {
         }
         tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
       }
+
+      // A release can add a module that an older `UPDATE_FILES` list does not
+      // name. 2.1.0 -> 2.2.0 did exactly that: the new server.js required
+      // ./proxy and ./panel, the old updater never fetched them, and the
+      // restart crash-looped. Read the *incoming* server.js and stage every
+      // local module it imports, so the file list in the running process can
+      // never be the reason a valid release fails to boot.
+      const incoming = tmpFiles.find((f) => path.basename(f.targetPath) === "server.js");
+      if (incoming) {
+        const declared = new Set(tmpFiles.map((f) => path.basename(f.targetPath)));
+        for (const file of localRequires(fs.readFileSync(incoming.tmpPath, "utf8"))) {
+          if (declared.has(file) || fs.existsSync(path.join(__dirname, file))) continue;
+          const res = await proxy.netFetch(`${UPDATE_BASE_URL}/${file}?cb=${cb}`, {
+            headers: { "Cache-Control": "no-cache" },
+            signal: AbortSignal.timeout(15000),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status} fetching required module ${file}`);
+          const text = await res.text();
+          if (!text || text.length < 20) throw new Error(`empty response for required module ${file}`);
+          try {
+            new Function(text.replace(/^#!.*\n/, ""));
+          } catch (err) {
+            throw new Error(`syntax check failed for required module ${file}: ${err.message}`);
+          }
+          const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
+          fs.writeFileSync(tmpPath, text, "utf8");
+          tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
+          declared.add(file);
+          console.log(`[opencode-free-bridge] Staged newly required module ${file}`);
+        }
+      }
+
       for (const { tmpPath, targetPath } of tmpFiles) fs.renameSync(tmpPath, targetPath);
       console.log(
         `[opencode-free-bridge] Self-updated ${VERSION} → ${remoteVersion}; exiting for service restart.`
@@ -349,6 +510,98 @@ function isLocalOrigin(origin) {
   if (typeof origin !== "string" || !origin) return false;
   return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(origin.trim());
 }
+
+const LOOPBACK_HOST_RE = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\]|::1)$/i;
+
+/** Hostname from a `Host` header, without the port. IPv6 literals keep brackets off. */
+function hostnameOf(hostHeader) {
+  const raw = String(hostHeader || "").trim();
+  if (!raw) return "";
+  const v6 = raw.match(/^\[([^\]]+)\](?::\d+)?$/);
+  if (v6) return v6[1];
+  return raw.replace(/:\d+$/, "");
+}
+
+/**
+ * Admin-surface gate: the panel and `/api/proxy` can change where every
+ * outbound request goes, so they must not be reachable from a foreign page or
+ * a rebound DNS name.
+ *
+ * The bridge is a local tool with no authentication. Two browser attacks
+ * matter here:
+ *
+ *   - CSRF: any page the operator visits could POST to 127.0.0.1 and point the
+ *     egress at an attacker's proxy. A form POST cannot set
+ *     `Content-Type: application/json`, so requiring it removes the simple
+ *     request; the Origin/Sec-Fetch-Site checks below cover the rest.
+ *   - DNS rebinding: an attacker domain resolving to 127.0.0.1 makes the
+ *     browser send `Host: evil.example`, which a loopback-only listener would
+ *     otherwise accept.
+ *
+ * `PANEL_ALLOWED_HOSTS` (comma-separated) adds names for a reverse proxy or a
+ * deliberate LAN deployment. A bind address other than a wildcard is allowed
+ * automatically, so `HOST=192.168.1.5` keeps its own panel working.
+ */
+function allowedAdminHosts() {
+  const hosts = new Set(["localhost", "127.0.0.1", "::1"]);
+  for (const extra of String(process.env.PANEL_ALLOWED_HOSTS || "").split(",")) {
+    const trimmed = extra.trim().toLowerCase();
+    if (trimmed) hosts.add(trimmed);
+  }
+  const bound = String(HOST || "").toLowerCase();
+  const wildcard = !bound || bound === "0.0.0.0" || bound === "::" || bound === "[::]";
+  if (!wildcard) hosts.add(bound);
+  if (wildcard) {
+    // A wildcard bind is usually reached by one of this machine's own
+    // addresses (LAN IP, VPS public IP). Those are safe to accept and make
+    // `HOST=0.0.0.0` usable without configuration; a rebound attacker domain
+    // is still not in this set. Domain names go in PANEL_ALLOWED_HOSTS.
+    const os = require("os");
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const addr of list || []) {
+        if (addr && addr.address) hosts.add(String(addr.address).toLowerCase());
+      }
+    }
+  }
+  return hosts;
+}
+
+function adminRequestError(req) {
+  const host = hostnameOf(req.headers?.host).toLowerCase();
+  if (!host) return "Header Host wajib ada.";
+  if (!allowedAdminHosts().has(host)) {
+    return `Host ${host} tidak diizinkan. Panel hanya menerima host lokal; tambahkan ke PANEL_ALLOWED_HOSTS bila ini memang disengaja.`;
+  }
+
+  const site = String(req.headers?.["sec-fetch-site"] || "").toLowerCase();
+  if (site === "cross-site") {
+    return "Permintaan lintas-situs ditolak. Buka panel langsung dari host ini.";
+  }
+
+  // An Origin must match the Host this request was sent to (which covers the
+  // panel itself and an SSH/tunnel forward that keeps the browser's origin),
+  // or be explicitly allow-listed in CORS_ORIGIN. A loopback origin on a
+  // *different* port is another local service, not this panel, so it is not
+  // trusted automatically.
+  const origin = String(req.headers?.origin || "").trim();
+  if (origin) {
+    let originHost = "";
+    try {
+      originHost = new URL(origin).hostname.toLowerCase();
+    } catch {
+      return `Origin ${origin} tidak valid.`;
+    }
+    const configured = String(CORS_ORIGIN || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (originHost !== host && !configured.includes(origin)) {
+      return `Origin ${origin} tidak diizinkan.`;
+    }
+  }
+  return null;
+}
+
 
 /**
  * Kept for callers and tests that expect the old name. Consults the handshake
@@ -1467,13 +1720,46 @@ function handleRequest(req, res) {
 
   // Panel: the human-facing page. JSON consumers keep using /health, which is
   // why "/" is no longer an alias for the health document.
-  if (req.method === "GET" && (pathname === "" || pathname === "/")) {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-    return res.end(renderPanel(proxy.describe(), { version: VERSION, port: PORT }));
+  if ((req.method === "GET" || req.method === "HEAD") && (pathname === "" || pathname === "/")) {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+      return res.end(req.method === "HEAD" ? undefined : denied);
+    }
+    const html = panel.renderPanel(proxy.describe(), { version: VERSION, port: PORT });
+    res.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Length": Buffer.byteLength(html),
+      "X-Frame-Options": "DENY",
+    });
+    return res.end(req.method === "HEAD" ? undefined : html);
   }
 
   if (pathname === "/api/proxy" || pathname === "/api/proxy/test") {
-    return handleProxyApi(req, res, pathname);
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    // Only JSON can change the setting. `text/plain` is a CORS "simple
+    // request", so accepting it would let any page POST here without a
+    // preflight; refusing it is the structural half of the CSRF defence.
+    if (req.method === "POST") {
+      const type = String(req.headers?.["content-type"] || "").split(";")[0].trim().toLowerCase();
+      if (type !== "application/json") {
+        res.writeHead(415, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        return res.end(JSON.stringify({ error: "Content-Type harus application/json." }));
+      }
+    }
+    // `handleProxyApi` is async; an unexpected throw must become a 500 instead
+    // of an unhandled rejection that leaves the socket hanging.
+    handleProxyApi(req, res, pathname).catch((err) => {
+      if (res.headersSent) return res.destroy();
+      res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: `Kesalahan internal: ${err.message}` }));
+    });
+    return;
   }
 
   // Health check
@@ -2686,6 +2972,11 @@ if (require.main === module) {
       );
     }
   });
+  // Repair a half-installed tree (an older self-updater that did not know about
+  // proxy.js/panel.js) after the socket is open, so a slow or absent network
+  // never delays startup. The panel reads the current binding per request, so
+  // it starts working as soon as the repair lands.
+  repairMissingModules().catch(() => {});
   // Discovery runs in background: /v1/models is live as soon as upstream
   // answers. Boot never blocks on network.
   discoverModels().catch(() => {});
@@ -2766,4 +3057,7 @@ module.exports = {
   __setLastCliVersionCheckTime: (v) => { lastCliVersionCheckTime = v; },
   __getCliVersionState: () => ({ lastCliVersionCheckTime }),
   __setLastUpdateCheck: (v) => { lastUpdateCheck = v; },
+  __localRequires: localRequires,
+  __repairMissingModules: repairMissingModules,
+  __adminRequestError: adminRequestError,
 };

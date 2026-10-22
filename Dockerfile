@@ -4,7 +4,8 @@ WORKDIR /app
 
 ENV PORT=20129 \
     HOST=0.0.0.0 \
-    OPENCODE_CACHE_DIR=/data/cache
+    OPENCODE_CACHE_DIR=/data/cache \
+    OPENCODE_BRIDGE_STATE_DIR=/data/state
 
 COPY --chown=bun:bun . .
 
@@ -12,7 +13,7 @@ COPY --chown=bun:bun . .
 # them, so /app stays root-owned while the process runs as `bun`. The
 # self-updater stages its temp files next to their targets inside __dirname,
 # so it needs a writable /app or every update dies with EACCES.
-RUN mkdir -p /data/cache \
+RUN mkdir -p /data/cache /data/state \
     && chown -R bun:bun /data /app
 
 USER bun

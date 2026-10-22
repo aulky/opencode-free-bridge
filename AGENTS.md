@@ -116,6 +116,9 @@ candidate and reports the exit IP; *Matikan proxy* returns to direct egress. No 
 - API: `GET /api/proxy` (status), `POST /api/proxy` `{"url":"…"}` (set; `""` clears),
   `POST /api/proxy/test` `{"url":"…"}` (probe). Operator override: `UPSTREAM_PROXY_URL`, which
   locks the panel.
+- The panel and `/api/proxy` are an admin surface: writes must be
+  `Content-Type: application/json`, cross-site requests are refused, and `Host` must be loopback,
+  the bind address, or listed in `PANEL_ALLOWED_HOSTS`. Keep those checks if you touch the route.
 - `/health` → `egress.mode` (`proxy` / `relay` / `direct`) and `egress.proxy` (host:port only).
 
 ### Current active free models (also supports family shorthands)
@@ -207,7 +210,7 @@ When a user reports an error, diagnose it using this decision table before chang
 
 | File | Responsibility |
 |---|---|
-| `server.js` | HTTP server (panel at `/`, `/v1/chat/completions`, `/v1/models`, `/health`, `/api/proxy`), Bun runtime guard, configurable DNS result order (`DNS_RESULT_ORDER`), session affinity cache, client tool aliasing (`read` -> `read_client`), SSE stream normalization (`reasoning_content`, `usage`, `finish_reason`), 403/426/404 reactive retry loop with 30s IP-cooldown retry suppression (`GATE_RETRY_COOLDOWN_MS`), terminal IP-abuse branch (`X-OpenCode-Gate: ip-abuse`, no refresh/retry), egress proxy (`proxy.netFetch` on inference, discovery, and self-update) plus the optional `UPSTREAM_RELAY_URL` relay (`x-relay-target` / `x-relay-path`), and 6-hour self-updater (`checkAndApplyUpdate`). |
+| `server.js` | HTTP server (panel at `/`, `/v1/chat/completions`, `/v1/models`, `/health`, `/api/proxy` with the `adminRequestError` CSRF/Host guard), Bun runtime guard, tolerant loading of `proxy.js`/`panel.js` plus `repairMissingModules()` so a half-installed tree boots and heals, configurable DNS result order (`DNS_RESULT_ORDER`), session affinity cache, client tool aliasing (`read` -> `read_client`), SSE stream normalization (`reasoning_content`, `usage`, `finish_reason`), 403/426/404 reactive retry loop with 30s IP-cooldown retry suppression (`GATE_RETRY_COOLDOWN_MS`), terminal IP-abuse branch (`X-OpenCode-Gate: ip-abuse`, no refresh/retry), egress proxy (`proxy.netFetch` on inference, discovery, and self-update) plus the optional `UPSTREAM_RELAY_URL` relay (`x-relay-target` / `x-relay-path`), and 6-hour self-updater (`checkAndApplyUpdate`), which stages any module the incoming `server.js` requires even when the running `UPDATE_FILES` list predates it. |
 | `identity.js` | Adaptive OpenCode CLI synchronization: release handshake (`opencode.ai/update/api`), GitHub source fetcher (`identifier.ts`, `session-id.ts`, `app.ts`, `model-request.ts`, `tool/plugin/*.ts`, `codemode/tool.ts`), Effect Schema AST parser (`extractToolFromSource`), provider catalog parser & disk cache (`~/.opencode-free-bridge/cache/catalog.json`), 30s forced-refresh cooldown (`GATE_REFRESH_COOLDOWN_MS`), terminal `isIpAbuseRejection` guard, and pooled CSPRNG session ID generator (`createSessionId`). |
 | `token-budget.js` | Additive token budget calculation (`max(requested, 1024) + 4096` for reasoning models, `max(requested, 512)` for standard models), driven by catalog `modelFacts`. |
 | `proxy.js` | Egress proxy: URL validation (HTTP/HTTPS only, percent-encoded credentials), persistence in `<state dir>/proxy.json` (mode `0600`), `UPSTREAM_PROXY_URL` override with panel lock, `withProxy`/`netFetch` used by every outbound call in `server.js` and `identity.js`, and `testProxy` (upstream probe + `cdn-cgi/trace` exit IP). |
@@ -216,8 +219,8 @@ When a user reports an error, diagnose it using this decision table before chang
 | `gate-drill.js` | End-to-end self-healing drill suite (4 live drills + 6 deterministic offline drills including `full-corrupt`). |
 | `verify.js` | Live model readiness checker (`bun verify.js` / `bun verify.js --quick`); sends `stream: true` and halts immediately on `gate-closed` (`403` with `X-OpenCode-Gate: ip-throttled` or `ip-abuse`, or the free-tier/abuse message) to avoid extending IP cooldowns. |
 | `install.sh` | Cross-platform installer and `node` -> `bun` service unit migrator for Linux (`systemd`) and macOS (`launchd`). |
-| `Dockerfile` | Container image for the bridge: pinned `oven/bun:1.4.3-slim` base (the Bun version is pinned because the free-tier gate checks the TLS ClientHello), non-root `bun` user, writable `/app` so the in-place self-updater can stage its temp files, and `OPENCODE_CACHE_DIR=/data/cache` for the catalog cache. |
-| `docker-compose.yaml` | Single-service container deployment: restart policy, loopback-only port publish (`127.0.0.1:20129:20129` — the bridge has no auth), persistent `bridge-cache` volume, `no-new-privileges` + `cap_drop: [ALL]`, health check, and `AUTO_UPDATE=0` (the image is the unit of deployment). |
+| `Dockerfile` | Container image for the bridge: pinned `oven/bun:1.4.3-slim` base (the Bun version is pinned because the free-tier gate checks the TLS ClientHello), non-root `bun` user, writable `/app` so the in-place self-updater can stage its temp files, `OPENCODE_CACHE_DIR=/data/cache` for the catalog cache, and `OPENCODE_BRIDGE_STATE_DIR=/data/state` for the panel's proxy setting. |
+| `docker-compose.yaml` | Single-service container deployment: restart policy, loopback-only port publish (`127.0.0.1:20129:20129` — the bridge has no auth), persistent `bridge-cache` and `bridge-state` volumes, `no-new-privileges` + `cap_drop: [ALL]`, health check, and `AUTO_UPDATE=0` (the image is the unit of deployment). |
 | `.dockerignore` | Keeps `.git`, `.github`, and `test/` out of the build context: a `.git` directory inside the image defeats the self-updater's `git-checkout` guard, and a published image should not carry one. |
 
 ### Mandatory verification before committing changes
