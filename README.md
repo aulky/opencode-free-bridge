@@ -95,7 +95,13 @@ cd opencode-free-bridge
 bun server.js
 ```
 
+`bash install.sh` inside the clone installs that working tree (including
+uncommitted or unpushed files) instead of downloading from GitHub. Force a
+download with `SOURCE=remote bash install.sh`.
+
 The server listens on `http://127.0.0.1:20129` by default.
+Open `http://127.0.0.1:20129/` for the panel: it shows the live egress state and sets
+an HTTP proxy for every outbound request. See [Egress proxy](#egress-proxy).
 
 ### Docker
 
@@ -350,7 +356,7 @@ curl -s http://127.0.0.1:20129/health
 ## Testing, Verification & Gate Drills
 
 ```bash
-bun test                        # 145 offline unit, contract, and regression tests
+bun test                        # 158 offline unit, contract, and regression tests
 bun run verify                  # live check: probes every discovered free model
 bun run verify:quick            # live check: stops at the first model that answers
 bun run drill                   # runs live + offline self-healing gate drills
@@ -399,6 +405,7 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `OPENCODE_CHAT_URL` | _(derived)_ | Override the upstream Chat Completions endpoint URL |
 | `OPENCODE_RESPONSES_URL` | _(derived)_ | Override the upstream Responses API endpoint URL |
 | `UPSTREAM_RELAY_URL` | _(unset)_ | Route inference through an egress relay (`x-relay-target` / `x-relay-path` contract); empty = direct. See [Optional egress relay](#optional-egress-relay) |
+| `UPSTREAM_PROXY_URL` | _(unset)_ | Operator-level default for the egress proxy (`http://[user:pass@]host:port`). When set it wins over the panel and locks runtime edits. See [Egress proxy](#egress-proxy) |
 | `AUTO_UPDATE` | `1` | Poll GitHub for bridge updates every 6 hours (automatically skipped inside a `.git` checkout; set `0` to disable) |
 | `ALLOW_NODE` | _(unset)_ | Set `ALLOW_NODE=1` to bypass the startup Bun check for offline tests |
 
@@ -419,6 +426,36 @@ or `relay`) and the relay's origin, without credentials or query strings. Use a
 trusted HTTPS relay: it receives the request headers (including
 `Authorization: Bearer public`) and the full prompt. Changing the variable
 requires a restart.
+
+### Egress proxy
+
+Open `http://127.0.0.1:20129/` and enter an HTTP proxy. Every outbound request
+the bridge makes then tunnels through it (`CONNECT`), so upstream sees the
+proxy's IP rather than this machine's. That covers inference, model discovery,
+identity sync, and the self-updater.
+
+- **Protocol:** `http://` and `https://` only. Bun's fetch accepts those and
+  tunnels TLS itself, so `transport-baseline.json` still matches. SOCKS5 is
+  refused by Bun (`UnsupportedProxyProtocol`) and rejected in the panel with
+  that reason.
+- **Credentials:** `http://user:pass@host:port`, percent-encoded if they contain
+  `@`, `:`, or `/`. They are stored in `~/.opencode-free-bridge/proxy.json`
+  (mode `0600`) and never returned by the panel, `/api/proxy`, or `/health`;
+  those show `host:port` only.
+- **Test before trusting it:** *Uji koneksi* fetches the models endpoint through
+  the candidate proxy and reports the exit IP from `cdn-cgi/trace`. A 403 there
+  means the proxy reaches upstream but its egress is refused.
+- **No restart:** the setting is read on every request. *Matikan proxy* returns
+  to direct egress.
+- **Operator override:** `UPSTREAM_PROXY_URL` beats the panel and locks runtime
+  edits to it.
+
+`/health` reports `egress.mode` (`proxy`, `relay`, or `direct`) plus
+`egress.proxy` with the same credential-free description.
+
+The proxy applies *in addition to* the relay: with both configured, the request
+is still sent to `UPSTREAM_RELAY_URL`, and that connection is dialled through
+the proxy.
 
 ## Troubleshooting
 

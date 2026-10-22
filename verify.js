@@ -112,6 +112,7 @@ async function checkHealth() {
     version: res.body.version,
     runtime: res.body.runtime || null,
     models: res.body.discoveredModels,
+    egress: res.body.egress || null,
   };
 }
 
@@ -193,6 +194,18 @@ async function probe(model) {
     process.exit(1);
   }
   console.log(`  ${ok("OK")}  bridge v${health.version}, ${health.models} free models discovered\n`);
+  // Which IP upstream will see. A refused allowance is often a proxy problem,
+  // so say where the traffic leaves before blaming upstream.
+  const egress = health.egress;
+  if (egress) {
+    const label =
+      egress.mode === "proxy"
+        ? `proxy ${egress.proxy?.proxy || "(configured)"}`
+        : egress.mode === "relay"
+          ? `relay ${egress.relay || "(configured)"}`
+          : "direct (this machine's IP)";
+    console.log(`  ${C.dim}egress: ${label}${C.reset}\n`);
+  }
 
   const models = await listModels();
   if (models.length === 0) {
