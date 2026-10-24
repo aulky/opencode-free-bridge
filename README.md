@@ -537,6 +537,106 @@ ClientAliveCountMax 4        # dead peer detected in 120s
 
 OpenSSH uses the **first** value it reads, so a later-sorting file (for example `99-*.conf`) is silently ignored. Verify with `sshd -T | grep -i clientalive` and `systemctl reload ssh`.
 
+### `429 FreeUsageLimitError` — is it the quota, or the request shape?
+
+`429 FreeUsageLimitError` means the transport gate accepted the request and the
+free-tier allowance is spent. It is *not* the shape gate (`403 FreeTierError`)
+and *not* an IP block (`403` + "abusive traffic"). Measured behaviour:
+
+- The allowance is **not** keyed to egress IP. Seven different egress IPs
+  (three cloud regions plus a residential line) returned `429` in the same
+  minute.
+- The allowance is **not** keyed to session or project id. Freshly minted
+  session ids and the CLI's own project id both returned `429`.
+- It refills on a short window. The same bridge answered `200` at 06:24 UTC and
+  `429` at 06:33 UTC with no configuration change.
+
+Because of that window, "the CLI works but the bridge does not" is a
+**time-of-measurement artifact**, not proof of a bridge defect. Both are drawing
+on the same allowance. Verify by interleaving the two within the same minute:
+
+```bash
+for i in 1 2 3; do
+  opencode run -m opencode/glm-5.3-flash-free "probe $i" 2>&1 | tail -1
+  curl -s http://127.0.0.1:20129/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"glm-5.3-flash-free","messages":[{"role":"user","content":"probe"}],"max_tokens":8}' \
+    | head -c 120; echo
+done
+```
+
+If both refuse, the allowance is spent and nothing about the bridge needs
+changing. If the CLI answers while the bridge refuses **in the same minute**,
+the bridge is being charged more per request than the CLI is.
+
+#### Why the bridge can be charged earlier than the CLI
+
+The default `TOOL_PROFILE_SCOPE=core` sends two tools (`read`, `shell`) and a
+short placeholder note, then escalates to `full` only after a rejection. The
+real CLI always sends the full profile. Measured against a captured CLI request
+(`opencode run`, v2.0.32) and this bridge on the same model:
+
+| | CLI | bridge, `core` | bridge, `full` |
+|---|---|---|---|
+| tools | 12 | 2 | 12 |
+| tool schema bytes | 13,991 | 2,522 | 12,865 |
+| system prompt chars | 12,251 | 128 | 250 |
+| `max_completion_tokens` | 32,000 | 5,120 | 5,120 |
+| total body bytes | 26,262 | 2,864 | 13,329 |
+
+`TOOL_PROFILE_SCOPE=full` closes the tool gap and is the safer default when a
+deployment is being throttled ahead of the CLI. The remaining gap is the
+system prompt: the bridge does not ship the CLI's harness prompt, so a request
+still looks lighter than a real CLI turn. This is not a shape-gate failure —
+the gate accepts it — but it does mean the bridge is not byte-identical to the
+CLI.
+
+```bash
+# systemd drop-in for a service that runs as a dedicated user
+sudo mkdir -p /etc/systemd/system/opencode-free-bridge.service.d
+printf '[Service]\nEnvironment=TOOL_PROFILE_SCOPE=full\n' \
+  | sudo tee /etc/systemd/system/opencode-free-bridge.service.d/10-tool-profile.conf
+sudo systemctl daemon-reload && sudo systemctl restart opencode-free-bridge.service
+```
+
+### Reverse tunnel dies while the process still looks healthy
+
+A deployment that reaches the bridge over `ssh -R` can fail in a way systemd
+cannot see: the `ssh` process stays `active`, the TCP connection stays `ESTAB`,
+and the listener on the far end is gone. `Restart=always` never fires because
+the process never exits. This cost two hours of downtime on a five-node
+deployment before it was diagnosed.
+
+The only reliable probe is the endpoint itself. Run it on the host that owns the
+forwarded port, not on the node:
+
+```bash
+#!/bin/bash
+# /usr/local/bin/opencode-tunnel-watchdog.sh — run as root via a systemd timer
+PORT=20136
+LOG=/var/log/opencode-tunnel-watchdog.log
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG"; }
+
+if ! curl -sf --max-time 5 http://127.0.0.1:20129/health >/dev/null; then
+  log "bridge DOWN - restarting"; systemctl restart opencode-bridge.service; sleep 4
+fi
+if ! pgrep -f "ssh .*-R 127.0.0.1:${PORT}:" >/dev/null; then
+  log "tunnel MISSING - restarting"; systemctl restart opencode-tunnel.service; sleep 6
+fi
+pgrep -f "ssh .*-R 127.0.0.1:${PORT}:" >/dev/null \
+  && log "SUMMARY ok" || log "SUMMARY FAILED - manual attention needed"
+```
+
+Pair it with a `oneshot` service and a `OnUnitActiveSec=60` timer. The
+`SUMMARY` line is deliberate: without a heartbeat, an empty log is
+indistinguishable from a watchdog that never ran.
+
+Restarting the tunnel from a remote host over SSH needs care. `Defaults use_pty`
+in `/etc/sudoers` makes `sudo -n` fail with "a password is required" even when
+`NOPASSWD` is granted, and a nested `ssh host "python3 -c \"...\""` mangles
+quotes. Run the watchdog **as root on the node itself** through systemd instead
+of driving it remotely.
+
 ### Checking service logs
 
 ```bash
