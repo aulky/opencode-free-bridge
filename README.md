@@ -465,7 +465,76 @@ identity sync, and the self-updater.
   `/data/state` (`OPENCODE_BRIDGE_STATE_DIR`) so the setting survives a
   recreate. Plain `docker run` needs that env var and volume too.
 
-`/health` reports `egress.mode` (`proxy`, `relay`, or `direct`) plus
+### Egress pool
+
+The free-tier allowance is per egress IP, not per account. Running one bridge
+per host multiplies processes, service units and tunnels without giving anything
+a pool does not: the pool rotates the egress while one process keeps the
+identity, the catalog and the session cache in one place.
+
+A pool is a list of egress entries. Each keeps its own health, so an entry that
+upstream throttles is skipped until its cooldown ends instead of being retried
+by every request.
+
+```bash
+# in the panel under "Pool egress", one entry per line
+med1=http://pool:token@127.0.0.1:20251
+med2=http://pool:token@127.0.0.1:20252
+```
+
+```bash
+# operator override: comma- or newline-separated, label=url optional
+UPSTREAM_PROXY_POOL="med1=http://a:1,med2=http://b:2" \
+UPSTREAM_PROXY_STRATEGY=failover \
+  bun server.js
+```
+
+- **Entry shape:** a URL string, `{id,label,url,enabled,weight}`, or
+  `{direct: true}` for this machine's own address. `direct` is a first-class
+  entry, so the hosting IP can take part in the rotation instead of being the
+  fallback used only when every proxy is down.
+- **Strategies:** `round-robin` (default; even spread across healthy entries),
+  `failover` (sticky on the first healthy entry, which keeps upstream prompt
+  caching on one IP), `random` (weighted).
+- **Cooldown:** a refusal on a pooled egress is recorded against *that* entry.
+  The backoff doubles per consecutive failure from `cooldownMs` (default 120 s)
+  up to `maxCooldownMs` (default 30 min); a success resets it. A `429` earns four
+  times the base window because it is an unambiguous allowance answer.
+- **Always sends:** when every entry is cooling, the one that recovers first is
+  used anyway. Refusing would turn a throttled pool into a dead bridge, and
+  upstream answers a throttled IP with a normal refusal the caller already
+  handles.
+- **Failover on a gate rejection:** the bridge drops the entry that was refused
+  and retries through a different one, in the same request. An unreachable proxy
+  is also failed over, since nothing reached upstream.
+- **One egress per request:** the protocol-lane, endpoint-migration, 5xx and
+  gate retries all reuse the entry the request started on, because upstream ties
+  a retry to the address that saw the first attempt. Only the two cases above
+  move it.
+- **`/health`** reports `egress.mode: "pool"` and `egress.proxy.pool` with each
+  entry's host, state, remaining cooldown and failure count. Credentials are
+  never included.
+
+#### Turning a host into a pool member
+
+`egress-proxy.js` is a dependency-free HTTP proxy for exactly this: it answers
+`CONNECT` and absolute-URI HTTP, and forwards bytes without inspecting them.
+Its TLS is tunneled end to end, so it never sees plaintext.
+
+```bash
+# on the node
+PORT=8888 EGRESS_PROXY_TOKEN=secret bun egress-proxy.js
+
+# from the bridge host: put it on a loopback port, so the proxy itself is never
+# exposed and the tunnel carries the authentication
+ssh -L 127.0.0.1:20251:127.0.0.1:8888 node
+```
+
+`/healthz` is unauthenticated on purpose: it reports a connection count and an
+uptime, nothing about the target or the token, so a monitor does not need the
+credential to ask whether the proxy is up.
+
+`/health` reports `egress.mode` (`pool`, `proxy`, `relay`, or `direct`) plus
 `egress.proxy` with the same credential-free description.
 
 The proxy applies *in addition to* the relay: with both configured, the request

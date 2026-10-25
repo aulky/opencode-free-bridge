@@ -1,5 +1,63 @@
 # Changelog
 
+## [2.3.0] — 2026-10-25
+
+Egress pool: one bridge, many exit IPs.
+
+The free-tier allowance is per egress IP, so the previous answer to "I need more
+IPs" was one bridge process per host: eight hosts, eight service units, eight
+tunnels, eight catalogs to keep in step. The pool moves that rotation into the
+one thing that already makes the request, and the per-host process goes away.
+
+### Pool (`proxy.js`, `server.js`)
+
+- A pool is a list of entries (`url`, `{id,label,url,enabled,weight}`, or
+  `{direct: true}` for the hosting machine's own address). `direct` is a
+  first-class entry, so the bridge host's IP takes part in the rotation instead
+  of being the fallback used only when every proxy is down.
+- Strategies: `round-robin` (default), `failover` (sticky, preserving upstream
+  prompt caching on one IP), `random` (weighted).
+- Health is per entry and keyed by egress identity, not by URL, so `direct`
+  cannot share a record with a proxy. Backoff doubles per consecutive failure
+  from `cooldownMs` (120 s) up to `maxCooldownMs` (30 min); a success resets it.
+  A `429` earns four times the base window.
+- When every entry is cooling the one that recovers first is used anyway:
+  refusing to send would turn a throttled pool into a dead bridge.
+- A gate rejection drops the refused entry and retries through a different one
+  inside the same request. An unreachable proxy is failed over too, because
+  nothing reached upstream; that path used to surface a 500 to the client.
+- Every non-egress retry (protocol lane, endpoint migration, 5xx, gate shape)
+  reuses the entry the request started on, since upstream ties a retry to the
+  address that saw the first attempt.
+- `UPSTREAM_PROXY_POOL` / `UPSTREAM_PROXY_STRATEGY` are operator overrides that
+  lock runtime edits, matching `UPSTREAM_PROXY_URL`.
+
+### Egress proxy (`egress-proxy.js`)
+
+A dependency-free HTTP proxy so a host can become a pool member without root, a
+package install, or a config file: CONNECT plus absolute-URI HTTP, optional
+`EGRESS_PROXY_TOKEN` (Basic, password only), unauthenticated `/healthz` carrying
+nothing but a connection count and uptime. TLS is tunneled end to end, so it
+never sees plaintext. It binds loopback; reachability is the tunnel's job.
+
+`egress-proxy.js` ships through `UPDATE_FILES`, `install.sh` and `package.json`
+`files[]`, and `install.sh` marks it executable.
+
+### Panel
+
+`/` gains a pool section: one proxy per line (`label=url`), strategy selector,
+*Uji semua* (probes every entry concurrently and records the verdict in the same
+health map the request path uses), *Simpan pool*, and *Kosongkan pool*. The
+status block lists each entry with its state, remaining cooldown, failure count
+and last error.
+
+### Fixed
+
+- `pick({exclude})` let a round-robin selection return the excluded entry,
+  defeating the retry-on-another-egress path entirely.
+- `withProxy({}, "")` treated the `direct` entry's empty URL as "no egress" and
+  fell back to a pool pick, so an explicitly pinned direct egress was ignored.
+
 ## [2.2.2] — 2026-10-25
 
 Fleet release: the catalog-freeze fix plus the delivery fixes below. Every

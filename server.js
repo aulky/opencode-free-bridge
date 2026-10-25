@@ -205,6 +205,7 @@ const UPDATE_FILES = [
   "tunnel-doctor.sh",
   "proxy.js",
   "panel.js",
+  "egress-proxy.js",
   "server.js",
   "THIRD_PARTY_NOTICES.md",
 ];
@@ -430,14 +431,58 @@ function syncUserAgent() {
  *
  * A configured egress proxy applies to whichever URL is finally fetched, so a
  * relay deployment can itself be dialled through the proxy.
+ *
+ * `egressUrl` pins the egress for this call. The chat handler picks one egress
+ * per request and reuses it across retries, so a retry that must stay on the IP
+ * that answered does not silently move to a different one mid-conversation.
+ * Without it, a pool picks per call.
  */
-function upstreamFetch(url, init) {
-  if (!UPSTREAM_RELAY_URL) return proxy.netFetch(url, init);
+function upstreamFetch(url, init, egressUrl = null) {
+  if (!UPSTREAM_RELAY_URL) return proxy.netFetch(url, init, egressUrl);
   const parsed = new URL(url);
   const headers = { ...(init.headers || {}) };
   headers["x-relay-target"] = parsed.origin;
   headers["x-relay-path"] = parsed.pathname + parsed.search;
-  return proxy.netFetch(UPSTREAM_RELAY_URL, { ...init, headers });
+  return proxy.netFetch(UPSTREAM_RELAY_URL, { ...init, headers }, egressUrl);
+}
+
+/**
+ * Send a request through the chosen egress, and move to the next pool entry when
+ * the egress itself is unreachable.
+ *
+ * A dead proxy is not an upstream refusal: nothing reached upstream, so retrying
+ * on another entry costs one connection, while returning a 500 to the client
+ * wastes the request entirely. This is the failure mode a pool exists to absorb.
+ *
+ * With one proxy (or none) there is nothing to fail over to, so the transport
+ * error is rethrown for the caller's existing handling.
+ */
+async function egressFetch(url, init, state) {
+  try {
+    const res = await upstreamFetch(url, init, state.egressUrl);
+    state.transportFailures = 0;
+    return res;
+  } catch (err) {
+    const pool = proxy.describe().pool;
+    const canFailover = pool && pool.active && pool.enabled > 1;
+    if (!canFailover || !state.egressUrl) throw err;
+
+    proxy.markFailure(state.egressUrl, { reason: `transport: ${err.message}`.slice(0, 200) });
+    const next = proxy.pick({ exclude: state.egressUrl });
+    if (!next.url || next.url === state.egressUrl) throw err;
+
+    console.warn(
+      `[opencode-free-bridge] Egress ${
+        proxy.displayHost(state.egressUrl) || "direct"
+      } unreachable (${err.message}); retrying through ${proxy.displayHost(next.url) || "direct"}`
+    );
+    state.egress = next;
+    state.egressUrl = next.url;
+    state.transportFailures = (state.transportFailures || 0) + 1;
+    // One hop only. A pool where every entry is down must surface the error
+    // instead of walking the whole list inside a single client request.
+    return upstreamFetch(url, init, state.egressUrl);
+  }
 }
 
 function isValidV2UserAgent(ua) {
@@ -1679,26 +1724,75 @@ async function handleProxyApi(req, res, pathname) {
 
   let payload = {};
   try {
-    const text = await readRequestBody(req, 16 * 1024);
+    const text = await readRequestBody(req, 128 * 1024);
     payload = text ? JSON.parse(text) : {};
   } catch (err) {
     return send(err.statusCode === 413 ? 413 : 400, { error: `Body tidak valid: ${err.message}` });
   }
-  if (!payload || typeof payload !== "object" || typeof payload.url !== "string") {
-    return send(400, { error: "Body harus berupa objek dengan field string 'url'." });
+  if (!payload || typeof payload !== "object") {
+    return send(400, { error: "Body harus berupa objek JSON." });
   }
 
-  if (pathname === "/api/proxy/test") {
+  // Pool management. `entries` replaces the whole pool; `pool: []` clears it.
+  // Kept apart from the single-proxy `url` field so one request cannot mean two
+  // different things, and so an operator can keep a single proxy configured as a
+  // fallback while experimenting with a pool.
+  const hasPool = Object.prototype.hasOwnProperty.call(payload, "entries") ||
+    Object.prototype.hasOwnProperty.call(payload, "pool");
+  if (hasPool && pathname === "/api/proxy") {
+    const spec = Object.prototype.hasOwnProperty.call(payload, "entries")
+      ? { entries: payload.entries, strategy: payload.strategy, cooldownMs: payload.cooldownMs, maxCooldownMs: payload.maxCooldownMs }
+      : payload.pool;
+    const result = proxy.setPool(spec);
+    if (!result.ok) return send(400, { error: result.error });
+    console.log(
+      `[opencode-free-bridge] Egress pool: ${result.pool.enabled}/${result.pool.size} aktif, strategi ${result.pool.strategy}`
+    );
+    return send(200, result);
+  }
+
+  if (pathname === "/api/proxy/test" && Array.isArray(payload.entries)) {
+    const { entries } = payload;
+    if (entries.length === 0) return send(400, { error: "Daftar entries kosong." });
+    // Probe without installing: the caller is evaluating candidates.
+    const results = [];
+    for (const [index, entry] of entries.entries()) {
+      const parsed = proxy.parsePoolEntry(entry, index);
+      if (!parsed.ok) {
+        results.push({ id: `#${index + 1}`, host: null, ok: false, error: parsed.error });
+        continue;
+      }
+      const verdict = await proxy.testProxy(parsed.entry.url, { probeUrl: resolveEndpoints().modelsUrl });
+      results.push({
+        id: parsed.entry.id,
+        label: parsed.entry.label,
+        host: proxy.displayHost(parsed.entry.url),
+        ok: verdict.ok,
+        apiStatus: verdict.apiStatus || null,
+        exitIp: verdict.exitIp || null,
+        latencyMs: verdict.latencyMs || null,
+        error: verdict.error || null,
+      });
+    }
+    const anyOk = results.some((r) => r.ok);
+    return send(anyOk ? 200 : 502, { ok: anyOk, entries: results });
+  }
+
+  if (pathname === "/api/proxy/test" && typeof payload.url === "string") {
     const result = await proxy.testProxy(payload.url, { probeUrl: resolveEndpoints().modelsUrl });
     return send(result.ok ? 200 : 502, result);
   }
 
-  const result = proxy.setProxyUrl(payload.url);
-  if (!result.ok) return send(400, { error: result.error });
-  console.log(
-    `[opencode-free-bridge] Egress ${result.mode === "proxy" ? `via proxy ${result.proxy}` : "direct"}`
-  );
-  return send(200, result);
+  if (typeof payload.url === "string") {
+    const result = proxy.setProxyUrl(payload.url);
+    if (!result.ok) return send(400, { error: result.error });
+    console.log(
+      `[opencode-free-bridge] Egress ${result.mode === "proxy" ? `via proxy ${result.proxy}` : "direct"}`
+    );
+    return send(200, result);
+  }
+
+  return send(400, { error: "Body harus berisi 'url' (satu proxy) atau 'entries' (pool)." });
 }
 
 function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
@@ -1865,12 +1959,19 @@ function handleRequest(req, res) {
         runtime: typeof Bun !== "undefined" ? `bun/${Bun.version}` : `node/${process.versions.node}`,
         discoveredModels: activeModels.length,
         // Egress in force. `mode` is what actually carries the request: the
-        // proxy when one is configured, otherwise the relay, otherwise direct.
-        // `proxy.mode` only reports whether a proxy exists, so a relay-only
-        // deployment still reads as `relay` here. Credentials are never
-        // included; `proxy.proxy` is host:port only.
+        // pool when one is configured, otherwise a single proxy, otherwise the
+        // relay, otherwise direct. `proxy.mode` only reports the configured
+        // shape, so a relay-only deployment still reads as `relay` here.
+        // Credentials are never included; every host in `proxy` is host:port.
         egress: {
-          mode: proxyState.mode === "proxy" ? "proxy" : UPSTREAM_RELAY_URL ? "relay" : "direct",
+          mode:
+            proxyState.mode === "pool"
+              ? "pool"
+              : proxyState.mode === "proxy"
+                ? "proxy"
+                : UPSTREAM_RELAY_URL
+                  ? "relay"
+                  : "direct",
           ...(UPSTREAM_RELAY_URL ? { relay: relayLabel(UPSTREAM_RELAY_URL) } : {}),
           proxy: proxyState,
         },
@@ -2082,12 +2183,22 @@ function handleRequest(req, res) {
         let liveEndpoints = resolveEndpoints(targetModel);
         let upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
 
-        let upstreamRes = await upstreamFetch(upstreamUrl, {
+        // One egress per client request. Everything below — the protocol-lane
+        // retry, the endpoint-migration retry, the 5xx retry, and the gate retry
+        // — reuses it, because upstream ties a retry to the address that saw the
+        // first attempt. Only two things move it: an unreachable proxy (the
+        // request never left) and a gate rejection that names this egress as the
+        // problem. Both are handled where they happen and update this state.
+        const egressState = { egress: proxy.pick(), egressUrl: null, transportFailures: 0 };
+        egressState.egressUrl = egressState.egress.url;
+        const egressUrl = () => egressState.egressUrl;
+
+        let upstreamRes = await egressFetch(upstreamUrl, {
           method: "POST",
           headers: upstreamHeaders,
           body: JSON.stringify(upstreamBody),
           signal: abortController.signal,
-        });
+        }, egressState);
 
         // If a newly released model requires the opposite protocol lane, learn it
         // and transparently retry once on the matching lane.
@@ -2115,7 +2226,7 @@ function handleRequest(req, res) {
               headers: upstreamHeaders,
               body: JSON.stringify(upstreamBody),
               signal: abortController.signal,
-            });
+            }, egressUrl());
           } else {
             res.writeHead(400, { "Content-Type": "application/json" });
             return res.end(
@@ -2173,7 +2284,7 @@ function handleRequest(req, res) {
                 headers: upstreamHeaders,
                 body: JSON.stringify(upstreamBody),
                 signal: abortController.signal,
-              });
+              }, egressUrl());
               // The text above belonged to the response we just replaced. Reading
               // it for the new response would report the old error verbatim.
               consumedErrorText = null;
@@ -2205,7 +2316,7 @@ function handleRequest(req, res) {
             headers: retry5xxHeaders,
             body: JSON.stringify(upstreamBody),
             signal: abortController.signal,
-          });
+          }, egressUrl());
           consumedErrorText = null;
         }
 
@@ -2244,6 +2355,9 @@ function handleRequest(req, res) {
           // CLI gets the same refusal from the same IP. Return it verbatim and
           // leave the identity layer untouched.
           if (identity.isIpAbuseRejection(upstreamRes.status, rawMsg)) {
+            // The block is keyed to this network's IP, so this egress is the
+            // problem: park it so the next request leaves through another entry.
+            if (egressState.egressUrl) proxy.markFailure(egressState.egressUrl, { reason: "ip-abuse block" });
             return respondIpAbuse(
               res,
               upstreamRes.status,
@@ -2327,6 +2441,30 @@ function handleRequest(req, res) {
             lastFailedGateRetryEpoch === currentEpoch;
 
           if (!skipCooldownRetry) {
+            // A gate rejection on a pooled egress is the one case where the
+            // bridge can act on it locally: the allowance is per IP, so a
+            // different entry is a different allowance. Failed over before the
+            // retry so the retry is a genuinely different request in both shape
+            // and egress. The old entry is put in cooldown; with a single proxy
+            // (or none) `pick()` hands back the same egress and this is a no-op.
+            const pooled = proxy.describe().pool;
+            const canFailover = pooled && pooled.active && pooled.enabled > 1;
+            if (canFailover && egressState.egressUrl) {
+              proxy.markFailure(egressState.egressUrl, {
+                reason: `gate ${gateStatus}`,
+                cooldownMs: gateStatus === 429 ? pooled.cooldownMs * 4 : null,
+              });
+              const next = proxy.pick({ exclude: egressState.egressUrl });
+              if (next.url && next.url !== egressState.egressUrl) {
+                console.warn(
+                  `[opencode-free-bridge] Gate refused egress ${
+                    proxy.displayHost(egressState.egressUrl) || "direct"
+                  } (${gateStatus}); moving to ${proxy.displayHost(next.url) || "direct"} for the retry`
+                );
+                egressState.egress = next;
+                egressState.egressUrl = next.url;
+              }
+            }
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}, ${verdict.reason || "unknown"}); refreshing identity and retrying once with full tool set`
             );
@@ -2347,7 +2485,7 @@ function handleRequest(req, res) {
               headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
               signal: abortController.signal,
-            });
+            }, egressUrl());
           } else {
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}); skipping retry because a full-shape retry already failed <${Math.round(GATE_RETRY_COOLDOWN_MS / 1000)}s ago on the current identity (IP cooldown active)`
@@ -2407,6 +2545,7 @@ function handleRequest(req, res) {
                 lastFailedGateRetryTime = Date.now();
                 lastFailedGateRetryEpoch = identity.getState().epoch || 0;
               }
+              if (egressState.egressUrl) proxy.markFailure(egressState.egressUrl, { reason: "ip-abuse block" });
               return respondIpAbuse(
                 res,
                 retryStatus,
@@ -2427,6 +2566,20 @@ function handleRequest(req, res) {
             } else if (!skipCooldownRetry && isFreeTierCliGateError(retryStatus, retryType, retryMsg)) {
               lastFailedGateRetryTime = Date.now();
               lastFailedGateRetryEpoch = identity.getState().epoch || 0;
+            }
+            // The egress that produced *this* refusal is spent: record it so the
+            // next request picks a different entry instead of relearning the
+            // same throttle. A 429 is an unambiguous allowance answer, so it
+            // earns a longer cooldown than a 403 whose cause the bridge cannot
+            // fully separate from a shape problem.
+            {
+              const poolState = proxy.describe().pool;
+              if (poolState && poolState.active && egressState.egressUrl) {
+                proxy.markFailure(egressState.egressUrl, {
+                  reason: capacity ? "allowance 429" : `gate ${retryStatus}`,
+                  cooldownMs: capacity ? poolState.cooldownMs * 4 : null,
+                });
+              }
             }
 
             // The gate answers the same `403 FreeTierError` for a blocked egress
@@ -2500,6 +2653,9 @@ function handleRequest(req, res) {
 
         lastFailedGateRetryTime = 0;
         lastIpAbuseAt = 0;
+        // This egress carried a request upstream accepted, so its failure
+        // history is stale: clear it so the next pick treats it as healthy.
+        if (egressState.egressUrl) proxy.markSuccess(egressState.egressUrl);
         const completionId = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
         const created = Math.floor(Date.now() / 1000);
         reader = upstreamRes.body.getReader();

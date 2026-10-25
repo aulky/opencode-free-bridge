@@ -339,3 +339,234 @@ describe("panel document", () => {
     assert.match(html, /form\.addEventListener\("submit"/);
   });
 });
+
+describe("egress pool", () => {
+  beforeEach(() => {
+    emptyStateDir();
+    delete process.env.UPSTREAM_PROXY_POOL;
+    delete process.env.UPSTREAM_PROXY_STRATEGY;
+    proxy.__reload();
+    proxy.resetHealth();
+  });
+
+  after(() => {
+    delete process.env.UPSTREAM_PROXY_POOL;
+    delete process.env.UPSTREAM_PROXY_STRATEGY;
+  });
+
+  it("parses a pool from URLs, label=url lines, and objects", () => {
+    const spec = proxy.parsePoolSpec("http://a:1, med2=http://b:2");
+    assert.equal(spec.errors.length, 0);
+    assert.deepEqual(spec.entries.map((e) => [e.label, e.url]), [
+      ["a:1", "http://a:1"],
+      ["med2", "http://b:2"],
+    ]);
+
+    const fromObject = proxy.parsePoolEntry({ id: "x", label: "Laptop", url: "http://c:3", weight: 5 }, 0);
+    assert.equal(fromObject.ok, true);
+    assert.equal(fromObject.entry.weight, 5);
+    // A weight only has to be relative, and an omitted one is 1.
+    assert.equal(proxy.parsePoolEntry("http://d:4", 0).entry.weight, 1);
+  });
+
+  it("refuses a malformed or duplicated entry instead of installing half a pool", () => {
+    assert.match(proxy.parsePoolSpec("socks5://a:1").errors[0], /SOCKS5/);
+    assert.equal(proxy.parsePoolEntry({}, 3).ok, false);
+
+    const dup = proxy.setPool(["http://a:1", "http://a:1"]);
+    assert.equal(dup.ok, false);
+    assert.match(dup.error, /ganda/);
+    assert.equal(proxy.describe().pool.active, false);
+  });
+
+  it("persists the pool with 0600 and reports host:port only", () => {
+    const saved = proxy.setPool({
+      entries: ["http://u:secret@a:1", { label: "b", url: "http://b:2", weight: 3 }],
+      strategy: "failover",
+    });
+    assert.equal(saved.ok, true);
+    assert.equal(saved.mode, "pool");
+    assert.equal(saved.pool.size, 2);
+    assert.equal(saved.pool.strategy, "failover");
+    assert.equal(saved.raw ?? JSON.stringify(saved).includes("secret"), false);
+    assert.equal(JSON.stringify(saved).includes("secret"), false, "describe() must not leak credentials");
+
+    const file = proxy.configFile();
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    const onDisk = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(onDisk.pool.length, 2);
+    assert.equal(onDisk.strategy, "failover");
+
+    // A fresh process reads the same pool.
+    proxy.__reload();
+    assert.equal(proxy.getPool().length, 2);
+    assert.equal(proxy.describe().pool.enabled, 2);
+  });
+
+  it("rotates round-robin across enabled entries", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2", "http://c:3"], strategy: "round-robin" });
+    const picked = [proxy.pick(), proxy.pick(), proxy.pick(), proxy.pick()].map((p) => p.url);
+    assert.deepEqual(picked, ["http://a:1", "http://b:2", "http://c:3", "http://a:1"]);
+  });
+
+  it("stays on the first healthy entry in failover mode", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"], strategy: "failover" });
+    assert.equal(proxy.pick().url, "http://a:1");
+    assert.equal(proxy.pick().url, "http://a:1");
+    proxy.markFailure("http://a:1", { reason: "gate 429" });
+    assert.equal(proxy.pick().url, "http://b:2");
+  });
+
+  it("skips a cooling entry and returns to it once the cooldown ends", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"], strategy: "round-robin" });
+    const cooldown = proxy.markFailure("http://a:1", { reason: "allowance 429", cooldownMs: 60000 });
+    assert.equal(cooldown.failures, 1);
+    assert.ok(cooldown.cooldownUntil > Date.now());
+
+    const state = proxy.describe();
+    const a = state.pool.entries.find((e) => e.host === "a:1");
+    assert.equal(a.state, "cooling");
+    assert.equal(state.pool.ready, 1);
+
+    // Every pick now lands on the healthy entry.
+    assert.deepEqual([proxy.pick(), proxy.pick(), proxy.pick()].map((p) => p.url), [
+      "http://b:2",
+      "http://b:2",
+      "http://b:2",
+    ]);
+
+    // Time moves on: a's cooldown is over, so it is a candidate again.
+    const later = Date.now() + 61000;
+    assert.equal(proxy.describe(later).pool.ready, 2);
+  });
+
+  it("backs off further on each consecutive failure, capped, and resets on success", () => {
+    proxy.setPool({ entries: ["http://a:1"], cooldownMs: 1000, maxCooldownMs: 4000 });
+    const first = proxy.markFailure("http://a:1");
+    const second = proxy.markFailure("http://a:1");
+    const third = proxy.markFailure("http://a:1");
+    assert.equal(first.backoffMs, 1000);
+    assert.equal(second.backoffMs, 2000);
+    assert.equal(third.backoffMs, 4000);
+    // Capped: the fourth failure does not exceed maxCooldownMs.
+    assert.equal(proxy.markFailure("http://a:1").backoffMs, 4000);
+
+    proxy.markSuccess("http://a:1");
+    assert.equal(proxy.describe().pool.entries[0].state, "ready");
+    assert.equal(proxy.describe().pool.entries[0].failures, 0);
+    assert.equal(proxy.markFailure("http://a:1").backoffMs, 1000);
+  });
+
+  it("still sends through the least-cooling entry when every entry is throttled", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
+    proxy.markFailure("http://a:1", { reason: "gate 429", cooldownMs: 9000 });
+    proxy.markFailure("http://b:2", { reason: "gate 429", cooldownMs: 3000 });
+    const picked = proxy.pick();
+    assert.equal(picked.cooling, true);
+    // b recovers first, so it is the one used.
+    assert.equal(picked.url, "http://b:2");
+  });
+
+  it("honours exclude so a retry can leave the egress that just failed", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
+    assert.equal(proxy.pick({ exclude: "http://a:1" }).url, "http://b:2");
+    // Excluding everything falls back to the pool instead of returning nothing.
+    assert.ok(proxy.pick({ exclude: "http://a:1" }).url);
+  });
+
+  it("injects the picked entry as proxy: and never overrides a caller's own", () => {
+    proxy.setPool({ entries: ["http://a:1"] });
+    assert.equal(proxy.withProxy({}).proxy, "http://a:1");
+    assert.equal(proxy.withProxy({ proxy: "http://pinned:9" }).proxy, "http://pinned:9");
+    // An explicit egress wins over the pool's rotation.
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
+    assert.equal(proxy.withProxy({}, "http://c:3").proxy, "http://c:3");
+  });
+
+  it("reads UPSTREAM_PROXY_POOL from the environment and locks runtime edits", () => {
+    process.env.UPSTREAM_PROXY_POOL = "one=http://a:1,two=http://b:2";
+    process.env.UPSTREAM_PROXY_STRATEGY = "failover";
+    proxy.__reload();
+    try {
+      assert.equal(proxy.getPool().length, 2);
+      assert.equal(proxy.describe().pool.strategy, "failover");
+      assert.equal(proxy.describe().locked, true);
+      const attempt = proxy.setPool(["http://c:3"]);
+      assert.equal(attempt.ok, false);
+      assert.match(attempt.error, /UPSTREAM_PROXY_POOL/);
+    } finally {
+      delete process.env.UPSTREAM_PROXY_POOL;
+      delete process.env.UPSTREAM_PROXY_STRATEGY;
+      proxy.__reload();
+    }
+  });
+
+  it("clearing the pool falls back to direct egress", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
+    const cleared = proxy.setPool({ entries: [] });
+    assert.equal(cleared.ok, true);
+    assert.equal(cleared.mode, "direct");
+    assert.equal(proxy.getPool().length, 0);
+    assert.equal(proxy.pick().url, "");
+  });
+
+  it("keeps a single proxy configured when a pool is cleared", () => {
+    proxy.setProxyUrl("http://single:9");
+    proxy.setPool({ entries: ["http://a:1"] });
+    assert.equal(proxy.describe().mode, "pool");
+
+    proxy.setPool({ entries: [] });
+    assert.equal(proxy.describe().mode, "proxy");
+    assert.equal(proxy.getProxyUrl(), "http://single:9");
+  });
+});
+
+describe("egress pool: direct entry", () => {
+  beforeEach(() => {
+    emptyStateDir();
+    delete process.env.UPSTREAM_PROXY_POOL;
+    proxy.__reload();
+    proxy.resetHealth();
+  });
+
+  it("accepts { direct: true } and reports it distinctly", () => {
+    const saved = proxy.setPool({ entries: [{ direct: true, label: "petafora" }, "http://a:1"] });
+    assert.equal(saved.ok, true);
+    assert.deepEqual(
+      saved.pool.entries.map((e) => [e.label, e.host, e.state]),
+      [
+        ["petafora", "direct", "ready"],
+        ["a:1", "a:1", "ready"],
+      ]
+    );
+  });
+
+  it("returns an empty egress for the direct entry, so the fetch goes out unproxied", () => {
+    proxy.setPool({ entries: [{ direct: true }, "http://a:1"], strategy: "failover" });
+    const first = proxy.pick();
+    assert.equal(first.url, "");
+    assert.equal(first.source, "direct");
+
+    // withProxy must leave the init alone for a direct egress even when an
+    // explicit empty target is passed.
+    assert.deepEqual(proxy.withProxy({ headers: { a: "b" } }, ""), { headers: { a: "b" } });
+  });
+
+  it("keeps direct and a proxy independent in health", () => {
+    proxy.setPool({ entries: [{ direct: true }, "http://a:1"], strategy: "round-robin" });
+    proxy.markFailure("", { reason: "gate 429" });
+    const state = proxy.describe();
+    const directEntry = state.pool.entries.find((e) => e.host === "direct");
+    const proxyEntry = state.pool.entries.find((e) => e.host === "a:1");
+    assert.equal(directEntry.failures, 1);
+    assert.equal(proxyEntry.failures, 0);
+    // The healthy proxy is the only candidate now.
+    assert.equal(proxy.pick().url, "http://a:1");
+  });
+
+  it("refuses a second direct entry as a duplicate", () => {
+    const result = proxy.setPool([{ direct: true }, { direct: true, label: "again" }]);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /direct/);
+  });
+});

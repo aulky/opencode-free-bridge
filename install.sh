@@ -160,7 +160,7 @@ if [ -n "$PREV_VERSION" ]; then
   say "Found existing install: v$PREV_VERSION in $BINDIR"
   BACKUP="$BINDIR/.backup-v$PREV_VERSION-$(date +%Y%m%d%H%M%S)"
   mkdir -p "$BACKUP"
-  for f in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json package.json tunnel-doctor.sh proxy.js panel.js THIRD_PARTY_NOTICES.md; do
+  for f in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json package.json tunnel-doctor.sh proxy.js panel.js egress-proxy.js THIRD_PARTY_NOTICES.md; do
     [ -f "$BINDIR/$f" ] && cp -p "$BINDIR/$f" "$BACKUP/$f" 2>/dev/null || true
   done
   say "Backed up to $BACKUP"
@@ -451,10 +451,10 @@ if [ -n "$(port_holder)" ]; then
   die "cannot bind port $PORT"
 fi
 
-for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json tunnel-doctor.sh proxy.js panel.js THIRD_PARTY_NOTICES.md; do
+for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json tunnel-doctor.sh proxy.js panel.js egress-proxy.js THIRD_PARTY_NOTICES.md; do
   [ -f "$STAGE/$file" ] && mv -f "$STAGE/$file" "$BINDIR/$file"
 done
-chmod +x "$BINDIR/server.js" "$BINDIR/identity.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" "$BINDIR/transport-fingerprint.js" "$BINDIR/tunnel-doctor.sh" 2>/dev/null || true
+chmod +x "$BINDIR/server.js" "$BINDIR/identity.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" "$BINDIR/transport-fingerprint.js" "$BINDIR/tunnel-doctor.sh" "$BINDIR/egress-proxy.js" 2>/dev/null || true
 say "Files installed (v$("$RUNTIME" -e 'try{process.stdout.write(require(process.argv[1]).version||"latest")}catch{process.stdout.write("latest")}' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
 
 # ---------------------------------------------------------------- service ---
