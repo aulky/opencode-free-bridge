@@ -1239,6 +1239,97 @@ describe("server unit & integration tests", () => {
       assert.equal(rateRes.body.error.message, "Endpoint is unavailable");
     });
 
+    it("moves to another pool entry when an egress is out of allowance", async () => {
+      // The failure this covers: a 429 never reaches the gate branch, so before
+      // this the pool recorded nothing and every later request picked the same
+      // spent IP. Measured on the fleet: six requests rotated six IPs, four of
+      // them answered 429, and /health still showed every entry ready.
+      const fs = require("node:fs");
+      const os = require("node:os");
+      const path = require("node:path");
+      const proxy = require("../proxy");
+
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-429-pool-"));
+      const previousStateDir = process.env.OPENCODE_BRIDGE_STATE_DIR;
+      process.env.OPENCODE_BRIDGE_STATE_DIR = stateDir;
+      delete process.env.UPSTREAM_PROXY_POOL;
+      proxy.__reload();
+      proxy.resetHealth();
+
+      try {
+        const saved = proxy.setPool({
+          entries: ["http://first:1", "http://second:2"],
+          strategy: "failover",
+          cooldownMs: 60000,
+        });
+        assert.equal(saved.ok, true);
+
+        const spent = new Set();
+        const usedEgress = [];
+        mockFetchImpl = async (_url, init) => {
+          // Bun's fetch carries the egress in `init.proxy`; the pool entry that
+          // was in force is what the test cares about.
+          const egress = init?.proxy || "direct";
+          usedEgress.push(egress);
+          if (egress === "http://first:1") {
+            spent.add(egress);
+            return {
+              ok: false,
+              status: 429,
+              text: async () =>
+                JSON.stringify({
+                  error: {
+                    type: "FreeUsageLimitError",
+                    message: "Free usage limit reached.",
+                  },
+                }),
+            };
+          }
+          return {
+            ok: true,
+            status: 200,
+            body: sseStreamFromLines([
+              'data: {"id":"1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\n',
+              "data: [DONE]\n\n",
+            ]),
+          };
+        };
+
+        const first = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "glm-5.3-flash-free",
+          messages: [{ role: "user", content: "pool-429" }],
+          stream: true,
+        });
+        assert.equal(first.status, 200, "the retry through a healthy entry must succeed");
+        assert.deepEqual(usedEgress, ["http://first:1", "http://second:2"]);
+
+        const state = proxy.describe();
+        const firstEntry = state.pool.entries.find((e) => e.host === "first:1");
+        const secondEntry = state.pool.entries.find((e) => e.host === "second:2");
+        assert.equal(firstEntry.state, "cooling", "the spent egress must be parked");
+        assert.equal(firstEntry.failures, 1);
+        assert.equal(secondEntry.state, "ready");
+        assert.equal(state.pool.ready, 1);
+
+        // The next request must not go back to the spent entry.
+        usedEgress.length = 0;
+        const second = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "glm-5.3-flash-free",
+          messages: [{ role: "user", content: "pool-429-again" }],
+          stream: true,
+        });
+        assert.equal(second.status, 200);
+        assert.deepEqual(usedEgress, ["http://second:2"]);
+      } finally {
+        proxy.setPool({ entries: [] });
+        proxy.resetHealth();
+        if (previousStateDir === undefined) delete process.env.OPENCODE_BRIDGE_STATE_DIR;
+        else process.env.OPENCODE_BRIDGE_STATE_DIR = previousStateDir;
+        proxy.__reload();
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
+    });
+
     it("retries once with a fresh session ID on transient upstream 5xx and recovers to 200", async () => {
       const seenSessions = [];
       let attempt = 0;

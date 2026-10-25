@@ -485,6 +485,20 @@ async function egressFetch(url, init, state) {
   }
 }
 
+/**
+ * Record a refusal against the egress that produced it.
+ *
+ * An empty URL is the `direct` pool entry, which is a real egress, so this
+ * cannot test truthiness: only a missing state means "nothing to record".
+ */
+function recordEgressFailure(state, { reason, cooldownMs = null } = {}) {
+  const url = state && state.egressUrl;
+  if (url === null || url === undefined) return;
+  const pool = proxy.describe().pool;
+  if (!pool || !pool.active) return;
+  proxy.markFailure(url, { reason, cooldownMs });
+}
+
 function isValidV2UserAgent(ua) {
   const match = String(ua || "")
     .trim()
@@ -2292,6 +2306,49 @@ function handleRequest(req, res) {
           }
         }
 
+        // Spent allowance on a pooled egress. A 429 means transport and request
+        // shape were both accepted and only this IP's quota is gone, so the one
+        // useful action is to spend the retry on a different IP instead of
+        // replaying an identical request at an address upstream just refused.
+        // The cooldown is recorded either way, so the next request also moves.
+        if (!upstreamRes.ok && upstreamRes.status === 429) {
+          const poolState = proxy.describe().pool;
+          const canFailover = poolState && poolState.active && poolState.enabled > 1;
+          recordEgressFailure(egressState, {
+            reason: "allowance 429",
+            cooldownMs: poolState ? poolState.cooldownMs * 4 : null,
+          });
+          if (canFailover) {
+            const next = proxy.pick({ exclude: egressState.egressUrl });
+            if (next.url !== egressState.egressUrl) {
+              console.warn(
+                `[opencode-free-bridge] Egress ${
+                  proxy.displayHost(egressState.egressUrl) || "direct"
+                } is out of allowance (429); retrying through ${
+                  proxy.displayHost(next.url) || "direct"
+                }`
+              );
+              egressState.egress = next;
+              egressState.egressUrl = next.url;
+              upstreamRes = await egressFetch(upstreamUrl, {
+                method: "POST",
+                headers: upstreamHeaders,
+                body: JSON.stringify(upstreamBody),
+                signal: abortController.signal,
+              }, egressState);
+              consumedErrorText = null;
+              // The retry may have landed on a second spent IP. Record it too,
+              // or the next request would pick it again and learn the same thing.
+              if (upstreamRes.status === 429) {
+                recordEgressFailure(egressState, {
+                  reason: "allowance 429",
+                  cooldownMs: poolState.cooldownMs * 4,
+                });
+              }
+            }
+          }
+        }
+
         // Transient 5xx self-heal: upstream Workers intermittently drop empty-body
         // HTTP 500/502/503/504 responses (e.g. cf-placement: remote-IAD) during
         // free-inference degradation. Retry once with fresh trace/session headers.
@@ -2357,7 +2414,7 @@ function handleRequest(req, res) {
           if (identity.isIpAbuseRejection(upstreamRes.status, rawMsg)) {
             // The block is keyed to this network's IP, so this egress is the
             // problem: park it so the next request leaves through another entry.
-            if (egressState.egressUrl) proxy.markFailure(egressState.egressUrl, { reason: "ip-abuse block" });
+            recordEgressFailure(egressState, { reason: "ip-abuse block" });
             return respondIpAbuse(
               res,
               upstreamRes.status,
@@ -2545,7 +2602,7 @@ function handleRequest(req, res) {
                 lastFailedGateRetryTime = Date.now();
                 lastFailedGateRetryEpoch = identity.getState().epoch || 0;
               }
-              if (egressState.egressUrl) proxy.markFailure(egressState.egressUrl, { reason: "ip-abuse block" });
+              recordEgressFailure(egressState, { reason: "ip-abuse block" });
               return respondIpAbuse(
                 res,
                 retryStatus,
@@ -2572,15 +2629,10 @@ function handleRequest(req, res) {
             // same throttle. A 429 is an unambiguous allowance answer, so it
             // earns a longer cooldown than a 403 whose cause the bridge cannot
             // fully separate from a shape problem.
-            {
-              const poolState = proxy.describe().pool;
-              if (poolState && poolState.active && egressState.egressUrl) {
-                proxy.markFailure(egressState.egressUrl, {
-                  reason: capacity ? "allowance 429" : `gate ${retryStatus}`,
-                  cooldownMs: capacity ? poolState.cooldownMs * 4 : null,
-                });
-              }
-            }
+            recordEgressFailure(egressState, {
+              reason: capacity ? "allowance 429" : `gate ${retryStatus}`,
+              cooldownMs: capacity ? proxy.describe().pool.cooldownMs * 4 : null,
+            });
 
             // The gate answers the same `403 FreeTierError` for a blocked egress
             // and for a request whose shape it refuses, so the status line and
@@ -2655,7 +2707,7 @@ function handleRequest(req, res) {
         lastIpAbuseAt = 0;
         // This egress carried a request upstream accepted, so its failure
         // history is stale: clear it so the next pick treats it as healthy.
-        if (egressState.egressUrl) proxy.markSuccess(egressState.egressUrl);
+        proxy.markSuccess(egressState.egressUrl);
         const completionId = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
         const created = Math.floor(Date.now() / 1000);
         reader = upstreamRes.body.getReader();

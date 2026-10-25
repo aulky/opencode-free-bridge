@@ -53,6 +53,18 @@ and last error.
 
 ### Fixed
 
+- A `429 FreeUsageLimitError` never marked its egress. `isFreeTierCliGateError`
+  only recognises 401/403/426, so the refusal fell into the generic non-gate
+  branch and the pool learned nothing. Measured on the fleet: six requests
+  rotated through six IPs, four answered 429, and `/health` still showed every
+  entry `ready` — the pool burned the whole rotation on every request. A 429 now
+  parks that entry (four base windows) and the same request retries through
+  another one.
+- A 5xx does *not* park the egress: that is upstream's fault, and treating it as
+  the IP's would empty the pool during a bad hour at the gateway.
+- `markFailure`/`markSuccess` treated the `direct` entry's empty URL as "nothing
+  to record", so an exhausted bridge host IP was never cooled down. Health is
+  keyed by egress identity now, and only a missing state means nothing to record.
 - `pick({exclude})` let a round-robin selection return the excluded entry,
   defeating the retry-on-another-egress path entirely.
 - `withProxy({}, "")` treated the `direct` entry's empty URL as "no egress" and
