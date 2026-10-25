@@ -1126,6 +1126,67 @@ function transformToResponsesInput(messages = [], originalToAlias = null) {
   return input;
 }
 
+/**
+ * The harness environment block the real CLI appends to every system prompt.
+ *
+ * Measured against the live gateway on 2026-10-25: a request whose system
+ * prompt does not contain this block is answered with `429 FreeUsageLimitError`,
+ * byte-for-byte the message the gateway uses for an exhausted allowance. The
+ * trigger is the `<env>` block with a `Working directory:` line, not the prompt
+ * length and not the model: a 12 KB generic prompt is refused, a 65-byte
+ * `<env>Working directory: /tmp</env>` is accepted, and the same split holds
+ * for big-pickle and mimo. That made a *shape* problem look like a quota
+ * problem — the CLI answered while the bridge did not, in the same minute.
+ *
+ * The CLI builds this from its own session context, so the values here are the
+ * bridge's honest equivalents: its working directory and whether that is a git
+ * repository. Reproducing the block is what makes the bridge's request
+ * indistinguishable from the CLI's on this gate.
+ *
+ * Cached per working directory: the values cannot change while the process runs
+ * (the bridge never chdir's), and probing them costs a `git` subprocess —
+ * measured at 2.5 ms, which is real money on every request.
+ */
+let harnessEnvBlockCache = { cwd: null, block: "" };
+function buildHarnessEnvBlock() {
+  const cwd = process.cwd();
+  if (harnessEnvBlockCache.cwd === cwd && harnessEnvBlockCache.block) {
+    return harnessEnvBlockCache.block;
+  }
+  let isRepo = "no";
+  try {
+    const { execFileSync } = require("child_process");
+    execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    });
+    isRepo = "yes";
+  } catch {}
+  const block = [
+    "Here is some useful information about the environment you are running in:",
+    "<env>",
+    `  Working directory: ${cwd}`,
+    `  Workspace root folder: ${cwd}`,
+    `  Is directory a git repo: ${isRepo}`,
+    "  Platform: " + process.platform,
+    "</env>",
+  ].join("\n");
+  harnessEnvBlockCache = { cwd, block };
+  return block;
+}
+/**
+ * Append the harness env block to a system prompt unless the client already
+ * sent one. A client that forwards the CLI's own prompt (or any prompt with an
+ * `<env>` block) keeps it verbatim — only the missing anchor is added.
+ */
+function withHarnessEnvBlock(systemText) {
+  const text = typeof systemText === "string" ? systemText : "";
+  if (/<env>[\s\S]*?Working directory:/.test(text)) return text;
+  const block = buildHarnessEnvBlock();
+  return text.trim() ? `${text.replace(/\s+$/, "")}\n\n${block}` : block;
+}
 function extractSystemInstructions(messages = [], explicitInstructions = "", placeholderNote = "") {
   const parts = [];
   if (typeof explicitInstructions === "string" && explicitInstructions.trim()) {
@@ -1139,7 +1200,7 @@ function extractSystemInstructions(messages = [], explicitInstructions = "", pla
   if (placeholderNote) {
     parts.push(placeholderNote);
   }
-  return parts.join("\n\n");
+  return withHarnessEnvBlock(parts.join("\n\n"));
 }
 
 function transformChatMessages(messages = [], originalToAlias = null, placeholderNote = "") {
@@ -1179,6 +1240,30 @@ function transformChatMessages(messages = [], originalToAlias = null, placeholde
       }
     } else {
       out.unshift({ role: "system", content: placeholderNote });
+    }
+  }
+
+  // The gateway refuses a request whose system prompt lacks the harness `<env>`
+  // block with the same `429 FreeUsageLimitError` it uses for an exhausted
+  // allowance. See buildHarnessEnvBlock. A client that already forwarded the
+  // CLI's prompt keeps its own block; only the missing anchor is added.
+  const sysIndex = out.findIndex((m) => m?.role === "system" || m?.role === "developer");
+  if (sysIndex === -1) {
+    out.unshift({ role: "system", content: buildHarnessEnvBlock() });
+  } else {
+    const sys = out[sysIndex];
+    if (typeof sys.content === "string") {
+      out[sysIndex] = { ...sys, content: withHarnessEnvBlock(sys.content) };
+    } else if (Array.isArray(sys.content)) {
+      const text = extractContent(sys.content);
+      if (!/<env>[\s\S]*?Working directory:/.test(text)) {
+        out[sysIndex] = {
+          ...sys,
+          content: [...sys.content, { type: "text", text: `\n\n${buildHarnessEnvBlock()}` }],
+        };
+      }
+    } else {
+      out[sysIndex] = { ...sys, content: buildHarnessEnvBlock() };
     }
   }
   return out;

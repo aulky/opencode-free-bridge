@@ -229,6 +229,53 @@ describe("server unit & integration tests", () => {
     assert.equal(respBody.top_p, 0.9);
   });
 
+  it("adds the harness <env> block the gateway requires, in both lanes", () => {
+    // Measured live 2026-10-25: a system prompt without `<env>` + a
+    // `Working directory:` line is answered with `429 FreeUsageLimitError` —
+    // the same message as an exhausted allowance — while a 65-byte env block
+    // passes. A 12 KB generic prompt still fails, so this is a shape anchor,
+    // not a length rule. Both lanes must carry it or the bridge looks throttled.
+    const envRe = /<env>[\s\S]*?Working directory:[\s\S]*?<\/env>/;
+    const model = "glm-5.3-flash-free";
+    const user = { role: "user", content: "hi" };
+
+    // Chat lane, no system message at all: one is synthesized.
+    const bare = buildUpstreamPayload({ model, messages: [user] }, model, false, "core").upstreamBody;
+    assert.match(bare.messages[0].content, envRe);
+    assert.equal(bare.messages[0].role, "system");
+
+    // Chat lane, short client system prompt: the block is appended, the
+    // client's own text is preserved verbatim.
+    const short = buildUpstreamPayload(
+      { model, messages: [{ role: "system", content: "You are helpful." }, user] },
+      model,
+      false,
+      "core"
+    ).upstreamBody;
+    assert.match(short.messages[0].content, /^You are helpful\./);
+    assert.match(short.messages[0].content, envRe);
+
+    // A client that already forwards the CLI's prompt keeps its own block —
+    // exactly once, not doubled.
+    const own = "<env>\n  Working directory: /x\n</env>";
+    const forwarded = buildUpstreamPayload(
+      { model, messages: [{ role: "system", content: `prompt\n\n${own}` }, user] },
+      model,
+      false,
+      "core"
+    ).upstreamBody;
+    assert.equal(forwarded.messages[0].content.match(/<env>/g).length, 1);
+    assert.match(forwarded.messages[0].content, /Working directory: \/x/);
+
+    // Responses lane carries the same anchor in `instructions`.
+    const responses = buildUpstreamPayload(
+      { model, messages: [{ role: "system", content: "You are helpful." }, user] },
+      model,
+      true,
+      "core"
+    ).upstreamBody;
+    assert.match(responses.instructions, envRe);
+  });
   it("avoids session hash collisions when headerless requests share a >1000-char prefix", () => {
     const sharedPrefix = "S".repeat(2000);
     const bodyA = {

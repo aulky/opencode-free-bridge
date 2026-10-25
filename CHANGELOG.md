@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased]
+
+### 429 FreeUsageLimitError was a request-shape problem, not a quota
+
+The gateway answers `429 FreeUsageLimitError` for two unrelated things: an
+exhausted free-tier allowance, and a system prompt that lacks the harness
+`<env>` block. Only the second one applied here — the CLI answered while the
+bridge was refused in the same minute, repeatedly, which the previous
+"time-of-measurement artifact" note could not explain.
+
+- Reproduced by capturing the CLI's own request (`opencode run` through a local
+  provider pointing at a capture server) and replaying it byte-for-byte: 200.
+  The same body with the system prompt replaced by a short one: 429. Both went
+  out with the same headers, session id and TLS stack, so the difference is the
+  body.
+- The trigger is the `<env>` block plus a `Working directory:` line, not the
+  prompt length: a 12 KB generic prompt is refused, a 65-byte
+  `<env>Working directory: /tmp</env>` is accepted, and `big-pickle` and
+  `mimo-v2.6-flash-free` behave identically. Dropping every tool (`tools: []`)
+  produces the same 429, which is why that case also looked like a quota error.
+- `transformChatMessages` and `extractSystemInstructions` now append the block
+  (working directory, workspace root, git-repo flag, platform) to whichever
+  system prompt the request carries, synthesizing one when the client sent
+  none. A client forwarding the CLI's own prompt keeps its block unchanged and
+  gets no duplicate.
+- Covered by a regression test in `test/server.test.js` for both protocol
+  lanes.
+
 ## [2.2.1] — 2026-10-22
 
 Hardening for the egress proxy shipped in 2.2.0. The feature worked, but three
