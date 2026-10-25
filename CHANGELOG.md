@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.3.1] — 2026-10-25
+
+Pool health survives a restart.
+
+A pool that forgets its cooldowns re-burns every spent IP on the first request
+after a restart, which is exactly what an Instabox suspend/resume does eight
+times a day. The rotation was correct; its memory was not.
+
+- Cooldowns, failure counts and last-seen timestamps are written to
+  `<state dir>/pool-health.json` (mode `0600`) and re-applied by
+  `loadFromDisk()`. A restart now resumes with the same pool state it went down
+  with.
+- Records are keyed by a truncated SHA-256 of the egress identity, so the health
+  file is not a second copy of the proxy credentials sitting next to
+  `proxy.json`.
+- A refusal writes immediately; a success is coalesced over one second. The file
+  is written by rename, so a crash mid-write keeps the previous copy.
+- A corrupt health file costs the cooldowns and nothing else.
+- `setPool` no longer calls `resetHealth()`: saving the pool from the panel —
+  including a strategy change — used to discard every cooldown it had learned.
+  Removed entries are still pruned and the file is rewritten to match.
+
 ## [2.3.0] — 2026-10-25
 
 Egress pool: one bridge, many exit IPs.

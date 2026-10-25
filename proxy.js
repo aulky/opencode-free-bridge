@@ -28,11 +28,14 @@
  * host:port only.
  */
 
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
 const CONFIG_FILE_NAME = "proxy.json";
+const HEALTH_FILE_NAME = "pool-health.json";
+const HEALTH_VERSION = 1;
 const ENV_OVERRIDE = "UPSTREAM_PROXY_URL";
 const POOL_ENV = "UPSTREAM_PROXY_POOL";
 const STRATEGY_ENV = "UPSTREAM_PROXY_STRATEGY";
@@ -50,6 +53,15 @@ function stateDir() {
 
 function configFile() {
   return path.join(stateDir(), CONFIG_FILE_NAME);
+}
+
+/**
+ * Pool health lives beside the config but in its own file: the config is
+ * operator intent, health is runtime observation. Writing one must never
+ * rewrite the other, and a corrupt health file must not cost the pool.
+ */
+function healthFile() {
+  return path.join(stateDir(), HEALTH_FILE_NAME);
 }
 
 /**
@@ -215,13 +227,161 @@ function healthFor(url) {
   return h;
 }
 
-/** Drop health for egresses no longer in the pool, so a removed entry leaves no ghost. */
+/**
+ * Drop health for egresses no longer in the pool, so a removed entry leaves no
+ * ghost. Pure: the caller persists, so a reload never writes a half-restored map
+ * over a file it has not read yet.
+ */
 function pruneHealth(entries) {
   const live = new Set(entries.map((e) => keyOf(e.url)));
   if (current.url) live.add(current.url);
+  let removed = 0;
   for (const key of [...health.keys()]) {
-    if (!live.has(key)) health.delete(key);
+    if (!live.has(key)) {
+      health.delete(key);
+      removed += 1;
+    }
   }
+  return removed;
+}
+
+/**
+ * Stable, non-secret id for one egress. The health file sits beside a config
+ * that already holds proxy credentials; a second copy of every token would be
+ * a second thing to leak, and the record only has to be matchable, not readable.
+ */
+function healthId(key) {
+  return crypto.createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+function healthLabel(key) {
+  if (key === "@direct") return "direct";
+  const entry = pool.entries.find((e) => keyOf(e.url) === key);
+  return entry ? entry.label : null;
+}
+
+function healthSnapshot(now = Date.now()) {
+  return {
+    version: HEALTH_VERSION,
+    savedAt: new Date(now).toISOString(),
+    entries: [...health.entries()].map(([key, h]) => ({
+      id: healthId(key),
+      label: healthLabel(key),
+      failures: h.failures,
+      cooldownUntil: h.cooldownUntil,
+      lastError: h.lastError,
+      lastStatus: h.lastStatus,
+      lastOkAt: h.lastOkAt || null,
+      lastUsedAt: h.lastUsedAt || null,
+    })),
+  };
+}
+
+let healthWriteTimer = null;
+
+/** Drop the health file: no egress has anything worth remembering. */
+function removeHealthFile() {
+  try {
+    fs.unlinkSync(healthFile());
+  } catch (err) {
+    if (err.code !== "ENOENT") return;
+  }
+}
+
+/**
+ * Write observed health. Atomic via rename so a crash mid-write leaves the
+ * previous file intact — a truncated file would silently cost the pool every
+ * cooldown it had learned.
+ *
+ * Failure is never surfaced: health is a memory optimization, and a request
+ * must not fail because a cache file could not be written.
+ */
+function writeHealthNow(now = Date.now()) {
+  if (healthWriteTimer) {
+    clearTimeout(healthWriteTimer);
+    healthWriteTimer = null;
+  }
+  if (health.size === 0) {
+    removeHealthFile();
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(healthFile()), { recursive: true });
+    const tmp = `${healthFile()}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(healthSnapshot(now), null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, healthFile());
+    fs.chmodSync(healthFile(), 0o600);
+  } catch {
+    // Best effort: the bridge keeps running with in-memory health.
+  }
+}
+
+/**
+ * Coalesce rapid writes. A success arrives with every request, and rewriting a
+ * file per request would turn a cheap memory update into disk churn.
+ */
+function scheduleHealthWrite(delayMs = 1000) {
+  if (healthWriteTimer) return;
+  healthWriteTimer = setTimeout(() => {
+    healthWriteTimer = null;
+    writeHealthNow();
+  }, delayMs);
+  // Never hold the process open for a cache write.
+  if (typeof healthWriteTimer.unref === "function") healthWriteTimer.unref();
+}
+
+/**
+ * Re-apply health saved by an earlier process. An Instabox suspend or a service
+ * restart would otherwise forget which IPs are spent and re-burn all of them.
+ *
+ * The in-memory record wins when it already exists: a restart is the only thing
+ * that leaves the map empty, so a live record is by definition at least as
+ * fresh as the file.
+ */
+function restoreHealth(entries, now = Date.now()) {
+  let raw;
+  try {
+    raw = fs.readFileSync(healthFile(), "utf8");
+  } catch {
+    return 0;
+  }
+
+  let json = null;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    // A corrupt health file must cost nothing but the cooldowns.
+    removeHealthFile();
+    return 0;
+  }
+  if (!json || json.version !== HEALTH_VERSION || !Array.isArray(json.entries)) return 0;
+
+  const saved = new Map();
+  for (const record of json.entries) {
+    if (record && typeof record.id === "string") saved.set(record.id, record);
+  }
+
+  const keys = entries.map((e) => keyOf(e.url));
+  if (current.url) keys.push(current.url);
+
+  let restored = 0;
+  for (const key of keys) {
+    if (health.has(key)) continue;
+    const record = saved.get(healthId(key));
+    if (!record) continue;
+    const cooldownUntil = Number(record.cooldownUntil);
+    const failures = Number(record.failures);
+    health.set(key, {
+      failures: Number.isFinite(failures) && failures > 0 ? Math.floor(failures) : 0,
+      cooldownUntil: Number.isFinite(cooldownUntil) && cooldownUntil > now ? cooldownUntil : 0,
+      lastError: typeof record.lastError === "string" ? record.lastError : null,
+      lastOkAt: Number.isFinite(Number(record.lastOkAt)) ? Number(record.lastOkAt) : 0,
+      lastUsedAt: Number.isFinite(Number(record.lastUsedAt)) ? Number(record.lastUsedAt) : 0,
+      lastStatus: typeof record.lastStatus === "string" ? record.lastStatus : null,
+    });
+    restored += 1;
+  }
+  return restored;
 }
 
 function normalizeStrategy(raw) {
@@ -253,6 +413,7 @@ function loadFromDisk() {
     };
     current = { url: "", source: "env", error: null };
     pruneHealth(pool.entries);
+    restoreHealth(pool.entries);
     return pool;
   }
 
@@ -265,6 +426,7 @@ function loadFromDisk() {
     }
     pool = { entries: [], errors: [], strategy: DEFAULT_STRATEGY, source: "env", error: null };
     pruneHealth([]);
+    restoreHealth([]);
     return pool;
   }
 
@@ -275,6 +437,7 @@ function loadFromDisk() {
     current = { url: "", source: "none", error: null };
     pool = { entries: [], errors: [], strategy: DEFAULT_STRATEGY, source: "none", error: null };
     pruneHealth([]);
+    restoreHealth([]);
     return pool;
   }
 
@@ -287,6 +450,7 @@ function loadFromDisk() {
     current = { url: "", source: "none", error: `proxy.json tidak terbaca: ${err.message}` };
     pool = { entries: [], errors: [], strategy: DEFAULT_STRATEGY, source: "none", error: current.error };
     pruneHealth([]);
+    restoreHealth([]);
     return pool;
   }
 
@@ -314,6 +478,7 @@ function loadFromDisk() {
   };
   cooldowns = normalizeCooldowns(json);
   pruneHealth(entries);
+  restoreHealth(entries);
   return pool;
 }
 
@@ -428,6 +593,9 @@ function markFailure(egressUrl, { reason = "throttled", now = Date.now(), cooldo
   const backoff = Math.min(base * Math.pow(2, h.failures - 1), Math.max(cooldowns.maxMs, base));
   h.cooldownUntil = now + backoff;
   h.lastStatus = reason;
+  // A refusal is the expensive thing to rediscover: write it before the caller
+  // can act on it, so a restart in the next second does not forget the IP.
+  writeHealthNow(now);
   return { failures: h.failures, cooldownUntil: h.cooldownUntil, backoffMs: backoff };
 }
 
@@ -440,12 +608,15 @@ function markSuccess(egressUrl, { now = Date.now() } = {}) {
   h.lastError = null;
   h.lastOkAt = now;
   h.lastStatus = "ok";
+  // Every request lands here, so this one is coalesced.
+  scheduleHealthWrite();
   return h;
 }
 
 function resetHealth() {
   health.clear();
   cursor = 0;
+  writeHealthNow();
 }
 
 /** Public view of one entry: host:port, health, and never the URL's credentials. */
@@ -637,9 +808,14 @@ function setPool(raw) {
     if (!written.ok) return written;
   }
 
+  // Deliberately not `resetHealth()`: an operator saving the pool (even just to
+  // change the strategy) must not forget which IPs are spent. In-memory health
+  // wins over the file during reload, so unchanged entries keep their cooldown
+  // and removed ones were just pruned.
   loadFromDisk();
-  resetHealth();
+  cursor = 0;
   for (const entry of entries) healthFor(entry.url);
+  writeHealthNow();
   return { ok: true, ...describe() };
 }
 
@@ -771,6 +947,7 @@ module.exports = {
   POOL_ENV,
   STRATEGY_ENV,
   configFile,
+  healthFile,
   parseProxyUrl,
   parsePoolEntry,
   parsePoolSpec,
@@ -792,4 +969,12 @@ module.exports = {
     current = state;
   },
   __reload: loadFromDisk,
+  /** Simulate a process start: in-memory state gone, everything re-read from disk. */
+  __restart() {
+    health.clear();
+    cursor = 0;
+    loadFromDisk();
+  },
+  /** Force the coalesced health write, so a test can assert persisted state. */
+  __flushHealth: () => writeHealthNow(),
 };

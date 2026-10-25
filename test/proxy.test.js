@@ -570,3 +570,94 @@ describe("egress pool: direct entry", () => {
     assert.match(result.error, /direct/);
   });
 });
+
+describe("egress pool: health survives a restart", () => {
+  beforeEach(() => {
+    emptyStateDir();
+    delete process.env.UPSTREAM_PROXY_POOL;
+    proxy.__reload();
+    proxy.resetHealth();
+  });
+
+  it("remembers a cooling entry across a reload and keeps the same desired state", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
+    proxy.markFailure("http://a:1", { reason: "allowance 429", cooldownMs: 60000 });
+
+    // A fresh process reads the pool and the health file; only the pool config
+    // is operator intent, so losing health here would re-burn a spent IP.
+    proxy.__restart();
+
+    const state = proxy.describe();
+    const a = state.pool.entries.find((e) => e.host === "a:1");
+    assert.equal(a.state, "cooling");
+    assert.equal(a.failures, 1);
+    assert.ok(a.cooldownMsLeft > 50000, `expected cooldown to survive, got ${a.cooldownMsLeft}`);
+    assert.equal(state.pool.ready, 1);
+    assert.equal(proxy.pick().url, "http://b:2");
+  });
+
+  it("restores the failure count so backoff continues instead of restarting", () => {
+    proxy.setPool({ entries: ["http://a:1"], cooldownMs: 1000, maxCooldownMs: 8000 });
+    proxy.markFailure("http://a:1");
+    proxy.markFailure("http://a:1");
+    proxy.__restart();
+    // Third consecutive failure doubles from 4000, not from the base 1000.
+    assert.equal(proxy.markFailure("http://a:1").backoffMs, 4000);
+  });
+
+  it("forgets a spent entry once it succeeds, so the file does not keep stale cooldowns", () => {
+    proxy.setPool({ entries: ["http://a:1"] });
+    proxy.markFailure("http://a:1", { cooldownMs: 60000 });
+    proxy.markSuccess("http://a:1");
+    // `markSuccess` is coalesced; write deterministically before reloading so
+    // this asserts persisted state rather than the timer.
+    proxy.__flushHealth();
+    proxy.__restart();
+    const state = proxy.describe();
+    assert.equal(state.pool.entries[0].state, "ready");
+    assert.equal(state.pool.entries[0].failures, 0);
+  });
+
+  it("writes health with 0600 and never stores the proxy URL or its credentials", () => {
+    proxy.setPool({ entries: ["http://user:secret@a:1"] });
+    proxy.markFailure("http://user:secret@a:1", { reason: "allowance 429" });
+    const raw = fs.readFileSync(proxy.healthFile(), "utf8");
+    assert.equal(fs.statSync(proxy.healthFile()).mode & 0o777, 0o600);
+    // A second copy of every proxy token would be a second thing to leak. The
+    // record is keyed by an opaque hash of the egress identity, and the label
+    // carries only what `describe()` already exposes (host:port).
+    assert.equal(raw.includes("secret"), false);
+    assert.equal(raw.includes("user:"), false);
+    assert.equal(raw.includes("http://"), false);
+    const parsed = JSON.parse(raw);
+    assert.equal(parsed.entries.length, 1);
+    assert.match(parsed.entries[0].id, /^[0-9a-f]{16}$/);
+  });
+
+  it("ignores a corrupt health file instead of losing the pool", () => {
+    proxy.setPool({ entries: ["http://a:1"] });
+    proxy.markFailure("http://a:1");
+    fs.writeFileSync(proxy.healthFile(), "{ not json");
+    proxy.__restart();
+    assert.equal(proxy.describe().mode, "pool");
+    assert.equal(proxy.describe().pool.entries[0].state, "ready");
+    assert.equal(fs.existsSync(proxy.healthFile()), false);
+  });
+
+  it("drops health for an entry that leaves the pool", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
+    proxy.markFailure("http://a:1", { cooldownMs: 60000 });
+    proxy.setPool({ entries: ["http://b:2"] });
+    const raw = JSON.parse(fs.readFileSync(proxy.healthFile(), "utf8"));
+    assert.deepEqual(raw.entries.map((e) => e.label), ["b:2"]);
+  });
+
+  it("keeping the pool saved does not forget the cooldown it already learned", () => {
+    proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
+    proxy.markFailure("http://a:1", { reason: "allowance 429", cooldownMs: 60000 });
+    // Saving again is what the panel does on every strategy change.
+    const saved = proxy.setPool({ entries: ["http://a:1", "http://b:2"], strategy: "failover" });
+    assert.equal(saved.ok, true);
+    assert.equal(saved.pool.entries.find((e) => e.host === "a:1").state, "cooling");
+  });
+});

@@ -515,6 +515,26 @@ UPSTREAM_PROXY_STRATEGY=failover \
   entry's host, state, remaining cooldown and failure count. Credentials are
   never included.
 
+#### Health across restarts
+
+Cooldowns are written to `<state dir>/pool-health.json` (mode `0600`), so a
+service restart or a host suspend/resume does not forget which IPs are spent and
+re-burn all of them.
+
+- A refusal is written immediately; a success is coalesced over one second,
+  because a success arrives with every request and a rewrite per request would
+  turn a memory update into disk churn.
+- The file is written by rename, so a crash mid-write keeps the previous copy
+  instead of leaving a truncated one that would cost every cooldown.
+- Records are keyed by a truncated SHA-256 of the egress identity, not by URL,
+  so the file is not a second copy of the proxy credentials. A `label` field
+  carries `host:port` (or `direct`), which `/health` already exposes.
+- Saving the pool in the panel keeps existing cooldowns; only an entry that
+  leaves the pool loses its record.
+- A corrupt or missing health file costs the cooldowns and nothing else: the
+  bridge starts, reports the pool from `proxy.json`, and treats every entry as
+  ready.
+
 #### Turning a host into a pool member
 
 `egress-proxy.js` is a dependency-free HTTP proxy for exactly this: it answers
