@@ -1,6 +1,28 @@
 # Changelog
 
-## [Unreleased]
+## [2.2.2] — 2026-10-25
+
+Fleet release: the catalog-freeze fix plus the delivery fixes below. Every
+machine was on 2.2.1, whose `/v1/models` could stay frozen for the life of the
+process, so this is the version the fleet is pinned to.
+
+### Upstream catalog froze on crashed boots (identity.js)
+
+Boot-time warm-start from `~/.opencode-free-bridge/cache/catalog.json` filled
+`freeModels`, and `refresh()` only re-read the provider catalog when that list
+was empty — so a booted process served a permanent snapshot: retired models
+(measured: `minimax-m3.1-flash-free` answered upstream with `404` while still
+listed) stayed in `/v1/models`, and clients spent the per-IP free burst quota
+probing ids upstream no longer knows.
+
+- Both the "up-to-date" and "available-not-adopted" branches of `refresh()`
+  now re-read the catalog. `refresh()` is TTL-gated by `ensureFresh`, so this
+  costs at most one request per refresh interval.
+- `verify.js` now breaks its sweep at the first `429` the same way it already
+  breaks on `403 gate-closed` — hammering every model while the IP is
+  throttled only prolongs the allowance window.
+- `THIRD_PARTY_NOTICES.md` now ships through both delivery paths
+  (`UPDATE_FILES` and `install.sh`), fixing the delivery test.
 
 ### 429 FreeUsageLimitError was a request-shape problem, not a quota
 

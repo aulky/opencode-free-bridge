@@ -1822,12 +1822,16 @@ async function refresh({ force = false, recheck = false } = {}) {
       const shouldAdopt = cmp > 0 && (isForced || updateMode === "always" || forcedByUpstream);
 
       if (cmp === 0 && !isForced) {
-        // Even when the CLI version has not moved, populate the catalog once if
-        // this process still has no free-model list (cold boot without cache).
-        if (freeModels.length === 0) {
-          const catalog = await extractCatalog();
-          applyRecipe(catalog);
-        }
+        // Even when the CLI version has not moved, keep the catalog current.
+        // Warm-starting from the disk cache fills `freeModels`, which used to
+        // gate this call — so a cached list was a permanent snapshot and
+        // deprecated models kept being advertised (measured: retired
+        // minimax-m3.1-flash-free stayed in /v1/models). Clients probing
+        // retired ids burn the per-IP burst quota for nothing. refresh() is
+        // TTL-gated by ensureFresh, so re-reading the catalog costs at most
+        // one request per refresh interval.
+        const catalog = await extractCatalog();
+        applyRecipe(catalog);
         return {
           updated: false,
           version: recipe.version,
@@ -1837,7 +1841,9 @@ async function refresh({ force = false, recheck = false } = {}) {
       if (cmp > 0 && !shouldAdopt) {
         // Reactive mode: remember that a release exists without adopting it.
         // The next gate rejection forces a refresh, which flips shouldAdopt.
-        if (freeModels.length === 0) {
+        // Refresh the catalog here too — the not-adopted branch is the
+        // default-mode path and used to freeze the same stale list.
+        {
           const catalog = await extractCatalog();
           applyRecipe(catalog);
         }

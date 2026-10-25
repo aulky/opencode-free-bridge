@@ -244,7 +244,10 @@ async function probe(model) {
       console.log(`  ${bad("FAIL")} ${model.padEnd(36)} ${time}  ${C.dim}${r.detail}${C.reset}`);
     }
     if (QUICK && r.state === "ok") break;
+    // A 429 allowance is per-IP: firing the remaining models at a throttled
+    // peer only prolongs the penalty window — same trade-off as gate-closed.
     if (r.state === "gate-closed") break;
+    if (r.state === "ratelimited") break;
   }
 
   const counts = results.reduce((acc, r) => ((acc[r.state] = (acc[r.state] || 0) + 1), acc), {});

@@ -668,6 +668,6 @@ tail -50 ~/Library/Logs/opencode-free-bridge.log
 bun ~/.opencode-free-bridge/server.js
 ```
 
-## License
+## License and upstream data
 
-MIT
+This project is licensed under [MIT](./LICENSE). `identity.js` derives request identity and tool metadata from the [OpenCode source repository](https://github.com/anomalyco/opencode). Its offline fallback includes OpenCode `read` and `shell` tool descriptions and schema fields; related source-shaped fixtures appear in `test/identity.test.js`. See [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for the OpenCode MIT notice and contributor credit.

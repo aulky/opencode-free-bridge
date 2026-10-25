@@ -206,6 +206,7 @@ const UPDATE_FILES = [
   "proxy.js",
   "panel.js",
   "server.js",
+  "THIRD_PARTY_NOTICES.md",
 ];
 let updateInFlight = null;
 let lastUpdateCheck = 0;
